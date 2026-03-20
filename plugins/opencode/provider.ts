@@ -394,11 +394,15 @@ export class ClwndModel implements LanguageModelV2 {
                 if (ct === "tool_call" && msg.toolCallId && msg.toolName) {
                   const accumulated = toolInputAccum.get(msg.toolCallId as string) ?? "{}";
                   const ocToolName = mapToolName(msg.toolName as string);
+                  const mappedInput = mapToolInput(msg.toolName as string, accumulated);
+                  // OpenCode expects input as a parsed object for native tool rendering
+                  let parsedInput: unknown;
+                  try { parsedInput = JSON.parse(mappedInput); } catch { parsedInput = mappedInput; }
                   emit({
                     type: "tool-call",
                     toolCallId: msg.toolCallId,
                     toolName: ocToolName,
-                    input: mapToolInput(msg.toolName as string, accumulated),
+                    input: parsedInput,
                     providerExecuted: true,
                   } as LanguageModelV2StreamPart);
                 }
