@@ -2,6 +2,8 @@ import { spawn, type Subprocess } from "bun";
 import { EventEmitter } from "events";
 import { existsSync, unlinkSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from "fs";
 import { randomUUID } from "crypto";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -145,6 +147,20 @@ class SubprocessPool {
   }
 
   private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string): ProcEntry {
+    // MCP server config — route file/bash tools through our MCP server
+    // instead of Claude CLI's built-in tools
+    const mcpServerPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "mcp", "server.ts");
+    const mcpConfig = JSON.stringify({
+      mcpServers: {
+        clwnd: {
+          type: "stdio",
+          command: process.env.BUN_PATH ?? "bun",
+          args: [mcpServerPath],
+          env: { CLWND_CWD: process.env.CLWND_CWD ?? process.env.HOME ?? "/" },
+        },
+      },
+    });
+
     const cmd = [
       this.cliPath, "-p",
       "--verbose",
@@ -153,6 +169,12 @@ class SubprocessPool {
       "--model", modelId,
       "--include-partial-messages",
       "--permission-mode", process.env.CLWND_PERMISSION_MODE ?? "acceptEdits",
+      // Disable built-in tools that our MCP server replaces
+      "--disallowedTools", "Read,Edit,Write,Bash,Glob,Grep",
+      // Auto-approve our MCP tools
+      "--allowedTools", "mcp__clwnd__read,mcp__clwnd__edit,mcp__clwnd__write,mcp__clwnd__bash,mcp__clwnd__glob,mcp__clwnd__grep",
+      // Register our MCP server
+      "--mcp-config", mcpConfig,
     ];
     if (claudeSessionId) {
       cmd.push("--resume", claudeSessionId);
