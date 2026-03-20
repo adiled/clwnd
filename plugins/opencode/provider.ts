@@ -134,7 +134,7 @@ export class ClwndModel implements LanguageModelV2 {
       const abort = () => {
         if (resolved) return;
         resolved = true;
-        ipcCall({ action: "destroy", opencodeSessionId: sid }).catch(() => {});
+        // Don't send destroy — daemon manages session lifecycle for --resume.
         reject(new Error("aborted"));
       };
       opts.abortSignal?.addEventListener("abort", abort);
@@ -264,7 +264,8 @@ export class ClwndModel implements LanguageModelV2 {
         }
 
         opts.abortSignal?.addEventListener("abort", () => {
-          ipcCall({ action: "destroy", opencodeSessionId: sid }).catch(() => {});
+          // Don't send destroy — the daemon manages session lifecycle.
+          // Sending destroy here would nuke the session map entry needed for --resume.
           close();
         });
 
@@ -391,7 +392,7 @@ export class ClwndModel implements LanguageModelV2 {
       },
 
       cancel() {
-        ipcCall({ action: "destroy", opencodeSessionId: sid }).catch(() => {});
+        // Don't send destroy — daemon manages session lifecycle for --resume.
       },
     });
 

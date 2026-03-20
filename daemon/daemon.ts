@@ -3,6 +3,24 @@ import { EventEmitter } from "events";
 import { existsSync, unlinkSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from "fs";
 import { randomUUID } from "crypto";
 
+// ─── Logging ────────────────────────────────────────────────────────────────
+
+const LOG_LEVEL = process.env.CLWND_LOG_LEVEL ?? "info";
+const TRACE = LOG_LEVEL === "trace" || LOG_LEVEL === "debug";
+
+function trace(event: string, data?: Record<string, unknown>): void {
+  if (!TRACE) return;
+  const parts = [event];
+  if (data) for (const [k, v] of Object.entries(data)) parts.push(`${k}=${v}`);
+  console.log(`[trace] ${parts.join(" ")}`);
+}
+
+function info(event: string, data?: Record<string, unknown>): void {
+  const parts = [event];
+  if (data) for (const [k, v] of Object.entries(data)) parts.push(`${k}=${v}`);
+  console.log(parts.join(" "));
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface StreamHandler {
@@ -72,9 +90,6 @@ class SubprocessPool {
 
   constructor(private cliPath = "claude") {}
 
-  // poolKey: unique key for subprocess lookup (can be sessionId for isolation, or modelId for sharing)
-  // modelId: the actual model name passed to --model flag
-  // claudeSessionId: if provided, resume this Claude CLI session
   sendSpawn(poolKey: string, modelId: string, handler: StreamHandler, claudeSessionId?: string): void {
     let entry = this.procs.get(poolKey);
     if (!entry) entry = this.spawnProc(poolKey, modelId, claudeSessionId);
@@ -139,8 +154,6 @@ class SubprocessPool {
       "--include-partial-messages",
       "--permission-mode", "acceptEdits",
     ];
-    // First turn: --session-id creates a new session with a known UUID
-    // Subsequent turns: --resume continues the existing session
     if (claudeSessionId) {
       cmd.push("--resume", claudeSessionId);
     }
@@ -155,12 +168,12 @@ class SubprocessPool {
 
     const entry: ProcEntry = { proc, handlers: new Map(), activeSession: null };
     this.procs.set(poolKey, entry);
-    console.log("spawn:", poolKey, "model:", modelId, "pid", proc.pid);
+    info("spawn", { poolKey, model: modelId, pid: proc.pid, resume: claudeSessionId ?? "none" });
 
     this.readStderr(proc, poolKey);
 
     proc.exited.then(exit => {
-      console.log("proc", poolKey, "exited:", exit.exitCode);
+      trace("proc.exited", { poolKey, code: exit.exitCode });
       for (const h of entry.handlers.values()) {
         try { h.onError(`subprocess exited: code=${exit.exitCode}`); } catch {}
       }
@@ -433,7 +446,6 @@ function handleAction(msg: IpcToDaemon, pool: SubprocessPool): void {
         return;
       }
 
-      // Inject into Claude CLI JSONL
       if (session.claudeSessionId && session.claudeSessionPath) {
         const parentUuid = getLastEntryUuid(session.claudeSessionPath);
         injectUserMessage(session.claudeSessionPath, text ?? "", parentUuid, session.claudeSessionId);
@@ -469,9 +481,11 @@ function handleAction(msg: IpcToDaemon, pool: SubprocessPool): void {
     }
 
     case "destroy": {
-      const session = sessions.get(msg.opencodeSessionId);
-      if (session) pool.destroy(msg.opencodeSessionId, session.modelId);
-      sessions.delete(msg.opencodeSessionId);
+      // Only destroy the subprocess, NOT the session state.
+      // The plugin sends destroy on abort/cancel, but we need the session
+      // to persist for --resume on the next turn.
+      trace("destroy", { sid: msg.opencodeSessionId, hadSession: sessions.has(msg.opencodeSessionId) });
+      // Pool cleanup is handled per-request via poolKey, not via this action.
       break;
     }
 
@@ -504,6 +518,7 @@ const HTTP = SOCK + ".http";
 
 const pool = new SubprocessPool(process.env.CLAUDE_CLI_PATH ?? "claude");
 
+const sessionLocks = new Map<string, Promise<void>>();
 const pendingEvents = new Map<string, IpcToPlugin[]>();
 const sseClients = new Map<string, (msg: IpcToPlugin) => void>();
 
@@ -561,11 +576,24 @@ Bun.serve({
     }
 
     // Streaming endpoint: POST /stream — spawn + prompt, stream NDJSON response
+    // Serialized per session: OpenCode may fire concurrent calls for the same
+    // session (small model + main). We serialize to avoid racing --resume.
     if (req.method === "POST" && url.pathname === "/stream") {
-      return req.json().then((body: IpcToDaemon) => {
+      return req.json().then(async (body: IpcToDaemon) => {
         const { opencodeSessionId, cwd, modelId, text } = body;
+
+        // Wait for any in-flight request on this session to finish
+        const prev = sessionLocks.get(opencodeSessionId);
+        if (prev) {
+          trace("stream.wait", { sid: opencodeSessionId });
+          await prev;
+        }
+
         const encoder = new TextEncoder();
         let closed = false;
+        let releaseLock: () => void;
+        const lock = new Promise<void>(r => { releaseLock = r; });
+        sessionLocks.set(opencodeSessionId, lock);
 
         const stream = new ReadableStream({
           start(controller) {
@@ -576,36 +604,42 @@ Bun.serve({
               } catch { closed = true; }
             };
 
-            // Reuse existing session if we have one (for --resume)
-            const existing = sessions.get(opencodeSessionId);
-            const resumeSessionId = existing?.claudeSessionId ?? undefined;
+            // Reuse existing session for --resume, or create new
+            let session = sessions.get(opencodeSessionId);
+            const resumeSessionId = session?.claudeSessionId ?? undefined;
 
-            const session: Session = {
-              opencodeSessionId,
-              claudeSessionId: existing?.claudeSessionId ?? null,
-              claudeSessionPath: existing?.claudeSessionPath ?? null,
-              cwd: cwd ?? "/root",
-              modelId: modelId ?? "sonnet",
-            };
-            sessions.set(opencodeSessionId, session);
+            if (!session) {
+              session = {
+                opencodeSessionId,
+                claudeSessionId: null,
+                claudeSessionPath: null,
+                cwd: cwd ?? "/root",
+                modelId: modelId ?? "sonnet",
+              };
+              sessions.set(opencodeSessionId, session);
+            }
+
+            trace("stream.start", { sid: opencodeSessionId, resume: resumeSessionId ?? "new", sessions: sessions.size });
+
+            const poolKey = `${opencodeSessionId}-${Date.now()}`;
 
             const h: StreamHandler = {
               opencodeSessionId,
               onSystemInit(claudeSessionId, model, tools) {
-                // Only create session file if it doesn't already exist
+                session.claudeSessionId = claudeSessionId;
                 if (!session.claudeSessionPath) {
                   const dir = getSessionDir(session.cwd);
                   try { mkdirSync(dir, { recursive: true }); } catch {}
-                  const path = getSessionPath(session.cwd, claudeSessionId);
-                  session.claudeSessionPath = path;
+                  session.claudeSessionPath = getSessionPath(session.cwd, claudeSessionId);
                 }
-                session.claudeSessionId = claudeSessionId;
+                trace("stream.init", { sid: opencodeSessionId, claude: claudeSessionId });
                 send({ action: "session_ready", opencodeSessionId, claudeSessionId, model, tools });
               },
               onChunk(type, data) {
                 send({ action: "chunk", opencodeSessionId, chunkType: type, ...data } as unknown as IpcToPlugin);
               },
               onFinish(finish) {
+                trace("stream.finish", { sid: opencodeSessionId, claude: session.claudeSessionId });
                 send({
                   action: "finish",
                   opencodeSessionId,
@@ -613,27 +647,25 @@ Bun.serve({
                   usage: finish.usage,
                   providerMetadata: finish.providerMetadata,
                 });
-                // Destroy subprocess but keep session — Claude CLI persists to JSONL,
-                // next turn will --resume with the same claudeSessionId
-                pool.destroy(opencodeSessionId, opencodeSessionId);
+                pool.destroy(opencodeSessionId, poolKey);
+                releaseLock!();
                 if (!closed) { closed = true; try { controller.close(); } catch {} }
               },
               onError(err) {
+                trace("stream.error", { sid: opencodeSessionId, err });
                 send({ action: "error", opencodeSessionId, message: err });
-                pool.destroy(opencodeSessionId, opencodeSessionId);
+                pool.destroy(opencodeSessionId, poolKey);
+                releaseLock!();
                 if (!closed) { closed = true; try { controller.close(); } catch {} }
               },
             };
 
-            const poolKey = opencodeSessionId;
             pool.sendSpawn(poolKey, session.modelId, h, resumeSessionId);
-
-            // Send just the user text — Claude CLI handles history via session resume
             pool.sendPrompt(opencodeSessionId, poolKey, text ?? "");
           },
           cancel() {
             closed = true;
-            pool.destroy(opencodeSessionId, opencodeSessionId);
+            releaseLock!();
           },
         });
 
@@ -683,5 +715,4 @@ process.on("SIGTERM", () => { pool.killAll(); process.exit(0); });
 process.on("uncaughtException",  e => console.error("uncaught:", e));
 process.on("unhandledRejection", e => console.error("unhandled:", e));
 
-console.log("HTTP:", HTTP, "pid:", process.pid);
-console.log("ready");
+info("ready", { http: HTTP, pid: process.pid });
