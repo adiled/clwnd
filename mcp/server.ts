@@ -3,16 +3,19 @@
  * clwnd MCP server — stdio transport.
  *
  * Exposes Read, Edit, Write, Bash, Glob, Grep tools over MCP so Claude CLI
- * uses these instead of its built-in tools. This gives clwnd (and OpenCode)
- * full control over tool execution, permissions, and UI rendering.
+ * uses these instead of its built-in tools. Returns structured metadata so
+ * OpenCode can render native UI (diff views, syntax highlighting, etc.).
  *
  * Protocol: JSON-RPC 2.0 over stdin/stdout (MCP stdio transport).
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
-import { execSync, spawn as cpSpawn } from "child_process";
-import { resolve, dirname } from "path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "fs";
+import { execSync } from "child_process";
+import { resolve, dirname, relative, extname } from "path";
 import { createInterface } from "readline";
+import { createPatch } from "diff";
+
+const CWD = process.env.CLWND_CWD ?? process.cwd();
 
 // ─── Tool Definitions ───────────────────────────────────────────────────────
 
@@ -63,6 +66,7 @@ const TOOLS = [
       type: "object" as const,
       properties: {
         command: { type: "string", description: "The bash command to execute" },
+        description: { type: "string", description: "Short description of what the command does" },
         timeout: { type: "number", description: "Timeout in milliseconds (default 120000)" },
       },
       required: ["command"],
@@ -95,16 +99,24 @@ const TOOLS = [
   },
 ];
 
-// ─── Tool Execution ─────────────────────────────────────────────────────────
+// ─── Tool Execution (returns structured result for OpenCode metadata) ────────
 
-function execRead(args: { file_path: string; offset?: number; limit?: number }): string {
+interface ToolResult {
+  output: string;
+  title?: string;
+  metadata?: Record<string, unknown>;
+}
+
+function execRead(args: { file_path: string; offset?: number; limit?: number }): ToolResult {
   const p = resolve(args.file_path);
-  if (!existsSync(p)) return `Error: ${p} does not exist`;
+  if (!existsSync(p)) return { output: `Error: ${p} does not exist`, title: p };
 
-  // Check if directory
   try {
-    const stat = Bun.file(p);
-    // Bun.file on a directory will fail on .text(), handle below
+    const stat = statSync(p);
+    if (stat.isDirectory()) {
+      const out = execSync(`ls -la "${p}"`, { encoding: "utf-8", timeout: 5000 });
+      return { output: out, title: relative(CWD, p) || p };
+    }
   } catch {}
 
   try {
@@ -113,95 +125,134 @@ function execRead(args: { file_path: string; offset?: number; limit?: number }):
     const offset = (args.offset ?? 1) - 1;
     const limit = args.limit ?? 2000;
     const slice = lines.slice(offset, offset + limit);
-    return slice.map((line, i) => `${offset + i + 1}\t${line}`).join("\n");
-  } catch {
-    // Might be a directory
-    try {
-      const out = execSync(`ls -la "${p}"`, { encoding: "utf-8", timeout: 5000 });
-      return out;
-    } catch (e: any) {
-      return `Error reading ${p}: ${e.message}`;
-    }
+    const truncated = lines.length > offset + limit;
+    const numbered = slice.map((line, i) => `${offset + i + 1}\t${line}`).join("\n");
+
+    return {
+      output: numbered,
+      title: relative(CWD, p) || p,
+      metadata: {
+        preview: slice.slice(0, 20).join("\n"),
+        truncated,
+        loaded: [p],
+      },
+    };
+  } catch (e: any) {
+    return { output: `Error reading ${p}: ${e.message}`, title: p };
   }
 }
 
-function execEdit(args: { file_path: string; old_string: string; new_string: string; replace_all?: boolean }): string {
+function execEdit(args: { file_path: string; old_string: string; new_string: string; replace_all?: boolean }): ToolResult {
   const p = resolve(args.file_path);
-  if (!existsSync(p)) return `Error: ${p} does not exist`;
+  if (!existsSync(p)) return { output: `Error: ${p} does not exist` };
 
-  let content = readFileSync(p, "utf-8");
+  const original = readFileSync(p, "utf-8");
+  let content = original;
 
   if (args.replace_all) {
-    if (!content.includes(args.old_string)) return `Error: old_string not found in ${p}`;
+    if (!content.includes(args.old_string)) return { output: `Error: old_string not found in ${p}` };
     content = content.replaceAll(args.old_string, args.new_string);
   } else {
     const idx = content.indexOf(args.old_string);
-    if (idx === -1) return `Error: old_string not found in ${p}`;
+    if (idx === -1) return { output: `Error: old_string not found in ${p}` };
     const secondIdx = content.indexOf(args.old_string, idx + 1);
-    if (secondIdx !== -1) return `Error: old_string is not unique in ${p}. Provide more context or use replace_all.`;
+    if (secondIdx !== -1) return { output: `Error: old_string is not unique in ${p}. Provide more context or use replace_all.` };
     content = content.replace(args.old_string, args.new_string);
   }
 
   writeFileSync(p, content);
-  return `Updated ${p}`;
+
+  // Generate unified diff for OpenCode's diff renderer
+  const diff = createPatch(relative(CWD, p) || p, original, content, "", "");
+
+  return {
+    output: `Updated ${p}`,
+    title: relative(CWD, p) || p,
+    metadata: {
+      diff,
+      filediff: diff,
+      diagnostics: [],
+    },
+  };
 }
 
-function execWrite(args: { file_path: string; content: string }): string {
+function execWrite(args: { file_path: string; content: string }): ToolResult {
   const p = resolve(args.file_path);
   const dir = dirname(p);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const existed = existsSync(p);
   writeFileSync(p, args.content);
-  return `Wrote ${p}`;
+
+  return {
+    output: `Wrote ${p}`,
+    title: relative(CWD, p) || p,
+    metadata: {
+      filepath: p,
+      exists: existed,
+      diagnostics: [],
+    },
+  };
 }
 
-function execBash(args: { command: string; timeout?: number }): string {
+function execBash(args: { command: string; description?: string; timeout?: number }): ToolResult {
   const timeout = args.timeout ?? 120_000;
+  let output = "";
+  let exitCode: number | null = 0;
   try {
-    const out = execSync(args.command, {
+    output = execSync(args.command, {
       encoding: "utf-8",
       timeout,
-      cwd: process.env.CLWND_CWD ?? process.cwd(),
+      cwd: CWD,
       env: { ...process.env, TERM: "xterm-256color" },
       maxBuffer: 10 * 1024 * 1024,
     });
-    return out;
   } catch (e: any) {
-    const stderr = e.stderr ?? "";
-    const stdout = e.stdout ?? "";
-    return `${stdout}${stderr ? "\nSTDERR:\n" + stderr : ""}\nExit code: ${e.status ?? "unknown"}`;
+    output = (e.stdout ?? "") + (e.stderr ? "\n" + e.stderr : "");
+    exitCode = e.status ?? 1;
   }
+
+  return {
+    output,
+    title: args.description ?? args.command.slice(0, 80),
+    metadata: {
+      output: output.length > 50000 ? output.slice(0, 50000) + "\n\n..." : output,
+      exit: exitCode,
+      description: args.description ?? args.command.slice(0, 80),
+    },
+  };
 }
 
-function execGlob(args: { pattern: string; path?: string }): string {
-  const dir = args.path ?? process.env.CLWND_CWD ?? process.cwd();
+function execGlob(args: { pattern: string; path?: string }): ToolResult {
+  const dir = args.path ?? CWD;
   try {
-    // Use find or glob via bash
     const out = execSync(
-      `find "${dir}" -path "*/${args.pattern}" -o -name "${args.pattern}" 2>/dev/null | head -200`,
-      { encoding: "utf-8", timeout: 10000 },
+      `shopt -s globstar nullglob; cd "${dir}" && printf '%s\n' ${args.pattern} 2>/dev/null | head -200`,
+      { encoding: "utf-8", timeout: 10000, shell: "/bin/bash" },
     );
-    if (!out.trim()) {
-      // Try with bash globstar
-      const out2 = execSync(
-        `shopt -s globstar nullglob; cd "${dir}" && printf '%s\n' ${args.pattern} 2>/dev/null | head -200`,
-        { encoding: "utf-8", timeout: 10000, shell: "/bin/bash" },
-      );
-      return out2.trim() || "No matches found";
-    }
-    return out.trim();
+    const files = out.trim().split("\n").filter(Boolean);
+    return {
+      output: files.join("\n") || "No matches found",
+      title: relative(CWD, dir) || args.pattern,
+      metadata: { count: files.length, truncated: files.length >= 200 },
+    };
   } catch {
-    return "No matches found";
+    return { output: "No matches found", title: args.pattern, metadata: { count: 0, truncated: false } };
   }
 }
 
-function execGrep(args: { pattern: string; path?: string; include?: string }): string {
-  const dir = args.path ?? process.env.CLWND_CWD ?? process.cwd();
+function execGrep(args: { pattern: string; path?: string; include?: string }): ToolResult {
+  const dir = args.path ?? CWD;
   let cmd = `rg --no-heading --line-number`;
   if (args.include) cmd += ` --glob "${args.include}"`;
   cmd += ` "${args.pattern}" "${dir}" 2>/dev/null | head -500`;
   try {
     const out = execSync(cmd, { encoding: "utf-8", timeout: 15000 });
-    return out.trim() || "No matches found";
+    const lines = out.trim().split("\n").filter(Boolean);
+    return {
+      output: out.trim() || "No matches found",
+      title: args.pattern,
+      metadata: { matches: lines.length, truncated: lines.length >= 500 },
+    };
   } catch {
     // Fallback to grep
     try {
@@ -209,14 +260,19 @@ function execGrep(args: { pattern: string; path?: string; include?: string }): s
       if (args.include) gcmd += ` --include="${args.include}"`;
       gcmd += " 2>/dev/null | head -500";
       const out = execSync(gcmd, { encoding: "utf-8", timeout: 15000 });
-      return out.trim() || "No matches found";
+      const lines = out.trim().split("\n").filter(Boolean);
+      return {
+        output: out.trim() || "No matches found",
+        title: args.pattern,
+        metadata: { matches: lines.length, truncated: lines.length >= 500 },
+      };
     } catch {
-      return "No matches found";
+      return { output: "No matches found", title: args.pattern, metadata: { matches: 0, truncated: false } };
     }
   }
 }
 
-function executeTool(name: string, args: Record<string, unknown>): string {
+function executeTool(name: string, args: Record<string, unknown>): ToolResult {
   switch (name) {
     case "read": return execRead(args as any);
     case "edit": return execEdit(args as any);
@@ -224,7 +280,7 @@ function executeTool(name: string, args: Record<string, unknown>): string {
     case "bash": return execBash(args as any);
     case "glob": return execGlob(args as any);
     case "grep": return execGrep(args as any);
-    default: return `Unknown tool: ${name}`;
+    default: return { output: `Unknown tool: ${name}` };
   }
 }
 
@@ -238,18 +294,15 @@ interface JsonRpcRequest {
 }
 
 function sendResponse(id: number | string | undefined, result: unknown): void {
-  const msg = JSON.stringify({ jsonrpc: "2.0", id, result });
-  process.stdout.write(msg + "\n");
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
 }
 
 function sendError(id: number | string | undefined, code: number, message: string): void {
-  const msg = JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } });
-  process.stdout.write(msg + "\n");
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n");
 }
 
 function sendNotification(method: string, params?: unknown): void {
-  const msg = JSON.stringify({ jsonrpc: "2.0", method, params });
-  process.stdout.write(msg + "\n");
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
 }
 
 function handleRequest(req: JsonRpcRequest): void {
@@ -257,23 +310,15 @@ function handleRequest(req: JsonRpcRequest): void {
     case "initialize": {
       sendResponse(req.id, {
         protocolVersion: "2024-11-05",
-        capabilities: {
-          tools: {},
-        },
-        serverInfo: {
-          name: "clwnd",
-          version: "0.2.0",
-        },
+        capabilities: { tools: {} },
+        serverInfo: { name: "clwnd", version: "0.2.0" },
       });
-      // Send initialized notification
       sendNotification("notifications/initialized");
       break;
     }
 
-    case "notifications/initialized": {
-      // Client acknowledged initialization — nothing to do
+    case "notifications/initialized":
       break;
-    }
 
     case "tools/list": {
       sendResponse(req.id, { tools: TOOLS });
@@ -286,9 +331,19 @@ function handleRequest(req: JsonRpcRequest): void {
 
       try {
         const result = executeTool(name, args);
-        sendResponse(req.id, {
-          content: [{ type: "text", text: result }],
-        });
+        // Return structured content — text for Claude, metadata embedded as JSON
+        // for the daemon/plugin to extract and forward to OpenCode
+        const content: Array<{ type: string; text: string }> = [
+          { type: "text", text: result.output },
+        ];
+        // Embed metadata as a second content block that the plugin can parse
+        if (result.metadata || result.title) {
+          content.push({
+            type: "text",
+            text: `\n<!--clwnd-meta:${JSON.stringify({ title: result.title, metadata: result.metadata })}-->`,
+          });
+        }
+        sendResponse(req.id, { content });
       } catch (e: any) {
         sendResponse(req.id, {
           content: [{ type: "text", text: `Error: ${e.message}` }],
@@ -298,31 +353,23 @@ function handleRequest(req: JsonRpcRequest): void {
       break;
     }
 
-    case "ping": {
+    case "ping":
       sendResponse(req.id, {});
       break;
-    }
 
-    default: {
+    default:
       if (req.id !== undefined) {
         sendError(req.id, -32601, `Method not found: ${req.method}`);
       }
-    }
   }
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 const rl = createInterface({ input: process.stdin });
-
 rl.on("line", (line: string) => {
   if (!line.trim()) return;
-  try {
-    const req = JSON.parse(line) as JsonRpcRequest;
-    handleRequest(req);
-  } catch (e: any) {
-    sendError(undefined, -32700, `Parse error: ${e.message}`);
-  }
+  try { handleRequest(JSON.parse(line)); }
+  catch (e: any) { sendError(undefined, -32700, `Parse error: ${e.message}`); }
 });
-
 rl.on("close", () => process.exit(0));

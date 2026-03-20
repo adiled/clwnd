@@ -10,6 +10,61 @@ import type {
 } from "@ai-sdk/provider";
 import type { ClwndConfig } from "./types.ts";
 
+// ─── Tool Mapping (Claude CLI MCP → OpenCode native) ────────────────────────
+
+const MCP_PREFIX = "mcp__clwnd__";
+
+// Map MCP tool names to OpenCode tool names
+function mapToolName(name: string): string {
+  if (name.startsWith(MCP_PREFIX)) return name.slice(MCP_PREFIX.length);
+  return name;
+}
+
+// snake_case → camelCase field mapping per tool
+const INPUT_FIELD_MAP: Record<string, Record<string, string>> = {
+  read:  { file_path: "filePath" },
+  edit:  { file_path: "filePath", old_string: "oldString", new_string: "newString", replace_all: "replaceAll" },
+  write: { file_path: "filePath" },
+  bash:  {}, // command, description, timeout are already correct
+  glob:  {}, // pattern, path are already correct
+  grep:  {}, // pattern, path, include are already correct
+};
+
+function mapToolInput(toolName: string, input: string): string {
+  const ocName = mapToolName(toolName);
+  const fieldMap = INPUT_FIELD_MAP[ocName];
+  if (!fieldMap || Object.keys(fieldMap).length === 0) return input;
+  try {
+    const parsed = JSON.parse(input);
+    const mapped: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      mapped[fieldMap[k] ?? k] = v;
+    }
+    return JSON.stringify(mapped);
+  } catch {
+    return input;
+  }
+}
+
+// Extract <!--clwnd-meta:...--> from MCP tool result text
+function parseToolResult(resultText: string): { output: string; title: string; metadata: Record<string, unknown> } {
+  const metaMatch = resultText.match(/<!--clwnd-meta:(.*?)-->/s);
+  let title = "";
+  let metadata: Record<string, unknown> = {};
+  let output = resultText;
+
+  if (metaMatch) {
+    output = resultText.replace(/\n?<!--clwnd-meta:.*?-->/s, "").trim();
+    try {
+      const parsed = JSON.parse(metaMatch[1]);
+      title = parsed.title ?? "";
+      metadata = parsed.metadata ?? {};
+    } catch {}
+  }
+
+  return { output, title, metadata };
+}
+
 interface IpcToDaemon {
   action: string;
   opencodeSessionId: string;
@@ -172,12 +227,13 @@ export class ClwndModel implements LanguageModelV2 {
                 }
                 if (ct === "tool_call" && msg.toolCallId && msg.toolName) {
                   const accumulated = toolInputAccum.get(msg.toolCallId as string) ?? "{}";
+                  const mapped = mapToolInput(msg.toolName as string, accumulated);
                   let input: unknown = {};
-                  try { input = JSON.parse(accumulated); } catch { input = {}; }
+                  try { input = JSON.parse(mapped); } catch { input = {}; }
                   toolCalls.push({
                     type: "tool-call",
                     toolCallId: msg.toolCallId,
-                    toolName: msg.toolName,
+                    toolName: mapToolName(msg.toolName as string),
                     input,
                   } as LanguageModelV2Content);
                 }
@@ -328,7 +384,7 @@ export class ClwndModel implements LanguageModelV2 {
                 }
                 if (ct === "tool_input_start" && msg.toolCallId && msg.toolName) {
                   toolInputAccum.set(msg.toolCallId as string, "");
-                  emit({ type: "tool-input-start", id: msg.toolCallId, toolName: msg.toolName } as LanguageModelV2StreamPart);
+                  emit({ type: "tool-input-start", id: msg.toolCallId, toolName: mapToolName(msg.toolName as string) } as LanguageModelV2StreamPart);
                 }
                 if (ct === "tool_input_delta" && msg.toolCallId && msg.partialJson) {
                   const prev = toolInputAccum.get(msg.toolCallId as string) ?? "";
@@ -337,19 +393,22 @@ export class ClwndModel implements LanguageModelV2 {
                 }
                 if (ct === "tool_call" && msg.toolCallId && msg.toolName) {
                   const accumulated = toolInputAccum.get(msg.toolCallId as string) ?? "{}";
+                  const ocToolName = mapToolName(msg.toolName as string);
                   emit({
                     type: "tool-call",
                     toolCallId: msg.toolCallId,
-                    toolName: msg.toolName,
-                    input: accumulated,
+                    toolName: ocToolName,
+                    input: mapToolInput(msg.toolName as string, accumulated),
                     providerExecuted: true,
                   } as LanguageModelV2StreamPart);
                 }
                 if (ct === "tool_result" && msg.toolCallId) {
+                  const raw = (msg as Record<string, unknown>).result ?? "";
+                  const { output, title, metadata } = parseToolResult(typeof raw === "string" ? raw : JSON.stringify(raw));
                   emit({
                     type: "tool-result",
                     toolCallId: msg.toolCallId,
-                    result: { output: (msg as Record<string, unknown>).result ?? "", title: "", metadata: {} },
+                    result: { output, title, metadata },
                     providerExecuted: true,
                   } as LanguageModelV2StreamPart);
                 }

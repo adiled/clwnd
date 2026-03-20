@@ -42,5 +42,8 @@
   "devDependencies": {
     "tsup": "^8.0.0",
     "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "diff": "^8.0.3"
   }
 }
