@@ -392,12 +392,25 @@ export class ClwndModel implements LanguageModelV2 {
                   emit({ type: "tool-input-delta", id: msg.toolCallId, delta: msg.partialJson } as LanguageModelV2StreamPart);
                 }
                 if (ct === "tool_call" && msg.toolCallId && msg.toolName) {
-                  const accumulated = toolInputAccum.get(msg.toolCallId as string) ?? "{}";
                   const ocToolName = mapToolName(msg.toolName as string);
-                  const mappedInput = mapToolInput(msg.toolName as string, accumulated);
-                  // OpenCode expects input as a parsed object for native tool rendering
+                  // For MCP tools, tool_input_start may never fire (Claude CLI emits
+                  // the full assistant message, not streaming content blocks). Emit
+                  // tool-input-start so OpenCode's processor creates the part entry.
+                  if (!toolInputAccum.has(msg.toolCallId as string)) {
+                    emit({ type: "tool-input-start", id: msg.toolCallId, toolName: ocToolName } as LanguageModelV2StreamPart);
+                  }
+                  // Resolve input: prefer accumulated from streaming, fall back to msg.input
+                  const accumulated = toolInputAccum.get(msg.toolCallId as string);
+                  let rawInput: string;
+                  if (accumulated) {
+                    rawInput = mapToolInput(msg.toolName as string, accumulated);
+                  } else if (msg.input && typeof msg.input === "object") {
+                    rawInput = mapToolInput(msg.toolName as string, JSON.stringify(msg.input));
+                  } else {
+                    rawInput = "{}";
+                  }
                   let parsedInput: unknown;
-                  try { parsedInput = JSON.parse(mappedInput); } catch { parsedInput = mappedInput; }
+                  try { parsedInput = JSON.parse(rawInput); } catch { parsedInput = rawInput; }
                   emit({
                     type: "tool-call",
                     toolCallId: msg.toolCallId,
