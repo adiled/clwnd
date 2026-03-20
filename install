@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+set -e
+
+# ─── XDG directories ────────────────────────────────────────────────────────
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+
+CLWND_CONFIG="$XDG_CONFIG_HOME/clwnd"
+CLWND_DATA="$XDG_DATA_HOME/clwnd"
+CLWND_STATE="$XDG_STATE_HOME/clwnd"
+CLWND_RUNTIME="$XDG_RUNTIME_DIR/clwnd"
+
+OPENCODE_CONFIG="$XDG_CONFIG_HOME/opencode/opencode.json"
+
+CLWND_REPO="https://github.com/adiled/clwnd.git"
+CLWND_SRC="$CLWND_DATA/src"
+
+OS="$(uname -s)"
+CMD="${1:-install}"
+
+SOCK_PATH="$CLWND_RUNTIME/clwnd.sock"
+
+# ─── helpers ─────────────────────────────────────────────────────────────────
+
+check_prereqs() {
+  [ -x "$(command -v bun)" ]    || { echo "error: bun required"; exit 1; }
+  [ -x "$(command -v claude)" ] || { echo "error: claude CLI required"; exit 1; }
+  [ -x "$(command -v git)" ]    || { echo "error: git required"; exit 1; }
+}
+
+ensure_dirs() {
+  mkdir -p "$CLWND_CONFIG" "$CLWND_DATA" "$CLWND_STATE" "$CLWND_RUNTIME"
+}
+
+ensure_source() {
+  if [ -d "$CLWND_SRC/.git" ]; then
+    echo "[source] updating $CLWND_SRC..."
+    git -C "$CLWND_SRC" pull --ff-only
+  else
+    echo "[source] cloning to $CLWND_SRC..."
+    git clone "$CLWND_REPO" "$CLWND_SRC"
+  fi
+}
+
+do_build() {
+  echo "[build] bun install..."
+  cd "$CLWND_SRC"
+  bun install
+
+  echo "[build] compiling..."
+  bun run build
+}
+
+plugin_ref() {
+  echo "file://$CLWND_SRC/plugins/opencode/dist/index.js"
+}
+
+configure_opencode() {
+  echo "[config] opencode.json..."
+  local PLUGIN_REF
+  PLUGIN_REF=$(plugin_ref)
+
+  bun -e "
+const fs = require('fs');
+const configPath = '${OPENCODE_CONFIG}';
+const pluginRef = '${PLUGIN_REF}';
+
+const registry = JSON.parse(fs.readFileSync('${CLWND_SRC}/models.json', 'utf8'));
+
+let config = {};
+try {
+  config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+} catch {}
+
+// Add plugin entry
+if (!config.plugin) config.plugin = [];
+if (!config.plugin.includes(pluginRef)) {
+  config.plugin.push(pluginRef);
+  console.log('  added plugin: ' + pluginRef);
+} else {
+  console.log('  plugin already registered');
+}
+
+// Add provider + models
+if (!config.provider) config.provider = {};
+
+if (config.provider.clwnd) {
+  console.log('  provider already configured, skipping');
+} else {
+  const models = {};
+  for (const [id, entry] of Object.entries(registry)) {
+    models[id] = {
+      id,
+      name: entry.name,
+      tool_call: entry.tool_call ?? true,
+      provider: { npm: pluginRef }
+    };
+  }
+  config.provider.clwnd = {
+    npm: pluginRef,
+    models
+  };
+  console.log('  added clwnd provider with ' + Object.keys(models).length + ' models');
+}
+
+fs.mkdirSync(require('path').dirname(configPath), { recursive: true });
+fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+"
+}
+
+register_service() {
+  local BUN CLAUDE
+  BUN=$(which bun)
+  CLAUDE=$(which claude)
+
+  if [ "$OS" = "Darwin" ]; then
+    local PLIST_LABEL="com.clwnd.daemon"
+    local PLIST_FILE="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$PLIST_FILE" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${PLIST_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>cd ${CLWND_SRC} &amp;&amp; git pull --ff-only &amp;&amp; ${BUN} install --frozen-lockfile &amp;&amp; ${BUN} run build &amp;&amp; exec ${BUN} ${CLWND_SRC}/dist/daemon/index.js</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${CLWND_SRC}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLWND_SOCKET</key>
+    <string>${SOCK_PATH}</string>
+    <key>CLWND_CWD</key>
+    <string>${HOME}</string>
+    <key>CLAUDE_CLI_PATH</key>
+    <string>${CLAUDE}</string>
+    <key>XDG_CONFIG_HOME</key>
+    <string>${XDG_CONFIG_HOME}</string>
+    <key>XDG_DATA_HOME</key>
+    <string>${XDG_DATA_HOME}</string>
+    <key>XDG_STATE_HOME</key>
+    <string>${XDG_STATE_HOME}</string>
+    <key>XDG_RUNTIME_DIR</key>
+    <string>${XDG_RUNTIME_DIR}</string>
+    <key>PATH</key>
+    <string>$(dirname $CLAUDE):$(dirname $BUN):/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>${CLWND_STATE}/daemon.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>${CLWND_STATE}/daemon.stderr.log</string>
+</dict>
+</plist>
+EOF
+    echo "  wrote $PLIST_FILE"
+  else
+    local SERVICE_FILE="/etc/systemd/system/clwnd.service"
+    cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=clwnd daemon
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$CLWND_SRC
+Environment=CLWND_SOCKET=$SOCK_PATH
+Environment=CLWND_CWD=$HOME
+Environment=CLAUDE_CLI_PATH=$CLAUDE
+Environment=XDG_CONFIG_HOME=$XDG_CONFIG_HOME
+Environment=XDG_DATA_HOME=$XDG_DATA_HOME
+Environment=XDG_STATE_HOME=$XDG_STATE_HOME
+Environment=XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
+Environment=PATH=$(dirname $CLAUDE):$(dirname $BUN):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=/bin/sh -c 'cd $CLWND_SRC && git pull --ff-only && $BUN install --frozen-lockfile && $BUN run build'
+ExecStart=$BUN $CLWND_SRC/dist/daemon/index.js
+Restart=on-failure
+RestartSec=2s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clwnd
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable clwnd
+    echo "  wrote $SERVICE_FILE"
+  fi
+}
+
+start_daemon() {
+  if [ "$OS" = "Darwin" ]; then
+    local PLIST_LABEL="com.clwnd.daemon"
+    local PLIST_FILE="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+    launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_FILE"
+    sleep 1
+    if launchctl print "gui/$(id -u)/${PLIST_LABEL}" &>/dev/null; then
+      echo "  running"
+    else
+      echo "  FAILED — check: cat $CLWND_STATE/daemon.stderr.log"
+      exit 1
+    fi
+  else
+    systemctl restart clwnd
+    sleep 1
+    if systemctl is-active --quiet clwnd; then
+      echo "  running, pid: $(systemctl show --property MainPID --value clwnd)"
+    else
+      echo "  FAILED — check: journalctl -u clwnd -n 20"
+      exit 1
+    fi
+  fi
+}
+
+stop_daemon() {
+  if [ "$OS" = "Darwin" ]; then
+    local PLIST_LABEL="com.clwnd.daemon"
+    launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || true
+  else
+    systemctl stop clwnd 2>/dev/null || true
+  fi
+}
+
+print_status() {
+  echo ""
+  echo "done."
+  echo "  socket: $SOCK_PATH"
+  echo "  config: $CLWND_CONFIG/"
+  echo "  data:   $CLWND_DATA/"
+  echo "  state:  $CLWND_STATE/"
+  if [ "$OS" = "Darwin" ]; then
+    echo "  logs:   tail -f $CLWND_STATE/daemon.stderr.log"
+    echo "  stop:   launchctl bootout gui/$(id -u)/com.clwnd.daemon"
+  else
+    echo "  logs:   journalctl -u clwnd -f"
+    echo "  stop:   systemctl stop clwnd"
+  fi
+}
+
+# ─── commands ────────────────────────────────────────────────────────────────
+
+cmd_install() {
+  echo "=== clwnd install ==="
+  check_prereqs
+  ensure_dirs
+  ensure_source
+  do_build
+
+  echo "[service] registering..."
+  register_service
+
+  configure_opencode
+
+  echo "[daemon] starting..."
+  start_daemon
+  print_status
+}
+
+cmd_update() {
+  echo "=== clwnd update ==="
+  check_prereqs
+  ensure_dirs
+  ensure_source
+
+  echo "[daemon] stopping..."
+  stop_daemon
+
+  do_build
+
+  echo "[service] re-registering..."
+  register_service
+
+  # plugin + provider config already in opencode.json from install
+
+  echo "[daemon] restarting..."
+  start_daemon
+  print_status
+}
+
+cmd_uninstall() {
+  echo "=== clwnd uninstall ==="
+
+  echo "[daemon] stopping..."
+  stop_daemon
+
+  if [ "$OS" = "Darwin" ]; then
+    rm -f "$HOME/Library/LaunchAgents/com.clwnd.daemon.plist"
+    echo "  removed plist"
+  else
+    rm -f /etc/systemd/system/clwnd.service
+    systemctl daemon-reload 2>/dev/null || true
+    echo "  removed systemd unit"
+  fi
+
+  # remove plugin entry + provider from opencode.json
+  if [ -f "$OPENCODE_CONFIG" ]; then
+    bun -e "
+const fs = require('fs');
+const p = '${OPENCODE_CONFIG}';
+try {
+  const c = JSON.parse(fs.readFileSync(p, 'utf8'));
+  let changed = false;
+
+  // remove from plugin array
+  if (Array.isArray(c.plugin)) {
+    const before = c.plugin.length;
+    c.plugin = c.plugin.filter(s => !s.includes('clwnd'));
+    if (c.plugin.length === 0) delete c.plugin;
+    if (c.plugin?.length !== before) { changed = true; console.log('  removed plugin entry'); }
+  }
+
+  // remove provider
+  if (c.provider?.clwnd) {
+    delete c.provider.clwnd;
+    if (Object.keys(c.provider).length === 0) delete c.provider;
+    changed = true;
+    console.log('  removed clwnd provider');
+  }
+
+  if (changed) fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n');
+} catch {}
+"
+  fi
+
+  echo ""
+  echo "uninstalled. XDG dirs left in place:"
+  echo "  $CLWND_CONFIG  $CLWND_DATA  $CLWND_STATE"
+}
+
+# ─── dispatch ────────────────────────────────────────────────────────────────
+
+case "$CMD" in
+  install)   cmd_install ;;
+  update)    cmd_update ;;
+  uninstall) cmd_uninstall ;;
+  *)
+    echo "Usage: $0 {install|update|uninstall}"
+    echo ""
+    echo "  install    — full setup: build, register service, configure opencode, start"
+    echo "  update     — rebuild, re-register service, restart daemon"
+    echo "  uninstall  — stop daemon, remove service, clean opencode config"
+    exit 1
+    ;;
+esac

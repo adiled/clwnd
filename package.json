@@ -1,0 +1,45 @@
+{
+  "name": "clwnd",
+  "version": "0.1.0",
+  "description": "Claude Code CLI daemon for OpenCode",
+  "type": "module",
+  "private": true,
+  "workspaces": [
+    "plugins/*"
+  ],
+  "main": "dist/daemon/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/daemon/index.js",
+      "types": "./dist/daemon/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup && bun run --filter '@clwnd/*' build",
+    "build:daemon": "tsup",
+    "build:plugins": "bun run --filter '@clwnd/*' build",
+    "dev": "tsup --watch",
+    "test": "bun test tests/",
+    "test:smoke": "bun test tests/smoke.test.ts",
+    "typecheck": "tsc --noEmit",
+    "version:patch": "bun run scripts/version.sh patch",
+    "version:minor": "bun run scripts/version.sh minor",
+    "version:major": "bun run scripts/version.sh major"
+  },
+  "keywords": [
+    "opencode",
+    "claude",
+    "cli",
+    "daemon",
+    "ai"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adiled/clwnd.git"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.0"
+  }
+}

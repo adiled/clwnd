@@ -1,0 +1,209 @@
+{
+  "claude-opus-4-6": {
+    "id": "claude-opus-4-6",
+    "name": "Claude Opus 4.6",
+    "family": "claude-opus",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 1000000, "output": 128000 }
+  },
+  "claude-sonnet-4-6": {
+    "id": "claude-sonnet-4-6",
+    "name": "Claude Sonnet 4.6",
+    "family": "claude-sonnet",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 1000000, "output": 64000 }
+  },
+  "claude-opus-4-5-20251101": {
+    "id": "claude-opus-4-5-20251101",
+    "name": "Claude Opus 4.5",
+    "family": "claude-opus",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 64000 }
+  },
+  "claude-opus-4-5": {
+    "id": "claude-opus-4-5",
+    "name": "Claude Opus 4.5 (latest)",
+    "family": "claude-opus",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 64000 }
+  },
+  "claude-opus-4-1-20250805": {
+    "id": "claude-opus-4-1-20250805",
+    "name": "Claude Opus 4.1",
+    "family": "claude-opus",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 32000 }
+  },
+  "claude-opus-4-1": {
+    "id": "claude-opus-4-1",
+    "name": "Claude Opus 4.1 (latest)",
+    "family": "claude-opus",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 32000 }
+  },
+  "claude-opus-4-20250514": {
+    "id": "claude-opus-4-20250514",
+    "name": "Claude Opus 4",
+    "family": "claude-opus",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 32000 }
+  },
+  "claude-opus-4-0": {
+    "id": "claude-opus-4-0",
+    "name": "Claude Opus 4 (latest)",
+    "family": "claude-opus",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 32000 }
+  },
+  "claude-3-opus-20240229": {
+    "id": "claude-3-opus-20240229",
+    "name": "Claude Opus 3",
+    "family": "claude-opus",
+    "tool_call": true,
+    "reasoning": false,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 4096 }
+  },
+  "claude-sonnet-4-5-20250929": {
+    "id": "claude-sonnet-4-5-20250929",
+    "name": "Claude Sonnet 4.5",
+    "family": "claude-sonnet",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 64000 }
+  },
+  "claude-sonnet-4-5": {
+    "id": "claude-sonnet-4-5",
+    "name": "Claude Sonnet 4.5 (latest)",
+    "family": "claude-sonnet",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 64000 }
+  },
+  "claude-sonnet-4-20250514": {
+    "id": "claude-sonnet-4-20250514",
+    "name": "Claude Sonnet 4",
+    "family": "claude-sonnet",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 64000 }
+  },
+  "claude-sonnet-4-0": {
+    "id": "claude-sonnet-4-0",
+    "name": "Claude Sonnet 4 (latest)",
+    "family": "claude-sonnet",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 64000 }
+  },
+  "claude-3-7-sonnet-20250219": {
+    "id": "claude-3-7-sonnet-20250219",
+    "name": "Claude Sonnet 3.7",
+    "family": "claude-sonnet",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 64000 }
+  },
+  "claude-3-7-sonnet-latest": {
+    "id": "claude-3-7-sonnet-latest",
+    "name": "Claude Sonnet 3.7 (latest)",
+    "family": "claude-sonnet",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 64000 }
+  },
+  "claude-3-5-sonnet-20241022": {
+    "id": "claude-3-5-sonnet-20241022",
+    "name": "Claude Sonnet 3.5 v2",
+    "family": "claude-sonnet",
+    "tool_call": true,
+    "reasoning": false,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 8192 }
+  },
+  "claude-3-5-sonnet-20240620": {
+    "id": "claude-3-5-sonnet-20240620",
+    "name": "Claude Sonnet 3.5",
+    "family": "claude-sonnet",
+    "tool_call": true,
+    "reasoning": false,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 8192 }
+  },
+  "claude-3-sonnet-20240229": {
+    "id": "claude-3-sonnet-20240229",
+    "name": "Claude Sonnet 3",
+    "family": "claude-sonnet",
+    "tool_call": true,
+    "reasoning": false,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 4096 }
+  },
+  "claude-haiku-4-5-20251001": {
+    "id": "claude-haiku-4-5-20251001",
+    "name": "Claude Haiku 4.5",
+    "family": "claude-haiku",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 64000 }
+  },
+  "claude-haiku-4-5": {
+    "id": "claude-haiku-4-5",
+    "name": "Claude Haiku 4.5 (latest)",
+    "family": "claude-haiku",
+    "tool_call": true,
+    "reasoning": true,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 64000 }
+  },
+  "claude-3-5-haiku-20241022": {
+    "id": "claude-3-5-haiku-20241022",
+    "name": "Claude Haiku 3.5",
+    "family": "claude-haiku",
+    "tool_call": true,
+    "reasoning": false,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 8192 }
+  },
+  "claude-3-5-haiku-latest": {
+    "id": "claude-3-5-haiku-latest",
+    "name": "Claude Haiku 3.5 (latest)",
+    "family": "claude-haiku",
+    "tool_call": true,
+    "reasoning": false,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 8192 }
+  },
+  "claude-3-haiku-20240307": {
+    "id": "claude-3-haiku-20240307",
+    "name": "Claude Haiku 3",
+    "family": "claude-haiku",
+    "tool_call": true,
+    "reasoning": false,
+    "attachment": true,
+    "limit": { "context": 200000, "output": 4096 }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "name": "@clwnd/opencode",
+  "version": "0.1.0",
+  "description": "clwnd for opencode",
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "bun run build"
+  },
+  "keywords": [
+    "opencode",
+    "claude",
+    "clwnd",
+    "plugin",
+    "ai"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adiled/clwnd.git",
+    "directory": "plugins/opencode"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@ai-sdk/provider": "^2.0.0",
+    "@ai-sdk/provider-utils": "^2.0.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.2.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.2.27",
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.0"
+  }
+}

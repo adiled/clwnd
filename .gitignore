@@ -1,0 +1,7 @@
+node_modules/
+dist/
+bun.lock
+*.tgz
+.claude/
+*.md
+!README.md

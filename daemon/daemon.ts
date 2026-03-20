@@ -1,0 +1,686 @@
+import { spawn, type Subprocess } from "bun";
+import { EventEmitter } from "events";
+import { existsSync, unlinkSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from "fs";
+import { randomUUID } from "crypto";
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+interface StreamHandler {
+  opencodeSessionId: string;
+  onSystemInit(sessionId: string, model: string, tools: string[]): void;
+  onChunk(type: string, data: Record<string, unknown>): void;
+  onFinish(info: { finishReason: string; usage: Record<string, number> | undefined; providerMetadata: Record<string, unknown> }): void;
+  onError(msg: string): void;
+}
+
+interface IpcToDaemon {
+  action: string;
+  opencodeSessionId: string;
+  cwd?: string;
+  modelId?: string;
+  text?: string;
+  historyContext?: string;
+  toolUseId?: string;
+  result?: string;
+  [key: string]: unknown;
+}
+
+interface IpcToPlugin {
+  action: string;
+  opencodeSessionId?: string;
+  chunkType?: string;
+  finishReason?: string;
+  usage?: Record<string, number>;
+  providerMetadata?: Record<string, unknown>;
+  message?: string;
+  claudeSessionId?: string;
+  model?: string;
+  tools?: string[];
+  [key: string]: unknown;
+}
+
+// ─── Protocol ────────────────────────────────────────────────────────────────
+
+function encodePrompt(text: string): string {
+  return JSON.stringify({
+    type: "user",
+    message: { role: "user", content: [{ type: "text", text }] },
+  });
+}
+
+function encodeToolResult(toolUseId: string, result: string): string {
+  return JSON.stringify({
+    type: "user",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, content: result }] },
+  });
+}
+
+function parseLine(line: string): unknown {
+  try { return JSON.parse(line); } catch { return null; }
+}
+
+// ─── SubprocessPool ──────────────────────────────────────────────────────────
+
+interface ProcEntry {
+  proc: Subprocess;
+  handlers: Map<string, StreamHandler>;
+  activeSession: string | null;
+}
+
+class SubprocessPool {
+  private procs = new Map<string, ProcEntry>();
+
+  constructor(private cliPath = "claude") {}
+
+  // poolKey: unique key for subprocess lookup (can be sessionId for isolation, or modelId for sharing)
+  // modelId: the actual model name passed to --model flag
+  // claudeSessionId: if provided, resume this Claude CLI session
+  sendSpawn(poolKey: string, modelId: string, handler: StreamHandler, claudeSessionId?: string): void {
+    let entry = this.procs.get(poolKey);
+    if (!entry) entry = this.spawnProc(poolKey, modelId, claudeSessionId);
+    handler.onChunk("stream_start", {});
+    entry.handlers.set(handler.opencodeSessionId, handler);
+  }
+
+  sendPrompt(sessionId: string, poolKey: string, text: string): void {
+    const entry = this.procs.get(poolKey);
+    if (!entry?.proc.stdin) return;
+    entry.activeSession = sessionId;
+    entry.proc.stdin.write(encodePrompt(text) + "\n");
+  }
+
+  sendToolResult(sessionId: string, poolKey: string, toolUseId: string, result: string): void {
+    const entry = this.procs.get(poolKey);
+    if (!entry?.proc.stdin) return;
+    entry.activeSession = sessionId;
+    entry.proc.stdin.write(encodeToolResult(toolUseId, result) + "\n");
+  }
+
+  abort(sessionId: string, poolKey: string): void {
+    const e = this.procs.get(poolKey);
+    if (e) {
+      e.handlers.delete(sessionId);
+      if (e.activeSession === sessionId) e.activeSession = null;
+    }
+  }
+
+  destroy(sessionId: string, poolKey: string): void {
+    const e = this.procs.get(poolKey);
+    if (e) {
+      e.handlers.delete(sessionId);
+      if (e.activeSession === sessionId) e.activeSession = null;
+      if (e.handlers.size === 0) {
+        try { e.proc.kill(); } catch {}
+        this.procs.delete(poolKey);
+      }
+    }
+  }
+
+  status(): Array<{ model: string; pid?: number; sessions: string[] }> {
+    const out: Array<{ model: string; pid?: number; sessions: string[] }> = [];
+    for (const [id, e] of this.procs) {
+      out.push({ model: id, pid: e.proc.pid, sessions: Array.from(e.handlers.keys()) });
+    }
+    return out;
+  }
+
+  killAll(): void {
+    for (const [, e] of this.procs) { try { e.proc.kill(); } catch {} }
+    this.procs.clear();
+  }
+
+  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string): ProcEntry {
+    const cmd = [
+      this.cliPath, "-p",
+      "--verbose",
+      "--input-format", "stream-json",
+      "--output-format", "stream-json",
+      "--model", modelId,
+      "--include-partial-messages",
+    ];
+    // First turn: --session-id creates a new session with a known UUID
+    // Subsequent turns: --resume continues the existing session
+    if (claudeSessionId) {
+      cmd.push("--resume", claudeSessionId);
+    }
+    const proc = spawn({
+      cmd,
+      cwd: process.env.CLWND_CWD ?? process.env.HOME ?? "/",
+      env: { ...process.env, TERM: "xterm-256color" },
+      stdout: "pipe",
+      stdin: "pipe",
+      stderr: "pipe",
+    });
+
+    const entry: ProcEntry = { proc, handlers: new Map(), activeSession: null };
+    this.procs.set(poolKey, entry);
+    console.log("spawn:", poolKey, "model:", modelId, "pid", proc.pid);
+
+    this.readStderr(proc, poolKey);
+
+    proc.exited.then(exit => {
+      console.log("proc", poolKey, "exited:", exit.exitCode);
+      for (const h of entry.handlers.values()) {
+        try { h.onError(`subprocess exited: code=${exit.exitCode}`); } catch {}
+      }
+      entry.handlers.clear();
+      entry.activeSession = null;
+      this.procs.delete(poolKey);
+    });
+
+    this.readLoop(proc, poolKey, entry);
+    return entry;
+  }
+
+  private readStderr(proc: Subprocess, modelId: string): void {
+    if (!proc.stderr) return;
+    const reader = proc.stderr.getReader();
+    const dec = new TextDecoder();
+    (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const text = dec.decode(value!, { stream: true });
+          if (text.trim()) console.error("stderr[" + modelId + "]:", text.trim());
+        }
+      } catch {}
+    })();
+  }
+
+  private readLoop(proc: Subprocess, modelId: string, entry: ProcEntry): void {
+    const reader = proc.stdout!.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+
+    (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value!, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() ?? "";
+          for (const line of lines) {
+            if (line.trim()) this.dispatchLine(modelId, entry, parseLine(line));
+          }
+        }
+      } catch (e) {
+        console.error("readLoop:", e);
+        for (const h of entry.handlers.values()) {
+          try { h.onError(`readLoop error: ${e}`); } catch {}
+        }
+        entry.handlers.clear();
+      }
+    })();
+  }
+
+  private dispatchLine(modelId: string, entry: ProcEntry, msg: unknown): void {
+    if (!msg || typeof msg !== "object") return;
+    const m = msg as Record<string, unknown>;
+
+    if (m.type === "system" && m.subtype === "init") {
+      const sid = (m.session_id as string) ?? "";
+      const model = (m.model as string) ?? modelId;
+      const tools = ((m.tools as unknown[]) ?? []).map(String);
+      for (const h of entry.handlers.values()) h.onSystemInit(sid, model, tools);
+      return;
+    }
+
+    let handler: StreamHandler | undefined;
+    if (entry.activeSession) {
+      handler = entry.handlers.get(entry.activeSession);
+    }
+    if (!handler) {
+      handler = entry.handlers.values().next().value;
+    }
+    if (!handler) return;
+
+    const emit = (type: string, data: Record<string, unknown>) => handler!.onChunk(type, data);
+
+    if (m.type === "content_block_start") {
+      const block = (m.content_block ?? {}) as Record<string, unknown>;
+      if (block.type === "thinking") emit("reasoning_start", { id: m.index });
+      if (block.type === "text") emit("text_start", { id: m.index });
+      if (block.type === "tool_use") emit("tool_input_start", { toolCallId: block.id as string, toolName: block.name as string });
+      return;
+    }
+
+    if (m.type === "content_block_delta") {
+      const delta = (m.delta ?? {}) as Record<string, unknown>;
+      if (delta.type === "thinking_delta") emit("reasoning_delta", { delta: delta.thinking as string });
+      if (delta.type === "text_delta") emit("text_delta", { delta: delta.text as string });
+      if (delta.type === "input_json_delta") emit("tool_input_delta", { partialJson: delta.partial_json as string });
+      return;
+    }
+
+    if (m.type === "content_block_stop") {
+      emit("content_block_stop", { blockIdx: m.index });
+      return;
+    }
+
+    if (m.type === "assistant" && m.message) {
+      const content = ((m.message as Record<string, unknown>).content ?? []) as Array<Record<string, unknown>>;
+      for (const block of content) {
+        if (block.type === "text" && typeof block.text === "string") emit("text_delta", { delta: block.text });
+        if (block.type === "tool_use") emit("tool_call", { toolCallId: block.id as string, toolName: block.name as string, input: block.input });
+      }
+      return;
+    }
+
+    if (m.type === "user" && m.message) {
+      const content = ((m.message as Record<string, unknown>).content ?? []) as Array<Record<string, unknown>>;
+      for (const block of content) {
+        if (block.type === "tool_result") {
+          const toolUseId = (block.tool_use_id as string) ?? "";
+          let resultText = "";
+          const raw = block.content;
+          if (typeof raw === "string") resultText = raw;
+          else if (Array.isArray(raw)) resultText = (raw as Array<Record<string, unknown>>).filter(c => typeof c.text === "string").map(c => c.text as string).join("\n");
+          emit("tool_result", { toolUseId, result: resultText });
+        }
+      }
+      return;
+    }
+
+    if (m.type === "result") {
+      handler.onFinish({
+        finishReason: (m.stop_reason as string) ?? "stop",
+        usage: m.usage as Record<string, number> | undefined,
+        providerMetadata: { sessionId: m.session_id, cost: m.total_cost_usd },
+      });
+      if (entry.activeSession) {
+        entry.handlers.delete(entry.activeSession);
+        entry.activeSession = null;
+      }
+    }
+  }
+}
+
+// ─── Session State (in-memory) ───────────────────────────────────────────────
+
+interface Session {
+  opencodeSessionId: string;
+  claudeSessionId: string | null;
+  claudeSessionPath: string | null;
+  cwd: string;
+  modelId: string;
+}
+
+const sessions = new Map<string, Session>();
+
+// ─── JSONL (Claude CLI history) ──────────────────────────────────────────────
+
+const CLAUDE_BASE = `${process.env.HOME}/.claude`;
+
+function cwdHash(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, "-").replace(/^-+|-+$/g, "");
+}
+
+function getSessionDir(cwd: string): string {
+  return `${CLAUDE_BASE}/projects/${cwdHash(cwd)}`;
+}
+
+function getSessionPath(cwd: string, id: string): string {
+  return `${getSessionDir(cwd)}/${id}.jsonl`;
+}
+
+function appendToJsonl(path: string, record: Record<string, unknown>): string {
+  const uuid = randomUUID();
+  const entry = { ...record, uuid, timestamp: new Date().toISOString() };
+  appendFileSync(path, JSON.stringify(entry) + "\n");
+  return uuid;
+}
+
+function getLastEntryUuid(path: string): string | null {
+  try {
+    const content = readFileSync(path, "utf-8");
+    const lines = content.trim().split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const e = JSON.parse(lines[i]);
+        if (e.uuid) return e.uuid as string;
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+function createClaudeSession(cwd: string, id: string): string {
+  const dir = getSessionDir(cwd);
+  const path = getSessionPath(cwd, id);
+  try { mkdirSync(dir, { recursive: true }); } catch {}
+  writeFileSync(path, JSON.stringify({
+    type: "summary",
+    summary: "clwnd session",
+    leafUuid: null,
+    sessionId: id,
+    timestamp: new Date().toISOString(),
+  }) + "\n");
+  return path;
+}
+
+function injectUserMessage(sessionPath: string, content: string | Record<string, unknown>[], parentUuid: string | null, sessionId: string): string {
+  return appendToJsonl(sessionPath, {
+    type: "user",
+    parentUuid,
+    sessionId,
+    message: { role: "user", content },
+    entrypoint: "sdk-cli",
+  });
+}
+
+// ─── IPC ─────────────────────────────────────────────────────────────────────
+
+const emitter = new EventEmitter();
+
+function onBroadcast(cb: (msg: IpcToPlugin) => void): void {
+  emitter.on("broadcast", cb);
+}
+
+function emitBroadcast(msg: IpcToPlugin): void {
+  emitter.emit("broadcast", msg);
+}
+
+function handleAction(msg: IpcToDaemon, pool: SubprocessPool): void {
+  switch (msg.action) {
+    case "spawn": {
+      const { opencodeSessionId, cwd, modelId } = msg;
+      const session: Session = {
+        opencodeSessionId,
+        claudeSessionId: null,
+        claudeSessionPath: null,
+        cwd: cwd ?? "/root",
+        modelId: modelId ?? "sonnet",
+      };
+      sessions.set(opencodeSessionId, session);
+
+      const h: StreamHandler = {
+        opencodeSessionId,
+        onSystemInit(claudeSessionId, model, tools) {
+          const path = createClaudeSession(session.cwd, claudeSessionId);
+          session.claudeSessionId = claudeSessionId;
+          session.claudeSessionPath = path;
+          emitBroadcast({ action: "session_ready", opencodeSessionId, claudeSessionId, model, tools });
+        },
+        onChunk(type, data) {
+          emitBroadcast({ action: "chunk", opencodeSessionId, chunkType: type, ...data } as unknown as IpcToPlugin);
+        },
+        onFinish(finish) {
+          emitBroadcast({
+            action: "finish",
+            opencodeSessionId,
+            finishReason: finish.finishReason,
+            usage: finish.usage,
+            providerMetadata: finish.providerMetadata,
+          });
+        },
+        onError(err) {
+          emitBroadcast({ action: "error", opencodeSessionId, message: err });
+        },
+      };
+
+      pool.sendSpawn(opencodeSessionId, session.modelId, h);
+      break;
+    }
+
+    case "prompt": {
+      const { opencodeSessionId, text } = msg;
+      const session = sessions.get(opencodeSessionId);
+      if (!session) {
+        emitBroadcast({ action: "error", opencodeSessionId, message: "session not found" });
+        return;
+      }
+
+      // Inject into Claude CLI JSONL
+      if (session.claudeSessionId && session.claudeSessionPath) {
+        const parentUuid = getLastEntryUuid(session.claudeSessionPath);
+        injectUserMessage(session.claudeSessionPath, text ?? "", parentUuid, session.claudeSessionId);
+      }
+
+      const fullText = (msg.historyContext as string)
+        ? `Previous context:\n${msg.historyContext}\n\nNew message:\n${text}`
+        : (text ?? "");
+      pool.sendPrompt(opencodeSessionId, session.modelId, fullText);
+      break;
+    }
+
+    case "tool_result": {
+      const { opencodeSessionId, toolUseId, result } = msg;
+      const session = sessions.get(opencodeSessionId);
+      if (!session) return;
+
+      if (session.claudeSessionPath && session.claudeSessionId) {
+        const parentUuid = getLastEntryUuid(session.claudeSessionPath);
+        injectUserMessage(session.claudeSessionPath, [
+          { type: "tool_result", tool_use_id: toolUseId, content: result, is_error: false }
+        ], parentUuid, session.claudeSessionId);
+      }
+
+      pool.sendToolResult(opencodeSessionId, session.modelId, toolUseId ?? "", result ?? "");
+      break;
+    }
+
+    case "abort": {
+      const session = sessions.get(msg.opencodeSessionId);
+      if (session) pool.abort(msg.opencodeSessionId, session.modelId);
+      break;
+    }
+
+    case "destroy": {
+      const session = sessions.get(msg.opencodeSessionId);
+      if (session) pool.destroy(msg.opencodeSessionId, session.modelId);
+      sessions.delete(msg.opencodeSessionId);
+      break;
+    }
+
+    case "status": {
+      emitBroadcast({ action: "status_reply", opencodeSessionId: msg.opencodeSessionId, procs: pool.status() });
+      break;
+    }
+
+    case "ping": {
+      emitBroadcast({ action: "pong" });
+      break;
+    }
+  }
+}
+
+// ─── HTTP Server ─────────────────────────────────────────────────────────────
+
+function defaultSocketPath(): string {
+  const runtime = process.env.XDG_RUNTIME_DIR;
+  if (runtime) {
+    const dir = `${runtime}/clwnd`;
+    mkdirSync(dir, { recursive: true });
+    return `${dir}/clwnd.sock`;
+  }
+  return "/tmp/clwnd.sock";
+}
+
+const SOCK = process.env.CLWND_SOCKET ?? defaultSocketPath();
+const HTTP = SOCK + ".http";
+
+const pool = new SubprocessPool(process.env.CLAUDE_CLI_PATH ?? "claude");
+
+const pendingEvents = new Map<string, IpcToPlugin[]>();
+const sseClients = new Map<string, (msg: IpcToPlugin) => void>();
+
+function flushToSse(sessionId: string, send: (msg: IpcToPlugin) => void) {
+  const buf = pendingEvents.get(sessionId) ?? [];
+  pendingEvents.delete(sessionId);
+  for (const m of buf) { try { send(m); } catch { break; } }
+}
+
+function broadcastToSession(sessionId: string, msg: IpcToPlugin) {
+  const send = sseClients.get(sessionId);
+  if (send) {
+    try { send(msg); } catch { sseClients.delete(sessionId); }
+  } else {
+    if (!pendingEvents.has(sessionId)) pendingEvents.set(sessionId, []);
+    pendingEvents.get(sessionId)!.push(msg);
+  }
+}
+
+onBroadcast((msg) => {
+  const sid = (msg as Record<string, unknown>).opencodeSessionId as string | undefined;
+  if (sid) broadcastToSession(sid, msg);
+  else {
+    for (const [id, send] of sseClients) {
+      try { send(msg); } catch { sseClients.delete(id); }
+    }
+  }
+});
+
+for (const p of [SOCK, HTTP]) {
+  if (existsSync(p)) { try { unlinkSync(p); } catch {} }
+}
+
+Bun.serve({
+  unix: HTTP,
+  idleTimeout: 0,
+  fetch(req) {
+    const url = new URL(req.url);
+
+    if (req.method === "POST" && url.pathname === "/") {
+      return req.text().then(body => {
+        try {
+          handleAction(JSON.parse(body) as IpcToDaemon, pool);
+        } catch (e) {
+          console.error("parse:", e);
+        }
+        return new Response("ok");
+      }).catch(() => new Response("error", { status: 500 }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/status") {
+      return new Response(JSON.stringify({ pid: process.pid, procs: pool.status(), sessions: sessions.size }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // Streaming endpoint: POST /stream — spawn + prompt, stream NDJSON response
+    if (req.method === "POST" && url.pathname === "/stream") {
+      return req.json().then((body: IpcToDaemon) => {
+        const { opencodeSessionId, cwd, modelId, text } = body;
+        const encoder = new TextEncoder();
+        let closed = false;
+
+        const stream = new ReadableStream({
+          start(controller) {
+            const send = (msg: IpcToPlugin) => {
+              if (closed) return;
+              try {
+                controller.enqueue(encoder.encode(JSON.stringify(msg) + "\n"));
+              } catch { closed = true; }
+            };
+
+            // Reuse existing session if we have one (for --resume)
+            const existing = sessions.get(opencodeSessionId);
+            const resumeSessionId = existing?.claudeSessionId ?? undefined;
+
+            const session: Session = {
+              opencodeSessionId,
+              claudeSessionId: existing?.claudeSessionId ?? null,
+              claudeSessionPath: existing?.claudeSessionPath ?? null,
+              cwd: cwd ?? "/root",
+              modelId: modelId ?? "sonnet",
+            };
+            sessions.set(opencodeSessionId, session);
+
+            const h: StreamHandler = {
+              opencodeSessionId,
+              onSystemInit(claudeSessionId, model, tools) {
+                // Only create session file if it doesn't already exist
+                if (!session.claudeSessionPath) {
+                  const dir = getSessionDir(session.cwd);
+                  try { mkdirSync(dir, { recursive: true }); } catch {}
+                  const path = getSessionPath(session.cwd, claudeSessionId);
+                  session.claudeSessionPath = path;
+                }
+                session.claudeSessionId = claudeSessionId;
+                send({ action: "session_ready", opencodeSessionId, claudeSessionId, model, tools });
+              },
+              onChunk(type, data) {
+                send({ action: "chunk", opencodeSessionId, chunkType: type, ...data } as unknown as IpcToPlugin);
+              },
+              onFinish(finish) {
+                send({
+                  action: "finish",
+                  opencodeSessionId,
+                  finishReason: finish.finishReason,
+                  usage: finish.usage,
+                  providerMetadata: finish.providerMetadata,
+                });
+                // Destroy subprocess but keep session — Claude CLI persists to JSONL,
+                // next turn will --resume with the same claudeSessionId
+                pool.destroy(opencodeSessionId, opencodeSessionId);
+                if (!closed) { closed = true; try { controller.close(); } catch {} }
+              },
+              onError(err) {
+                send({ action: "error", opencodeSessionId, message: err });
+                pool.destroy(opencodeSessionId, opencodeSessionId);
+                if (!closed) { closed = true; try { controller.close(); } catch {} }
+              },
+            };
+
+            const poolKey = opencodeSessionId;
+            pool.sendSpawn(poolKey, session.modelId, h, resumeSessionId);
+
+            // Send just the user text — Claude CLI handles history via session resume
+            pool.sendPrompt(opencodeSessionId, poolKey, text ?? "");
+          },
+          cancel() {
+            closed = true;
+            pool.destroy(opencodeSessionId, opencodeSessionId);
+          },
+        });
+
+        return new Response(stream, {
+          headers: { "Content-Type": "application/x-ndjson" },
+        });
+      }).catch(() => new Response("error", { status: 500 }));
+    }
+
+    if (req.method === "GET" && url.pathname === "/sse") {
+      const sessionId = url.searchParams.get("session") ?? "_all_";
+      const encoder = new TextEncoder();
+      let closed = false;
+
+      const stream = new ReadableStream({
+        start(controller) {
+          const send = (msg: IpcToPlugin) => {
+            if (closed) return;
+            try {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(msg)}\n\n`));
+            } catch { closed = true; }
+          };
+          sseClients.set(sessionId, send);
+          flushToSse(sessionId, send);
+        },
+        cancel() {
+          closed = true;
+          sseClients.delete(sessionId);
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "X-Accel-Buffering": "no",
+        },
+      });
+    }
+
+    return new Response("clwnd", { status: 200 });
+  },
+});
+
+process.on("SIGINT",  () => { pool.killAll(); process.exit(0); });
+process.on("SIGTERM", () => { pool.killAll(); process.exit(0); });
+process.on("uncaughtException",  e => console.error("uncaught:", e));
+process.on("unhandledRejection", e => console.error("unhandled:", e));
+
+console.log("HTTP:", HTTP, "pid:", process.pid);
+console.log("ready");
