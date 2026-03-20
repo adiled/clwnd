@@ -311,7 +311,7 @@ describe("bash execution", () => {
 });
 
 describe("session continuity", () => {
-  test("Claude CLI resumes session and recalls prior turns", async () => {
+  test("same opencodeSessionId reuses claudeSessionId (--resume)", async () => {
     const sid = `smoke-cont-${Date.now()}`;
 
     // Turn 1: establish a fact
@@ -322,12 +322,16 @@ describe("session continuity", () => {
       modelId: MODEL,
       text: "Remember this code: XYLOPHONE_42. Just confirm you see it.",
     });
-    trackSession(turn1);
+    const ready1 = findSessionReady(turn1);
+    expect(ready1).toBeDefined();
+    const claudeSid1 = ready1!.claudeSessionId as string;
+    expect(claudeSid1).toBeTruthy();
+    createdClaudeSessionIds.push(claudeSid1);
     const text1 = collectText(turn1);
     expect(text1.length).toBeGreaterThan(0);
     expect(findFinish(turn1)).toBeDefined();
 
-    // Turn 2: same opencodeSessionId — daemon will --resume the Claude CLI session
+    // Turn 2: same opencodeSessionId — daemon must --resume with same claudeSessionId
     const turn2 = await streamRequest({
       action: "stream",
       opencodeSessionId: sid,
@@ -335,8 +339,53 @@ describe("session continuity", () => {
       modelId: MODEL,
       text: "What was the code I told you to remember? Reply with just the code.",
     });
-    trackSession(turn2);
+    const ready2 = findSessionReady(turn2);
+    expect(ready2).toBeDefined();
+    const claudeSid2 = ready2!.claudeSessionId as string;
+    createdClaudeSessionIds.push(claudeSid2);
+
+    // Key assertion: same Claude CLI session was resumed
+    expect(claudeSid2).toBe(claudeSid1);
+
     expect(collectText(turn2)).toContain("XYLOPHONE_42");
+    expect(findFinish(turn2)).toBeDefined();
+  }, TIMEOUT);
+
+  test("different opencodeSessionId gets different claudeSessionId (no crosstalk)", async () => {
+    const sid1 = `smoke-iso-a-${Date.now()}`;
+    const sid2 = `smoke-iso-b-${Date.now()}`;
+
+    // Session A: establish a fact
+    const turn1 = await streamRequest({
+      action: "stream",
+      opencodeSessionId: sid1,
+      cwd: PROJECT_DIR,
+      modelId: MODEL,
+      text: "Remember this secret: MANGO_77. Confirm.",
+    });
+    const readyA = findSessionReady(turn1);
+    expect(readyA).toBeDefined();
+    createdClaudeSessionIds.push(readyA!.claudeSessionId as string);
+    expect(findFinish(turn1)).toBeDefined();
+
+    // Session B (different ID): ask for the secret — should NOT know it
+    const turn2 = await streamRequest({
+      action: "stream",
+      opencodeSessionId: sid2,
+      cwd: PROJECT_DIR,
+      modelId: MODEL,
+      text: "What secret did I tell you? If you don't know, reply with exactly: NO_SECRET",
+    });
+    const readyB = findSessionReady(turn2);
+    expect(readyB).toBeDefined();
+    createdClaudeSessionIds.push(readyB!.claudeSessionId as string);
+
+    // Different Claude sessions
+    expect(readyB!.claudeSessionId).not.toBe(readyA!.claudeSessionId);
+
+    // Should not recall MANGO_77
+    const text2 = collectText(turn2);
+    expect(text2).not.toContain("MANGO_77");
     expect(findFinish(turn2)).toBeDefined();
   }, TIMEOUT);
 

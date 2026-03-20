@@ -137,6 +137,7 @@ class SubprocessPool {
       "--output-format", "stream-json",
       "--model", modelId,
       "--include-partial-messages",
+      "--permission-mode", "acceptEdits",
     ];
     // First turn: --session-id creates a new session with a known UUID
     // Subsequent turns: --resume continues the existing session

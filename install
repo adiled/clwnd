@@ -86,7 +86,7 @@ if (!config.plugin.includes(pluginRef)) {
 // Add provider + models
 if (!config.provider) config.provider = {};
 
-if (config.provider.clwnd) {
+if (config.provider['opencode-clwnd']) {
   console.log('  provider already configured, skipping');
 } else {
   const models = {};
@@ -98,7 +98,7 @@ if (config.provider.clwnd) {
       provider: { npm: pluginRef }
     };
   }
-  config.provider.clwnd = {
+  config.provider['opencode-clwnd'] = {
     npm: pluginRef,
     models
   };
@@ -327,8 +327,8 @@ try {
   }
 
   // remove provider
-  if (c.provider?.clwnd) {
-    delete c.provider.clwnd;
+  if (c.provider?.['opencode-clwnd']) {
+    delete c.provider['opencode-clwnd'];
     if (Object.keys(c.provider).length === 0) delete c.provider;
     changed = true;
     console.log('  removed clwnd provider');
