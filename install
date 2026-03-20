@@ -19,6 +19,7 @@ CLWND_SRC="$CLWND_DATA/src"
 
 OS="$(uname -s)"
 CMD="${1:-install}"
+IS_ROOT=$([ "$(id -u)" = "0" ] && echo true || echo false)
 
 SOCK_PATH="$CLWND_RUNTIME/clwnd.sock"
 
@@ -169,7 +170,16 @@ register_service() {
 EOF
     echo "  wrote $PLIST_FILE"
   else
-    local SERVICE_FILE="/etc/systemd/system/clwnd.service"
+    local SERVICE_DIR SERVICE_FILE SC
+    if $IS_ROOT; then
+      SERVICE_DIR="/etc/systemd/system"
+      SC="systemctl"
+    else
+      SERVICE_DIR="$HOME/.config/systemd/user"
+      SC="systemctl --user"
+    fi
+    mkdir -p "$SERVICE_DIR"
+    SERVICE_FILE="$SERVICE_DIR/clwnd.service"
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=clwnd daemon
@@ -177,7 +187,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=$USER
+$($IS_ROOT && echo "User=$USER")
 WorkingDirectory=$CLWND_SRC
 Environment=CLWND_SOCKET=$SOCK_PATH
 Environment=CLWND_CWD=$HOME
@@ -196,10 +206,10 @@ StandardError=journal
 SyslogIdentifier=clwnd
 
 [Install]
-WantedBy=multi-user.target
+$($IS_ROOT && echo "WantedBy=multi-user.target" || echo "WantedBy=default.target")
 EOF
-    systemctl daemon-reload
-    systemctl enable clwnd
+    $SC daemon-reload
+    $SC enable clwnd
     echo "  wrote $SERVICE_FILE"
   fi
 }
@@ -218,12 +228,14 @@ start_daemon() {
       exit 1
     fi
   else
-    systemctl restart clwnd
+    local SC="systemctl"
+    $IS_ROOT || SC="systemctl --user"
+    $SC restart clwnd
     sleep 1
-    if systemctl is-active --quiet clwnd; then
-      echo "  running, pid: $(systemctl show --property MainPID --value clwnd)"
+    if $SC is-active --quiet clwnd; then
+      echo "  running, pid: $($SC show --property MainPID --value clwnd)"
     else
-      echo "  FAILED — check: journalctl -u clwnd -n 20"
+      echo "  FAILED — check: journalctl $($IS_ROOT || echo "--user") -u clwnd -n 20"
       exit 1
     fi
   fi
@@ -234,7 +246,9 @@ stop_daemon() {
     local PLIST_LABEL="com.clwnd.daemon"
     launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || true
   else
-    systemctl stop clwnd 2>/dev/null || true
+    local SC="systemctl"
+    $IS_ROOT || SC="systemctl --user"
+    $SC stop clwnd 2>/dev/null || true
   fi
 }
 
@@ -249,8 +263,13 @@ print_status() {
     echo "  logs:   tail -f $CLWND_STATE/daemon.stderr.log"
     echo "  stop:   launchctl bootout gui/$(id -u)/com.clwnd.daemon"
   else
-    echo "  logs:   journalctl -u clwnd -f"
-    echo "  stop:   systemctl stop clwnd"
+    if $IS_ROOT; then
+      echo "  logs:   journalctl -u clwnd -f"
+      echo "  stop:   systemctl stop clwnd"
+    else
+      echo "  logs:   journalctl --user -u clwnd -f"
+      echo "  stop:   systemctl --user stop clwnd"
+    fi
   fi
 }
 
@@ -304,8 +323,13 @@ cmd_uninstall() {
     rm -f "$HOME/Library/LaunchAgents/com.clwnd.daemon.plist"
     echo "  removed plist"
   else
-    rm -f /etc/systemd/system/clwnd.service
-    systemctl daemon-reload 2>/dev/null || true
+    if $IS_ROOT; then
+      rm -f /etc/systemd/system/clwnd.service
+      systemctl daemon-reload 2>/dev/null || true
+    else
+      rm -f "$HOME/.config/systemd/user/clwnd.service"
+      systemctl --user daemon-reload 2>/dev/null || true
+    fi
     echo "  removed systemd unit"
   fi
 
