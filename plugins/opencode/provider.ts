@@ -409,13 +409,11 @@ export class ClwndModel implements LanguageModelV2 {
                   } else {
                     rawInput = "{}";
                   }
-                  let parsedInput: unknown;
-                  try { parsedInput = JSON.parse(rawInput); } catch { parsedInput = rawInput; }
                   emit({
                     type: "tool-call",
                     toolCallId: msg.toolCallId,
                     toolName: ocToolName,
-                    input: parsedInput,
+                    input: rawInput,
                     providerExecuted: true,
                   } as LanguageModelV2StreamPart);
                 }
