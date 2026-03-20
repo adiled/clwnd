@@ -152,7 +152,7 @@ class SubprocessPool {
       "--output-format", "stream-json",
       "--model", modelId,
       "--include-partial-messages",
-      "--permission-mode", "acceptEdits",
+      "--permission-mode", process.env.CLWND_PERMISSION_MODE ?? "acceptEdits",
     ];
     if (claudeSessionId) {
       cmd.push("--resume", claudeSessionId);
