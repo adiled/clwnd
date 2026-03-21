@@ -417,12 +417,13 @@ export class ClwndModel implements LanguageModelV2 {
                     providerExecuted: true,
                   } as LanguageModelV2StreamPart);
                 }
-                if (ct === "tool_result" && msg.toolCallId) {
+                if (ct === "tool_result" && (msg.toolCallId || msg.toolUseId)) {
+                  const callId = (msg.toolCallId ?? msg.toolUseId) as string;
                   const raw = (msg as Record<string, unknown>).result ?? "";
                   const { output, title, metadata } = parseToolResult(typeof raw === "string" ? raw : JSON.stringify(raw));
                   emit({
                     type: "tool-result",
-                    toolCallId: msg.toolCallId,
+                    toolCallId: callId,
                     result: { output, title, metadata },
                     providerExecuted: true,
                   } as LanguageModelV2StreamPart);
