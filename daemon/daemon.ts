@@ -250,7 +250,12 @@ class SubprocessPool {
 
   private dispatchLine(modelId: string, entry: ProcEntry, msg: unknown): void {
     if (!msg || typeof msg !== "object") return;
-    const m = msg as Record<string, unknown>;
+    let m = msg as Record<string, unknown>;
+
+    // Unwrap stream_event wrapper from --include-partial-messages
+    if (m.type === "stream_event" && m.event && typeof m.event === "object") {
+      m = m.event as Record<string, unknown>;
+    }
 
     if (m.type === "system" && m.subtype === "init") {
       const sid = (m.session_id as string) ?? "";
