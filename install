@@ -136,7 +136,7 @@ register_service() {
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>cd ${CLWND_SRC} &amp;&amp; git pull --ff-only &amp;&amp; ${BUN} install --no-save &amp;&amp; ${BUN} run build &amp;&amp; exec ${BUN} ${CLWND_SRC}/dist/daemon/index.js</string>
+    <string>exec ${BUN} ${CLWND_SRC}/dist/daemon/index.js</string>
   </array>
   <key>WorkingDirectory</key>
   <string>${CLWND_SRC}</string>
@@ -202,7 +202,6 @@ Environment=XDG_DATA_HOME=$XDG_DATA_HOME
 Environment=XDG_STATE_HOME=$XDG_STATE_HOME
 Environment=XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
 Environment=PATH=$(dirname $CLAUDE):$(dirname $BUN):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStartPre=/bin/sh -c 'cd $CLWND_SRC && git pull --ff-only && $BUN install --no-save && $BUN run build'
 ExecStart=$BUN $CLWND_SRC/dist/daemon/index.js
 Restart=on-failure
 RestartSec=2s
