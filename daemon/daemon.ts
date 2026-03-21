@@ -334,7 +334,7 @@ class SubprocessPool {
   }
 }
 
-// ─── Session State (in-memory) ───────────────────────────────────────────────
+// ─── Session State (persisted) ───────────────────────────────────────────────
 
 interface Session {
   opencodeSessionId: string;
@@ -344,7 +344,30 @@ interface Session {
   modelId: string;
 }
 
-const sessions = new Map<string, Session>();
+const STATE_DIR = process.env.XDG_STATE_HOME
+  ? `${process.env.XDG_STATE_HOME}/clwnd`
+  : `${process.env.HOME}/.local/state/clwnd`;
+const SESSIONS_FILE = `${STATE_DIR}/sessions.json`;
+
+function loadSessions(): Map<string, Session> {
+  try {
+    const data = JSON.parse(readFileSync(SESSIONS_FILE, "utf-8"));
+    return new Map(Object.entries(data));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveSessions(): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true });
+    const obj: Record<string, Session> = {};
+    for (const [k, v] of sessions) obj[k] = v;
+    writeFileSync(SESSIONS_FILE, JSON.stringify(obj));
+  } catch {}
+}
+
+const sessions = loadSessions();
 
 // ─── JSONL (Claude CLI history) ──────────────────────────────────────────────
 
@@ -431,6 +454,7 @@ function handleAction(msg: IpcToDaemon, pool: SubprocessPool): void {
         modelId: modelId ?? "sonnet",
       };
       sessions.set(opencodeSessionId, session);
+      saveSessions();
 
       const h: StreamHandler = {
         opencodeSessionId,
@@ -438,6 +462,7 @@ function handleAction(msg: IpcToDaemon, pool: SubprocessPool): void {
           const path = createClaudeSession(session.cwd, claudeSessionId);
           session.claudeSessionId = claudeSessionId;
           session.claudeSessionPath = path;
+          saveSessions();
           emitBroadcast({ action: "session_ready", opencodeSessionId, claudeSessionId, model, tools });
         },
         onChunk(type, data) {
@@ -640,6 +665,7 @@ Bun.serve({
                 modelId: modelId ?? "sonnet",
               };
               sessions.set(opencodeSessionId, session);
+              saveSessions();
             }
 
             trace("stream.start", { sid: opencodeSessionId, resume: resumeSessionId ?? "new", sessions: sessions.size });
@@ -655,6 +681,7 @@ Bun.serve({
                   try { mkdirSync(dir, { recursive: true }); } catch {}
                   session.claudeSessionPath = getSessionPath(session.cwd, claudeSessionId);
                 }
+                saveSessions();
                 trace("stream.init", { sid: opencodeSessionId, claude: claudeSessionId });
                 send({ action: "session_ready", opencodeSessionId, claudeSessionId, model, tools });
               },
