@@ -211,6 +211,25 @@ describe("single prompt", () => {
   }, TIMEOUT);
 });
 
+describe("no duplicate text", () => {
+  test("text is not emitted twice from streaming + assistant message", async () => {
+    const messages = await streamRequest({
+      action: "stream",
+      opencodeSessionId: `smoke-dedup-${Date.now()}`,
+      cwd: PROJECT_DIR,
+      modelId: MODEL,
+      text: "Reply with exactly this word and nothing else: PINEAPPLE",
+    });
+
+    trackSession(messages);
+    const text = collectText(messages);
+    // Count occurrences — should be exactly 1
+    const count = (text.match(/PINEAPPLE/g) || []).length;
+    expect(count).toBe(1);
+    expect(findFinish(messages)).toBeDefined();
+  }, TIMEOUT);
+});
+
 describe("file read via MCP", () => {
   test("reads an existing project file", async () => {
     const messages = await streamRequest({
