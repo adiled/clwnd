@@ -17,6 +17,17 @@ import { createPatch } from "diff";
 
 const CWD = process.env.CLWND_CWD ?? process.cwd();
 
+// Additional allowed directories (e.g. /tmp for scratch files)
+const ALLOWED_DIRS = [CWD, "/tmp"];
+
+function assertPath(p: string): string {
+  const resolved = resolve(p);
+  if (ALLOWED_DIRS.some(dir => resolved.startsWith(dir + "/") || resolved === dir)) {
+    return resolved;
+  }
+  throw new Error(`Path ${resolved} is outside allowed directories`);
+}
+
 // ─── Tool Definitions ───────────────────────────────────────────────────────
 
 const TOOLS = [
@@ -108,7 +119,7 @@ interface ToolResult {
 }
 
 function execRead(args: { file_path: string; offset?: number; limit?: number }): ToolResult {
-  const p = resolve(args.file_path);
+  const p = assertPath(args.file_path);
   if (!existsSync(p)) return { output: `Error: ${p} does not exist`, title: p };
 
   try {
@@ -143,7 +154,7 @@ function execRead(args: { file_path: string; offset?: number; limit?: number }):
 }
 
 function execEdit(args: { file_path: string; old_string: string; new_string: string; replace_all?: boolean }): ToolResult {
-  const p = resolve(args.file_path);
+  const p = assertPath(args.file_path);
   if (!existsSync(p)) return { output: `Error: ${p} does not exist` };
 
   const original = readFileSync(p, "utf-8");
@@ -177,7 +188,7 @@ function execEdit(args: { file_path: string; old_string: string; new_string: str
 }
 
 function execWrite(args: { file_path: string; content: string }): ToolResult {
-  const p = resolve(args.file_path);
+  const p = assertPath(args.file_path);
   const dir = dirname(p);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const existed = existsSync(p);
@@ -223,7 +234,7 @@ function execBash(args: { command: string; description?: string; timeout?: numbe
 }
 
 function execGlob(args: { pattern: string; path?: string }): ToolResult {
-  const dir = args.path ?? CWD;
+  const dir = assertPath(args.path ?? CWD);
   try {
     const out = execSync(
       `shopt -s globstar nullglob; cd "${dir}" && printf '%s\n' ${args.pattern} 2>/dev/null | head -200`,
@@ -241,7 +252,7 @@ function execGlob(args: { pattern: string; path?: string }): ToolResult {
 }
 
 function execGrep(args: { pattern: string; path?: string; include?: string }): ToolResult {
-  const dir = args.path ?? CWD;
+  const dir = assertPath(args.path ?? CWD);
   let cmd = `rg --no-heading --line-number`;
   if (args.include) cmd += ` --glob "${args.include}"`;
   cmd += ` "${args.pattern}" "${dir}" 2>/dev/null | head -500`;
