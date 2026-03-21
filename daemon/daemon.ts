@@ -175,8 +175,8 @@ class SubprocessPool {
     ];
     if (claudeSessionId) {
       cmd.push("--resume", claudeSessionId);
-    }
-    if (systemPrompt) {
+    } else if (systemPrompt) {
+      // Only set on first turn — resumed sessions already have it
       cmd.push("--system-prompt", systemPrompt);
     }
     const proc = spawn({
