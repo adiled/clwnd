@@ -1,7 +1,7 @@
 {
   "name": "clwnd",
-  "version": "0.2.0",
-  "description": "Claude Code CLI daemon for OpenCode",
+  "version": "0.3.0",
+  "description": "clwnd - take back what is yours",
   "type": "module",
   "private": true,
   "workspaces": [
