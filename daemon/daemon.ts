@@ -177,7 +177,7 @@ class SubprocessPool {
       cmd.push("--resume", claudeSessionId);
     }
     if (systemPrompt) {
-      cmd.push("--append-system-prompt", systemPrompt);
+      cmd.push("--system-prompt", systemPrompt);
     }
     const proc = spawn({
       cmd,
