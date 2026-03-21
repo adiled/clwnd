@@ -120,6 +120,26 @@ function isAuxiliaryCall(opts: { prompt: LanguageModelV2Prompt; tools?: unknown[
   return !hasTools;
 }
 
+// Derive allowed MCP tools from OpenCode's resolved tool set.
+// OpenCode's resolveTools() already filters tools based on agent+session permissions.
+// If edit/write are denied (e.g. plan mode), they won't be in opts.tools.
+// We map OpenCode tool names to our MCP tool names.
+const OC_TO_MCP: Record<string, string> = {
+  read: "read", edit: "edit", write: "write", bash: "bash",
+  glob: "glob", grep: "grep", apply_patch: "edit",
+};
+
+function deriveAllowedTools(opts: { tools?: Array<{ name: string }> | unknown }): string[] {
+  if (!Array.isArray(opts.tools)) return ["read", "edit", "write", "bash", "glob", "grep"]; // default: all
+  const ocTools = new Set((opts.tools as Array<{ name: string }>).map(t => t.name));
+  const allowed: string[] = [];
+  for (const [ocName, mcpName] of Object.entries(OC_TO_MCP)) {
+    if (ocTools.has(ocName)) allowed.push(mcpName);
+  }
+  // Deduplicate
+  return [...new Set(allowed)];
+}
+
 function extractText(prompt: LanguageModelV2Prompt): string {
   for (let i = prompt.length - 1; i >= 0; i--) {
     const m = prompt[i];
@@ -212,6 +232,7 @@ export class ClwndModel implements LanguageModelV2 {
     const warnings: LanguageModelV2CallWarning[] = [];
     const cwd = this.config.cwd ?? process.cwd();
     const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
+    const allowedTools = isTitle ? [] : deriveAllowedTools(opts);
 
     let reasoning = "";
     let responseText = "";
@@ -241,6 +262,7 @@ export class ClwndModel implements LanguageModelV2 {
         text,
         systemPrompt,
         permissions,
+        allowedTools,
       }).then(async (resp) => {
         if (!resp.body) { abort(); return; }
         const reader = resp.body.getReader();
@@ -340,6 +362,7 @@ export class ClwndModel implements LanguageModelV2 {
     const self = this;
     const toolInputAccum = new Map<string, string>();
     const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
+    const allowedTools = isTitle ? [] : deriveAllowedTools(opts);
 
     const stream = new ReadableStream<LanguageModelV2StreamPart>({
       async start(controller) {
@@ -378,6 +401,7 @@ export class ClwndModel implements LanguageModelV2 {
             text,
             systemPrompt,
             permissions,
+            allowedTools,
           });
         } catch (e) {
           emit({ type: "error", error: new Error(String(e)) } as LanguageModelV2StreamPart);

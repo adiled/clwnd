@@ -92,9 +92,9 @@ class SubprocessPool {
 
   constructor(private cliPath = "claude") {}
 
-  sendSpawn(poolKey: string, modelId: string, handler: StreamHandler, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string): void {
+  sendSpawn(poolKey: string, modelId: string, handler: StreamHandler, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[]): void {
     let entry = this.procs.get(poolKey);
-    if (!entry) entry = this.spawnProc(poolKey, modelId, claudeSessionId, permissions, systemPrompt);
+    if (!entry) entry = this.spawnProc(poolKey, modelId, claudeSessionId, permissions, systemPrompt, allowedTools);
     handler.onChunk("stream_start", {});
     entry.handlers.set(handler.opencodeSessionId, handler);
   }
@@ -146,9 +146,10 @@ class SubprocessPool {
     this.procs.clear();
   }
 
-  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string): ProcEntry {
-    // Update MCP server permissions for this request
+  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[]): ProcEntry {
+    // Update MCP server permissions and allowed tools for this request
     mcpSetPerms((permissions ?? []) as any);
+    mcpSetAllowed(allowedTools);
 
     // MCP config — point Claude CLI to our persistent HTTP MCP server
     const mcpConfig = JSON.stringify({
@@ -175,8 +176,9 @@ class SubprocessPool {
     ];
     if (claudeSessionId) {
       cmd.push("--resume", claudeSessionId);
-    } else if (systemPrompt) {
-      // Only set on first turn — resumed sessions already have it
+    }
+    if (systemPrompt) {
+      // Pass on every turn — agent switches change the system prompt mid-session
       cmd.push("--system-prompt", systemPrompt);
     }
     const proc = spawn({
@@ -643,6 +645,7 @@ Bun.serve({
         const { opencodeSessionId, cwd, modelId, text } = body;
         const permissions = (body.permissions ?? []) as unknown[];
         const systemPrompt = (body.systemPrompt as string) || undefined;
+        const allowedTools = (body.allowedTools as string[]) || undefined;
 
         // Wait for any in-flight request on this session to finish
         const prev = sessionLocks.get(opencodeSessionId);
@@ -724,7 +727,7 @@ Bun.serve({
               },
             };
 
-            pool.sendSpawn(poolKey, session.modelId, h, resumeSessionId, permissions, systemPrompt);
+            pool.sendSpawn(poolKey, session.modelId, h, resumeSessionId, permissions, systemPrompt, allowedTools);
             pool.sendPrompt(opencodeSessionId, poolKey, text ?? "");
           },
           cancel() {
@@ -776,7 +779,7 @@ Bun.serve({
 
 // ─── MCP HTTP Server (persistent, no cold start) ────────────────────────────
 
-import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms } from "../mcp/tools.ts";
+import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms, setAllowedTools as mcpSetAllowed } from "../mcp/tools.ts";
 
 const MCP_PORT = parseInt(process.env.CLWND_MCP_PORT ?? "0") || 0;
 

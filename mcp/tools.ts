@@ -17,8 +17,12 @@ export function getCwd(): string { return CWD; }
 interface PermRule { permission: string; pattern: string; action: string }
 
 let permissions: PermRule[] = [];
+let allowedToolSet: Set<string> | null = null; // null = all allowed
 
 export function setPermissions(rules: PermRule[]): void { permissions = rules; }
+export function setAllowedTools(tools?: string[]): void {
+  allowedToolSet = tools && tools.length > 0 ? new Set(tools) : null;
+}
 
 export function loadPermissionsFromFile(): void {
   const permFile = process.env.CLWND_PERMISSIONS_FILE;
@@ -27,6 +31,10 @@ export function loadPermissionsFromFile(): void {
 }
 
 function checkPermission(tool: string, path?: string): void {
+  // Check allowed tools list (derived from OpenCode's agent permissions)
+  if (allowedToolSet && !allowedToolSet.has(tool)) {
+    throw new Error(`Tool "${tool}" is not allowed in the current agent mode`);
+  }
   if (permissions.length === 0) return;
   for (const rule of permissions) {
     if (rule.permission !== tool && rule.permission !== "*") continue;
