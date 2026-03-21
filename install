@@ -344,7 +344,7 @@ cmd_update() {
   echo "[service] re-registering..."
   register_service
 
-  # plugin + provider config already in opencode.json from install
+  install_cli
 
   echo "[daemon] restarting..."
   start_daemon
