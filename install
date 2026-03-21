@@ -159,6 +159,8 @@ register_service() {
     <string>${XDG_RUNTIME_DIR}</string>
     <key>PATH</key>
     <string>$(dirname $CLAUDE):$(dirname $BUN):/usr/local/bin:/usr/bin:/bin</string>
+    <key>CLWND_PERMISSION_MODE</key>
+    <string>bypassPermissions</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -203,6 +205,7 @@ Environment=XDG_DATA_HOME=$XDG_DATA_HOME
 Environment=XDG_STATE_HOME=$XDG_STATE_HOME
 Environment=XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
 Environment=PATH=$(dirname $CLAUDE):$(dirname $BUN):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+$($IS_ROOT || echo "Environment=CLWND_PERMISSION_MODE=bypassPermissions")
 ExecStart=$BUN $CLWND_SRC/dist/daemon/index.js
 Restart=on-failure
 RestartSec=2s
