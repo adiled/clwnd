@@ -801,9 +801,52 @@ const mcpServer = Bun.serve({
 const MCP_URL = `http://${MCP_HOST}:${mcpServer.port}`;
 mcpSetCwd(process.env.CLWND_CWD ?? process.env.HOME ?? "/");
 
+// ─── Auto-update ─────────────────────────────────────────────────────────────
+
+const CURRENT_VERSION = (() => {
+  try {
+    const pkg = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "package.json"), "utf-8");
+    return JSON.parse(pkg).version as string;
+  } catch { return "0.0.0"; }
+})();
+
+async function checkForUpdate(): Promise<void> {
+  try {
+    // Check if gh is available
+    const which = Bun.spawnSync({ cmd: ["which", "gh"], stdout: "pipe", stderr: "pipe" });
+    if (which.exitCode !== 0) return;
+
+    const result = Bun.spawnSync({
+      cmd: ["gh", "release", "view", "--repo", "adiled/clwnd", "--json", "tagName", "-q", ".tagName"],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (result.exitCode !== 0) return;
+
+    const latest = result.stdout.toString().trim().replace(/^v/, "");
+    if (!latest || latest === CURRENT_VERSION) return;
+
+    info("update-available", { current: CURRENT_VERSION, latest });
+
+    // Invoke clwnd update
+    const clwndBin = join(process.env.HOME ?? "/", ".local", "bin", "clwnd");
+    const update = Bun.spawn({
+      cmd: [clwndBin, "update"],
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    await update.exited;
+  } catch {}
+}
+
+// Check every 6 hours
+const UPDATE_INTERVAL = 6 * 60 * 60 * 1000;
+setTimeout(checkForUpdate, 60_000); // first check 1 min after boot
+setInterval(checkForUpdate, UPDATE_INTERVAL);
+
 process.on("SIGINT",  () => { pool.killAll(); process.exit(0); });
 process.on("SIGTERM", () => { pool.killAll(); process.exit(0); });
 process.on("uncaughtException",  e => console.error("uncaught:", e));
 process.on("unhandledRejection", e => console.error("unhandled:", e));
 
-info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid });
+info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid, version: CURRENT_VERSION });
