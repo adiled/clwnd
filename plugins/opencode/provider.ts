@@ -42,7 +42,7 @@ function mapToolName(name: string): string {
 // Tools that OpenCode should execute (providerExecuted: false).
 // MCP server still runs them for Claude CLI, but we tell OpenCode
 // to also execute them natively for state/UI integration.
-const BROKERED_TOOLS = new Set(["todowrite"]);
+const BROKERED_TOOLS = new Set(["webfetch", "websearch", "todowrite"]);
 
 // snake_case → camelCase field mapping per tool
 const INPUT_FIELD_MAP: Record<string, Record<string, string>> = {
@@ -160,6 +160,20 @@ function isAuxiliaryCall(opts: { prompt: LanguageModelV2Prompt; tools?: unknown[
   return !hasTools;
 }
 
+
+// Detect brokered tool return — OpenCode executed the tool and is sending
+// the result back. We short-circuit: Claude already responded with real data.
+function isBrokeredToolReturn(prompt: LanguageModelV2Prompt): boolean {
+  if (prompt.length < 2) return false;
+  const last = prompt[prompt.length - 1];
+  if (last.role !== "tool" || !Array.isArray(last.content)) return false;
+  for (const part of last.content as Array<{ type: string; toolName?: string }>) {
+    if (part.type === "tool-result" && part.toolName && BROKERED_TOOLS.has(part.toolName)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // Derive allowed MCP tools from OpenCode's resolved tool set.
 // OpenCode's resolveTools() already filters tools based on agent+session permissions.
@@ -404,6 +418,19 @@ export class ClwndModel implements LanguageModelV2 {
     const toolInputAccum = new Map<string, string>();
     const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
     const allowedTools = isTitle ? [] : deriveAllowedTools(opts);
+
+    // Brokered tool return — OpenCode executed the tool, sending result back.
+    // Claude already responded in the previous turn. Finish immediately.
+    if (isBrokeredToolReturn(opts.prompt)) {
+      trace("brokered.return", { sid });
+      const stream = new ReadableStream<LanguageModelV2StreamPart>({
+        start(controller) {
+          controller.enqueue({ type: "finish", finishReason: "stop", usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined }, providerMetadata: {} } as LanguageModelV2StreamPart);
+          controller.close();
+        },
+      });
+      return { stream, rawCall: { raw: {}, rawHeaders: {} }, warnings };
+    }
 
     const stream = new ReadableStream<LanguageModelV2StreamPart>({
       async start(controller) {
