@@ -248,6 +248,10 @@ class SubprocessPool {
     })();
   }
 
+  // Track whether we've seen streaming content blocks for this turn
+  // to avoid duplicating text from the final assistant message
+  private streamedTurn = false;
+
   private dispatchLine(modelId: string, entry: ProcEntry, msg: unknown): void {
     if (!msg || typeof msg !== "object") return;
     let m = msg as Record<string, unknown>;
@@ -285,6 +289,7 @@ class SubprocessPool {
     }
 
     if (m.type === "content_block_delta") {
+      this.streamedTurn = true;
       const delta = (m.delta ?? {}) as Record<string, unknown>;
       if (delta.type === "thinking_delta") emit("reasoning_delta", { delta: delta.thinking as string });
       if (delta.type === "text_delta") emit("text_delta", { delta: delta.text as string });
@@ -300,7 +305,9 @@ class SubprocessPool {
     if (m.type === "assistant" && m.message) {
       const content = ((m.message as Record<string, unknown>).content ?? []) as Array<Record<string, unknown>>;
       for (const block of content) {
-        if (block.type === "text" && typeof block.text === "string") emit("text_delta", { delta: block.text });
+        // Skip text if already streamed via content_block_delta
+        if (block.type === "text" && typeof block.text === "string" && !this.streamedTurn) emit("text_delta", { delta: block.text });
+        // Always emit tool_use — MCP tool calls only appear in assistant messages
         if (block.type === "tool_use") emit("tool_call", { toolCallId: block.id as string, toolName: block.name as string, input: block.input });
       }
       return;
@@ -322,6 +329,7 @@ class SubprocessPool {
     }
 
     if (m.type === "result") {
+      this.streamedTurn = false;
       handler.onFinish({
         finishReason: (m.stop_reason as string) ?? "stop",
         usage: m.usage as Record<string, number> | undefined,
