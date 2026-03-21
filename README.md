@@ -9,8 +9,10 @@ curl -fsSL https://raw.githubusercontent.com/adiled/clwnd/main/install | bash
 clwnd ([/klwʊnd/](https://ipa-reader.com/?text=%2Fklw%CA%8And%2F)).
 
 ```
-~/.local/share/clwnd/src/install update
-~/.local/share/clwnd/src/install uninstall
+clwnd update
+clwnd status
+clwnd logs
+clwnd uninstall
 ```
 
 Needs git, bun, opencode, claude.

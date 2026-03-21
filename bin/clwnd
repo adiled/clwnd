@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -e
+
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+CLWND_SRC="$XDG_DATA_HOME/clwnd/src"
+
+if [ ! -d "$CLWND_SRC" ]; then
+  echo "clwnd not installed. Run:"
+  echo "  curl -fsSL https://raw.githubusercontent.com/adiled/clwnd/main/install | bash"
+  exit 1
+fi
+
+CMD="${1:-help}"
+shift 2>/dev/null || true
+
+case "$CMD" in
+  update)
+    exec "$CLWND_SRC/install" update
+    ;;
+  uninstall)
+    exec "$CLWND_SRC/install" uninstall
+    ;;
+  status)
+    IS_ROOT=$([ "$(id -u)" = "0" ] && echo true || echo false)
+    SC="systemctl"
+    $IS_ROOT || SC="systemctl --user"
+    OS="$(uname -s)"
+
+    if [ "$OS" = "Darwin" ]; then
+      launchctl print "gui/$(id -u)/com.clwnd.daemon" 2>/dev/null | head -5 || echo "daemon not running"
+    else
+      $SC status clwnd 2>/dev/null | head -5 || echo "daemon not running"
+    fi
+    ;;
+  logs)
+    IS_ROOT=$([ "$(id -u)" = "0" ] && echo true || echo false)
+    OS="$(uname -s)"
+
+    if [ "$OS" = "Darwin" ]; then
+      XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+      tail -f "$XDG_STATE_HOME/clwnd/daemon.stderr.log"
+    else
+      if $IS_ROOT; then
+        journalctl -u clwnd -f
+      else
+        journalctl --user -u clwnd -f
+      fi
+    fi
+    ;;
+  restart)
+    IS_ROOT=$([ "$(id -u)" = "0" ] && echo true || echo false)
+    SC="systemctl"
+    $IS_ROOT || SC="systemctl --user"
+    OS="$(uname -s)"
+
+    if [ "$OS" = "Darwin" ]; then
+      LABEL="com.clwnd.daemon"
+      PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+      launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
+      launchctl bootstrap "gui/$(id -u)" "$PLIST"
+      echo "restarted"
+    else
+      $SC restart clwnd
+      echo "restarted"
+    fi
+    ;;
+  version)
+    cat "$CLWND_SRC/package.json" | grep '"version"' | head -1 | sed 's/.*"\([0-9.]*\)".*/\1/'
+    ;;
+  help|--help|-h|"")
+    echo "clwnd - take back what is yours"
+    echo ""
+    echo "Usage: clwnd <command>"
+    echo ""
+    echo "Commands:"
+    echo "  update     Pull latest, rebuild, restart daemon"
+    echo "  restart    Restart the daemon"
+    echo "  status     Show daemon status"
+    echo "  logs       Tail daemon logs"
+    echo "  version    Show installed version"
+    echo "  uninstall  Remove clwnd"
+    ;;
+  *)
+    echo "Unknown command: $CMD"
+    echo "Run 'clwnd help' for usage."
+    exit 1
+    ;;
+esac

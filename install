@@ -278,6 +278,13 @@ print_status() {
   fi
 }
 
+install_cli() {
+  local BIN_DIR="$HOME/.local/bin"
+  mkdir -p "$BIN_DIR"
+  ln -sf "$CLWND_SRC/bin/clwnd" "$BIN_DIR/clwnd"
+  echo "  linked $BIN_DIR/clwnd"
+}
+
 # ─── commands ────────────────────────────────────────────────────────────────
 
 cmd_install() {
@@ -291,6 +298,9 @@ cmd_install() {
   register_service
 
   configure_opencode
+
+  echo "[cli] installing clwnd command..."
+  install_cli
 
   echo "[daemon] starting..."
   start_daemon
