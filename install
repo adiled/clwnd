@@ -304,7 +304,30 @@ cmd_install() {
 
   echo "[daemon] starting..."
   start_daemon
-  print_status
+  print_greeting
+}
+
+print_greeting() {
+  local VERSION
+  VERSION=$(grep '"version"' "$CLWND_SRC/package.json" | head -1 | sed 's/.*"\([0-9.]*\)".*/\1/')
+  local BORN="2026-03-21"
+  local DAYS=$(( ( $(date +%s) - $(date -d "$BORN" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "$BORN" +%s 2>/dev/null) ) / 86400 ))
+
+  echo ""
+  echo "  ┌──────────────────────────────────────────┐"
+  echo "  │                                          │"
+  echo "  │   clwnd /klwʊnd/                         │"
+  echo "  │   take back what is yours.               │"
+  echo "  │                                          │"
+  local AGE_STR="born $BORN · $DAYS day(s) old"
+  printf "  │   %-39s│\n" "$AGE_STR"
+  printf "  │   adopted: v%-29s│\n" "$VERSION"
+  echo "  │                                          │"
+  echo "  │   clwnd is young and moving fast.        │"
+  echo "  │   run clwnd update often.                │"
+  echo "  │                                          │"
+  echo "  └──────────────────────────────────────────┘"
+  echo ""
 }
 
 cmd_update() {
