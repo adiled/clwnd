@@ -348,7 +348,7 @@ cmd_update() {
 
   echo "[daemon] restarting..."
   start_daemon
-  print_status
+  print_greeting
 }
 
 cmd_uninstall() {
