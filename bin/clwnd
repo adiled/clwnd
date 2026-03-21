@@ -67,6 +67,23 @@ case "$CMD" in
   version)
     cat "$CLWND_SRC/package.json" | grep '"version"' | head -1 | sed 's/.*"\([0-9.]*\)".*/\1/'
     ;;
+  sessions)
+    XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+    FILE="$XDG_STATE_HOME/clwnd/sessions.json"
+    if [ ! -f "$FILE" ]; then echo "no sessions"; exit 0; fi
+    cat "$FILE" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    if not d: print('no sessions'); sys.exit(0)
+    for sid, s in d.items():
+        claude = s.get('claudeSessionId') or '-'
+        model = s.get('modelId','?')
+        print(f\"  {sid[:30]}  claude={claude[:12]}  model={model}\")
+    print(f\"\n{len(d)} session(s)\")
+except: print('error reading sessions')
+" 2>/dev/null || cat "$FILE"
+    ;;
   help|--help|-h|"")
     echo "clwnd - take back what is yours"
     echo ""
@@ -77,6 +94,7 @@ case "$CMD" in
     echo "  restart    Restart the daemon"
     echo "  status     Show daemon status"
     echo "  logs       Tail daemon logs"
+    echo "  sessions   List tracked sessions"
     echo "  version    Show installed version"
     echo "  uninstall  Remove clwnd"
     ;;
