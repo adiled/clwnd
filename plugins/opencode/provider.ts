@@ -114,11 +114,10 @@ async function ipcCall(msg: IpcToDaemon): Promise<void> {
 }
 
 // Detect auxiliary calls (title generation, etc.) that should NOT
-// resume or persist sessions. These have no tools and no system prompt.
+// resume or persist sessions. These have no tools defined.
 function isAuxiliaryCall(opts: { prompt: LanguageModelV2Prompt; tools?: unknown[] | unknown }): boolean {
   const hasTools = Array.isArray(opts.tools) && opts.tools.length > 0;
-  const hasSystem = opts.prompt.some(m => m.role === "system");
-  return !hasTools && !hasSystem;
+  return !hasTools;
 }
 
 function extractText(prompt: LanguageModelV2Prompt): string {
