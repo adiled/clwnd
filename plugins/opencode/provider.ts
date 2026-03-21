@@ -1,4 +1,14 @@
 import { generateId } from "@ai-sdk/provider-utils";
+import { appendFileSync, mkdirSync } from "fs";
+
+const LOG_DIR = `${process.env.XDG_DATA_HOME || process.env.HOME + "/.local/share"}/opencode`;
+const LOG_FILE = `${LOG_DIR}/clwnd-plugin.log`;
+try { mkdirSync(LOG_DIR, { recursive: true }); } catch {}
+function trace(event: string, data?: Record<string, unknown>): void {
+  const parts = [new Date().toISOString(), event];
+  if (data) for (const [k, v] of Object.entries(data)) parts.push(`${k}=${v}`);
+  try { appendFileSync(LOG_FILE, parts.join(" ") + "\n"); } catch {}
+}
 import type {
   LanguageModelV2,
   LanguageModelV2CallWarning,
