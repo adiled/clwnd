@@ -113,6 +113,22 @@ async function ipcCall(msg: IpcToDaemon): Promise<void> {
   if (!r.ok) throw new Error(`clwnd IPC ${r.status}`);
 }
 
+// Detect title generation calls — these should NOT resume or persist sessions
+function isTitleCall(prompt: LanguageModelV2Prompt): boolean {
+  for (const m of prompt) {
+    if (m.role === "user") {
+      const text = typeof m.content === "string"
+        ? m.content
+        : (m.content as Array<{ type: string; text?: string }>)
+            .filter(p => p.type === "text" && p.text)
+            .map(p => p.text)
+            .join("");
+      if (text.includes("Generate a title")) return true;
+    }
+  }
+  return false;
+}
+
 function extractText(prompt: LanguageModelV2Prompt): string {
   for (let i = prompt.length - 1; i >= 0; i--) {
     const m = prompt[i];
@@ -180,11 +196,14 @@ export class ClwndModel implements LanguageModelV2 {
     response: { id: string; timestamp: Date; modelId: string };
     providerMetadata: Record<string, unknown>;
   }> {
-    const sid = opts.headers?.["x-opencode-session"] ?? generateId();
+    const isTitle = isTitleCall(opts.prompt);
+    // Title generation calls get a throwaway session ID so they don't
+    // pollute the main Claude CLI session with --resume
+    const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
     const text = extractText(opts.prompt);
     const warnings: LanguageModelV2CallWarning[] = [];
     const cwd = this.config.cwd ?? process.cwd();
-    const permissions = await getSessionPermissions(this.config.client, sid);
+    const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
 
     let reasoning = "";
     let responseText = "";
@@ -303,13 +322,14 @@ export class ClwndModel implements LanguageModelV2 {
     rawCall: { raw: unknown; rawHeaders: unknown };
     warnings: LanguageModelV2CallWarning[];
   }> {
-    const sid = opts.headers?.["x-opencode-session"] ?? generateId();
+    const isTitle = isTitleCall(opts.prompt);
+    const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
     const text = extractText(opts.prompt);
     const warnings: LanguageModelV2CallWarning[] = [];
     const cwd = this.config.cwd ?? process.cwd();
     const self = this;
     const toolInputAccum = new Map<string, string>();
-    const permissions = await getSessionPermissions(this.config.client, sid);
+    const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
 
     const stream = new ReadableStream<LanguageModelV2StreamPart>({
       async start(controller) {
