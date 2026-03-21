@@ -150,6 +150,7 @@ function isAuxiliaryCall(opts: { prompt: LanguageModelV2Prompt; tools?: unknown[
   return !hasTools;
 }
 
+
 // Derive allowed MCP tools from OpenCode's resolved tool set.
 // OpenCode's resolveTools() already filters tools based on agent+session permissions.
 // If edit/write are denied (e.g. plan mode), they won't be in opts.tools.

@@ -94,7 +94,13 @@ class SubprocessPool {
 
   sendSpawn(poolKey: string, modelId: string, handler: StreamHandler, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[]): void {
     let entry = this.procs.get(poolKey);
-    if (!entry) entry = this.spawnProc(poolKey, modelId, claudeSessionId, permissions, systemPrompt, allowedTools);
+    if (!entry) {
+      entry = this.spawnProc(poolKey, modelId, claudeSessionId, permissions, systemPrompt, allowedTools);
+    } else {
+      // Persistent process: update permissions for this turn
+      mcpSetPerms((permissions ?? []) as any);
+      mcpSetAllowed(allowedTools);
+    }
     handler.onChunk("stream_start", {});
     entry.handlers.set(handler.opencodeSessionId, handler);
   }
@@ -174,11 +180,8 @@ class SubprocessPool {
       // Register our MCP server
       "--mcp-config", mcpConfig,
     ];
-    if (claudeSessionId) {
-      cmd.push("--resume", claudeSessionId);
-    }
+    // System prompt set once at spawn — persistent process keeps it
     if (systemPrompt) {
-      // Pass on every turn — agent switches change the system prompt mid-session
       cmd.push("--system-prompt", systemPrompt);
     }
     const proc = spawn({
@@ -560,6 +563,7 @@ function handleAction(msg: IpcToDaemon, pool: SubprocessPool): void {
       emitBroadcast({ action: "pong" });
       break;
     }
+
   }
 }
 
@@ -577,6 +581,7 @@ function defaultSocketPath(): string {
 
 const SOCK = process.env.CLWND_SOCKET ?? defaultSocketPath();
 const HTTP = SOCK + ".http";
+
 
 const pool = new SubprocessPool(process.env.CLAUDE_CLI_PATH ?? "claude");
 
@@ -669,9 +674,9 @@ Bun.serve({
               } catch { closed = true; }
             };
 
-            // Reuse existing session for --resume, or create new
+            // Get or create persistent session
             let session = sessions.get(opencodeSessionId);
-            const resumeSessionId = session?.claudeSessionId ?? undefined;
+            const isNewSession = !session;
 
             if (!session) {
               session = {
@@ -685,9 +690,10 @@ Bun.serve({
               saveSessions();
             }
 
-            trace("stream.start", { sid: opencodeSessionId, resume: resumeSessionId ?? "new", sessions: sessions.size });
+            // Persistent process: poolKey = opencodeSessionId (one process per OC session)
+            const poolKey = opencodeSessionId;
 
-            const poolKey = `${opencodeSessionId}-${Date.now()}`;
+            trace("stream.start", { sid: opencodeSessionId, isNew: isNewSession, sessions: sessions.size });
 
             const h: StreamHandler = {
               opencodeSessionId,
@@ -714,20 +720,23 @@ Bun.serve({
                   usage: finish.usage,
                   providerMetadata: finish.providerMetadata,
                 });
-                pool.destroy(opencodeSessionId, poolKey);
+                // Remove handler but DON'T destroy process — it stays alive for next turn
+                pool.abort(opencodeSessionId, poolKey);
                 releaseLock!();
                 if (!closed) { closed = true; try { controller.close(); } catch {} }
               },
               onError(err) {
                 trace("stream.error", { sid: opencodeSessionId, err });
                 send({ action: "error", opencodeSessionId, message: err });
+                // On error, kill the process — next turn will spawn fresh
                 pool.destroy(opencodeSessionId, poolKey);
                 releaseLock!();
                 if (!closed) { closed = true; try { controller.close(); } catch {} }
               },
             };
 
-            pool.sendSpawn(poolKey, session.modelId, h, resumeSessionId, permissions, systemPrompt, allowedTools);
+            // First turn: spawn process. Subsequent turns: reuse existing.
+            pool.sendSpawn(poolKey, session.modelId, h, undefined, permissions, systemPrompt, allowedTools);
             pool.sendPrompt(opencodeSessionId, poolKey, text ?? "");
           },
           cancel() {

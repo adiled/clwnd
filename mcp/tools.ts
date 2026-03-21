@@ -344,8 +344,9 @@ export async function handleMcpRequest(body: { jsonrpc: string; id?: number | st
     case "tools/call": {
       const name = body.params?.name as string;
       const args = (body.params?.arguments ?? {}) as Record<string, unknown>;
+      const callId = `mcp-${body.id ?? Date.now()}`;
       try {
-        const result = await executeTool(name, args);
+        const result = await executeTool(name, args, callId);
         const content: Array<{ type: string; text: string }> = [
           { type: "text", text: result.output },
         ];

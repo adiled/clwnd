@@ -487,3 +487,71 @@ describe("directory enforcement", () => {
     expect(findFinish(messages)).toBeDefined();
   }, TIMEOUT);
 });
+
+describe("persistent process", () => {
+  test("same session reuses one process (no respawn)", async () => {
+    const sid = `smoke-persist-${Date.now()}`;
+
+    const turn1 = await streamRequest({
+      action: "stream",
+      opencodeSessionId: sid,
+      cwd: PROJECT_DIR,
+      modelId: MODEL,
+      text: "The answer is 7742. Just say OK.",
+    });
+    const ready1 = findSessionReady(turn1);
+    expect(ready1).toBeDefined();
+    const claude1 = ready1!.claudeSessionId as string;
+    expect(claude1).toBeTruthy();
+    createdClaudeSessionIds.push(claude1);
+    expect(findFinish(turn1)).toBeDefined();
+
+    const turn2 = await streamRequest({
+      action: "stream",
+      opencodeSessionId: sid,
+      cwd: PROJECT_DIR,
+      modelId: MODEL,
+      text: "What was the answer I just told you?",
+    });
+    const ready2 = findSessionReady(turn2);
+    expect(ready2).toBeDefined();
+    // Same Claude session = same process
+    expect(ready2!.claudeSessionId).toBe(claude1);
+    expect(collectText(turn2)).toContain("7742");
+    expect(findFinish(turn2)).toBeDefined();
+  }, TIMEOUT);
+
+  test("three turns retain full context", async () => {
+    const sid = `smoke-persist3-${Date.now()}`;
+
+    const t1 = await streamRequest({ action: "stream", opencodeSessionId: sid, cwd: PROJECT_DIR, modelId: MODEL, text: "My city is Berlin. Confirm." });
+    trackSession(t1);
+    expect(findFinish(t1)).toBeDefined();
+
+    const t2 = await streamRequest({ action: "stream", opencodeSessionId: sid, cwd: PROJECT_DIR, modelId: MODEL, text: "My color is green. Confirm." });
+    expect(findFinish(t2)).toBeDefined();
+
+    const t3 = await streamRequest({ action: "stream", opencodeSessionId: sid, cwd: PROJECT_DIR, modelId: MODEL, text: "What is my city and color?" });
+    const text = collectText(t3).toLowerCase();
+    expect(text).toContain("berlin");
+    expect(text).toContain("green");
+    expect(findFinish(t3)).toBeDefined();
+  }, TIMEOUT);
+
+  test("different sessions get different processes", async () => {
+    const sid1 = `smoke-persist-a-${Date.now()}`;
+    const sid2 = `smoke-persist-b-${Date.now()}`;
+
+    const t1 = await streamRequest({ action: "stream", opencodeSessionId: sid1, cwd: PROJECT_DIR, modelId: MODEL, text: "Say hello." });
+    const r1 = findSessionReady(t1);
+    expect(r1).toBeDefined();
+    createdClaudeSessionIds.push(r1!.claudeSessionId as string);
+
+    const t2 = await streamRequest({ action: "stream", opencodeSessionId: sid2, cwd: PROJECT_DIR, modelId: MODEL, text: "Say hi." });
+    const r2 = findSessionReady(t2);
+    expect(r2).toBeDefined();
+    createdClaudeSessionIds.push(r2!.claudeSessionId as string);
+
+    expect(r2!.claudeSessionId).not.toBe(r1!.claudeSessionId);
+  }, TIMEOUT);
+});
