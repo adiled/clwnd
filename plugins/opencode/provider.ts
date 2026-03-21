@@ -148,48 +148,6 @@ function deriveAllowedTools(opts: { tools?: Array<{ name: string }> | unknown })
   return [...new Set(allowed)];
 }
 
-// Check if prompt ends with a tool result (OpenCode returning brokered tool output).
-// In this case we should NOT call Claude CLI again — it already responded.
-function isBrokeredToolReturn(prompt: LanguageModelV2Prompt): boolean {
-  if (prompt.length === 0) return false;
-  const last = prompt[prompt.length - 1];
-  if (last.role !== "tool") return false;
-  // Check if the preceding assistant message has a brokered tool call
-  for (let i = prompt.length - 2; i >= 0; i--) {
-    const m = prompt[i];
-    if (m.role === "assistant" && Array.isArray(m.content)) {
-      for (const part of m.content as Array<{ type: string; toolName?: string }>) {
-        if (part.type === "tool-call" && part.toolName && BROKERED_TOOLS.has(part.toolName)) {
-          return true;
-        }
-      }
-    }
-    break;
-  }
-  return false;
-}
-
-function extractBrokeredReturn(prompt: LanguageModelV2Prompt): { toolCallId: string | null; result: string | null } {
-  let toolCallId: string | null = null;
-  let result: string | null = null;
-  for (let i = prompt.length - 1; i >= 0; i--) {
-    const m = prompt[i];
-    if (m.role === "tool" && Array.isArray(m.content)) {
-      for (const part of m.content as Array<{ type: string; toolCallId?: string; result?: unknown }>) {
-        if (part.type === "tool-result") {
-          toolCallId = part.toolCallId ?? null;
-          const r = part.result as any;
-          if (typeof r === "string") result = r;
-          else if (r?.output) result = String(r.output);
-          else result = JSON.stringify(r);
-        }
-      }
-      break;
-    }
-  }
-  return { toolCallId, result };
-}
-
 function extractText(prompt: LanguageModelV2Prompt): string {
   for (let i = prompt.length - 1; i >= 0; i--) {
     const m = prompt[i];
@@ -404,7 +362,6 @@ export class ClwndModel implements LanguageModelV2 {
     warnings: LanguageModelV2CallWarning[];
   }> {
     const isTitle = isAuxiliaryCall(opts);
-    const isBrokeredReturn = isBrokeredToolReturn(opts.prompt);
     const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
     const text = extractText(opts.prompt);
     const systemPrompt = extractSystemPrompt(opts.prompt);
@@ -414,27 +371,6 @@ export class ClwndModel implements LanguageModelV2 {
     const toolInputAccum = new Map<string, string>();
     const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
     const allowedTools = isTitle ? [] : deriveAllowedTools(opts);
-
-    // If OpenCode is sending back a brokered tool result, rewrite Claude CLI's
-    // JSONL so future --resume picks up OpenCode's version.
-    if (isBrokeredReturn) {
-      const { toolCallId, result } = extractBrokeredReturn(opts.prompt);
-      if (toolCallId && result) {
-        ipcCall({
-          action: "rewrite_tool_result",
-          opencodeSessionId: sid,
-          toolUseId: toolCallId,
-          result,
-        }).catch(() => {});
-      }
-      const stream = new ReadableStream<LanguageModelV2StreamPart>({
-        start(controller) {
-          controller.enqueue({ type: "finish", finishReason: "stop", usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined }, providerMetadata: {} } as LanguageModelV2StreamPart);
-          controller.close();
-        },
-      });
-      return { stream, rawCall: { raw: {}, rawHeaders: {} }, warnings };
-    }
 
     const stream = new ReadableStream<LanguageModelV2StreamPart>({
       async start(controller) {
