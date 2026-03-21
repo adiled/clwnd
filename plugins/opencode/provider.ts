@@ -14,10 +14,16 @@ import type { ClwndConfig } from "./types.ts";
 
 const MCP_PREFIX = "mcp__clwnd__";
 
-// Map MCP tool names to OpenCode tool names
+// Map tool names to OpenCode equivalents
+const TOOL_NAME_MAP: Record<string, string> = {
+  WebFetch: "webfetch", WebSearch: "websearch",
+  TodoWrite: "todowrite", AskUserQuestion: "question",
+  Task: "task", Skill: "skill",
+};
+
 function mapToolName(name: string): string {
   if (name.startsWith(MCP_PREFIX)) return name.slice(MCP_PREFIX.length);
-  return name;
+  return TOOL_NAME_MAP[name] ?? name;
 }
 
 // Tools that OpenCode should execute (providerExecuted: false).
@@ -26,7 +32,7 @@ function mapToolName(name: string): string {
 // Tools that OpenCode should execute (providerExecuted: false).
 // MCP server still runs them for Claude CLI, but we tell OpenCode
 // to also execute them natively for state/UI integration.
-const BROKERED_TOOLS = new Set(["webfetch"]);
+const BROKERED_TOOLS = new Set(["webfetch", "websearch"]);
 
 // snake_case → camelCase field mapping per tool
 const INPUT_FIELD_MAP: Record<string, Record<string, string>> = {
