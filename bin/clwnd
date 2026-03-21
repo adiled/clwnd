@@ -15,7 +15,7 @@ shift 2>/dev/null || true
 
 case "$CMD" in
   update)
-    exec "$CLWND_SRC/install" update
+    exec bash -c "$(curl -fsSL https://raw.githubusercontent.com/adiled/clwnd/main/install)" -- update
     ;;
   uninstall)
     exec "$CLWND_SRC/install" uninstall
