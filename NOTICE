@@ -1,0 +1,54 @@
+NOTICE
+
+clwnd – Usage Policy and Disclaimer
+
+This project "clwnd" is an open-source utility that enables users to invoke locally installed, user-authorized binaries (including, but not limited to, CLI tools) under their direct control.
+
+1. User-Controlled Execution
+
+All actions performed by this tool are initiated, configured, and executed by the end user. This project does not initiate network requests or carry out any data transmission independently, act autonomously, or operate as an agent, proxy, intermediary, or service provider. All requests made through invoked binaries are made by the user as the sole principal.
+
+2. Authentication and Credentials
+
+This project does not access, collect, store, transmit, or manage authentication credentials of any kind. Authentication, authorization, and credential handling are exclusively managed by the user’s local environment and the invoked binaries themselves.
+
+3. No Affiliation or Endorsement
+
+This project is not affiliated with, endorsed by, or sponsored by any third-party service providers whose tools or services may be invoked through its use, including but not limited to Anthropic PBC or its products (e.g., Claude, Claude Code, or Claude.ai).
+
+4. Compliance with Third-Party Terms
+
+Users are solely responsible for ensuring that their use of any third-party services, APIs, or software—whether invoked directly or indirectly by this tool—complies with all applicable terms of service, usage policies, and legal requirements.
+
+This includes, but is not limited to:
+- Restrictions on the use of OAuth tokens or personal account credentials
+- Limitations on automation, programmatic access, or proxying of services
+- Requirements to use API keys or other approved authentication mechanisms for integrations
+
+This project is not intended to circumvent, extend, or violate the intended usage policies of any third-party provider.
+
+5. Intended Use
+
+This tool is intended solely as a local execution and workflow convenience utility for user-directed operations. It is not designed or intended for:
+- Unauthorized automation of third-party services
+- Acting as a backend service, multi-user system, or automation layer in a manner that proxies, aggregates, or programmatically accesses third-party services in violation of their applicable terms
+- Commercial or production use cases that conflict with third-party provider terms
+
+Users must ensure their use aligns with the intended usage model of any external tools or services they invoke.
+
+6. No Warranties
+
+This software is provided “AS IS”, without warranty of any kind, express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose, and non-infringement.
+
+7. Limitation of Liability
+
+In no event shall the authors, contributors, or copyright holders be liable for any claim, damages, or other liability, whether in an action of contract, tort, or otherwise, arising from, out of, or in connection with the software or the use or other dealings in the software.
+
+8. Responsibility
+
+By using this software, you acknowledge and agree that:
+- You are solely responsible for how it is used
+- You assume all risks related to its operation and integration with third-party services
+- You will comply with all applicable laws and third-party terms
+
+Copyright (c) 2026 clwnd contributors
