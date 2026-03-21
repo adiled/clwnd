@@ -88,7 +88,7 @@ interface IpcToPlugin {
 function defaultSocketPath(): string {
   const runtime = process.env.XDG_RUNTIME_DIR;
   if (runtime) return `${runtime}/clwnd/clwnd.sock`;
-  return "/tmp/clwnd.sock";
+  return "/tmp/clwnd/clwnd.sock";
 }
 
 const SOCK_PATH = (process.env.CLWND_SOCKET ?? defaultSocketPath()) + ".http";
