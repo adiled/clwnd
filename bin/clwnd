@@ -38,7 +38,7 @@ case "$CMD" in
 
     if [ "$OS" = "Darwin" ]; then
       XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
-      tail -f "$XDG_STATE_HOME/clwnd/daemon.stderr.log"
+      tail -f "$XDG_STATE_HOME/clwnd/daemon.stdout.log" "$XDG_STATE_HOME/clwnd/daemon.stderr.log"
     else
       if $IS_ROOT; then
         journalctl -u clwnd -f
