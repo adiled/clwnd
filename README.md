@@ -13,4 +13,4 @@ clwnd.
 ~/.local/share/clwnd/src/install uninstall
 ```
 
-Needs bun, claude, git.
+Needs git, bun, opencode, claude.
