@@ -128,6 +128,17 @@ function extractText(prompt: LanguageModelV2Prompt): string {
   return "";
 }
 
+// Fetch session permission rules from OpenCode
+async function getSessionPermissions(client: any, sessionId: string): Promise<Array<{ permission: string; pattern: string; action: string }>> {
+  if (!client) return [];
+  try {
+    const resp = await client.session.get({ path: { sessionID: sessionId } });
+    return resp.data?.permission ?? [];
+  } catch {
+    return [];
+  }
+}
+
 // Parse NDJSON lines from buffer
 function parseNDJSON(buffer: string, sessionId: string): { messages: IpcToPlugin[]; remaining: string } {
   const messages: IpcToPlugin[] = [];
@@ -173,6 +184,7 @@ export class ClwndModel implements LanguageModelV2 {
     const text = extractText(opts.prompt);
     const warnings: LanguageModelV2CallWarning[] = [];
     const cwd = this.config.cwd ?? process.cwd();
+    const permissions = await getSessionPermissions(this.config.client, sid);
 
     let reasoning = "";
     let responseText = "";
@@ -200,7 +212,7 @@ export class ClwndModel implements LanguageModelV2 {
         cwd,
         modelId: this.modelId,
         text,
-
+        permissions,
       }).then(async (resp) => {
         if (!resp.body) { abort(); return; }
         const reader = resp.body.getReader();
@@ -297,6 +309,7 @@ export class ClwndModel implements LanguageModelV2 {
     const cwd = this.config.cwd ?? process.cwd();
     const self = this;
     const toolInputAccum = new Map<string, string>();
+    const permissions = await getSessionPermissions(this.config.client, sid);
 
     const stream = new ReadableStream<LanguageModelV2StreamPart>({
       async start(controller) {
@@ -333,7 +346,7 @@ export class ClwndModel implements LanguageModelV2 {
             cwd,
             modelId: self.modelId,
             text,
-    
+            permissions,
           });
         } catch (e) {
           emit({ type: "error", error: new Error(String(e)) } as LanguageModelV2StreamPart);

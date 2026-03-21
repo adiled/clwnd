@@ -92,9 +92,9 @@ class SubprocessPool {
 
   constructor(private cliPath = "claude") {}
 
-  sendSpawn(poolKey: string, modelId: string, handler: StreamHandler, claudeSessionId?: string): void {
+  sendSpawn(poolKey: string, modelId: string, handler: StreamHandler, claudeSessionId?: string, permissions?: unknown[]): void {
     let entry = this.procs.get(poolKey);
-    if (!entry) entry = this.spawnProc(poolKey, modelId, claudeSessionId);
+    if (!entry) entry = this.spawnProc(poolKey, modelId, claudeSessionId, permissions);
     handler.onChunk("stream_start", {});
     entry.handlers.set(handler.opencodeSessionId, handler);
   }
@@ -146,17 +146,28 @@ class SubprocessPool {
     this.procs.clear();
   }
 
-  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string): ProcEntry {
+  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[]): ProcEntry {
     // MCP server config — route file/bash tools through our MCP server
     // instead of Claude CLI's built-in tools
     const mcpServerPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "mcp", "server.ts");
+
+    // Write permissions to a temp file the MCP server reads
+    const permFile = `${STATE_DIR}/.mcp-perms-${poolKey}.json`;
+    try {
+      mkdirSync(STATE_DIR, { recursive: true });
+      writeFileSync(permFile, JSON.stringify(permissions ?? []));
+    } catch {}
+
     const mcpConfig = JSON.stringify({
       mcpServers: {
         clwnd: {
           type: "stdio",
           command: process.env.BUN_PATH ?? "bun",
           args: [mcpServerPath],
-          env: { CLWND_CWD: process.env.CLWND_CWD ?? process.env.HOME ?? "/" },
+          env: {
+            CLWND_CWD: process.env.CLWND_CWD ?? process.env.HOME ?? "/",
+            CLWND_PERMISSIONS_FILE: permFile,
+          },
         },
       },
     });
@@ -629,6 +640,7 @@ Bun.serve({
     if (req.method === "POST" && url.pathname === "/stream") {
       return req.json().then(async (body: IpcToDaemon) => {
         const { opencodeSessionId, cwd, modelId, text } = body;
+        const permissions = (body.permissions ?? []) as unknown[];
 
         // Wait for any in-flight request on this session to finish
         const prev = sessionLocks.get(opencodeSessionId);
@@ -710,7 +722,7 @@ Bun.serve({
               },
             };
 
-            pool.sendSpawn(poolKey, session.modelId, h, resumeSessionId);
+            pool.sendSpawn(poolKey, session.modelId, h, resumeSessionId, permissions);
             pool.sendPrompt(opencodeSessionId, poolKey, text ?? "");
           },
           cancel() {

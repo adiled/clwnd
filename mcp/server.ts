@@ -17,6 +17,48 @@ import { createPatch } from "diff";
 
 const CWD = process.env.CLWND_CWD ?? process.cwd();
 
+// ─── Permissions ────────────────────────────────────────────────────────────
+
+// OpenCode permission rules: [{permission, pattern, action}]
+// permission = tool name (e.g. "read", "bash", "edit")
+// pattern = glob for the argument (e.g. "*.ts", "/etc/*")
+// action = "allow" | "deny" | "ask"
+interface PermRule { permission: string; pattern: string; action: string }
+
+function loadPermissions(): PermRule[] {
+  const permFile = process.env.CLWND_PERMISSIONS_FILE;
+  if (!permFile) return [];
+  try {
+    return JSON.parse(readFileSync(permFile, "utf-8"));
+  } catch {
+    return [];
+  }
+}
+
+const permissions = loadPermissions();
+
+function checkPermission(tool: string, path?: string): void {
+  if (permissions.length === 0) return; // no rules = allow all
+
+  for (const rule of permissions) {
+    // Match tool name
+    if (rule.permission !== tool && rule.permission !== "*") continue;
+
+    // Match pattern against path (if applicable)
+    if (path) {
+      const pat = rule.pattern;
+      if (pat === "*" || path.startsWith(pat.replace("/*", "/")) || path === pat) {
+        if (rule.action === "deny") throw new Error(`Permission denied: ${tool} on ${path}`);
+        if (rule.action === "allow") return; // explicit allow, stop checking
+      }
+    } else {
+      // No path (e.g. bash) — match on tool name only
+      if (rule.action === "deny") throw new Error(`Permission denied: ${tool}`);
+      if (rule.action === "allow") return;
+    }
+  }
+}
+
 // Additional allowed directories (e.g. /tmp for scratch files)
 const ALLOWED_DIRS = [CWD, "/tmp"];
 
@@ -120,6 +162,7 @@ interface ToolResult {
 
 function execRead(args: { file_path: string; offset?: number; limit?: number }): ToolResult {
   const p = assertPath(args.file_path);
+  checkPermission("read", p);
   if (!existsSync(p)) return { output: `Error: ${p} does not exist`, title: p };
 
   try {
@@ -155,6 +198,7 @@ function execRead(args: { file_path: string; offset?: number; limit?: number }):
 
 function execEdit(args: { file_path: string; old_string: string; new_string: string; replace_all?: boolean }): ToolResult {
   const p = assertPath(args.file_path);
+  checkPermission("edit", p);
   if (!existsSync(p)) return { output: `Error: ${p} does not exist` };
 
   const original = readFileSync(p, "utf-8");
@@ -189,6 +233,7 @@ function execEdit(args: { file_path: string; old_string: string; new_string: str
 
 function execWrite(args: { file_path: string; content: string }): ToolResult {
   const p = assertPath(args.file_path);
+  checkPermission("write", p);
   const dir = dirname(p);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const existed = existsSync(p);
@@ -206,6 +251,7 @@ function execWrite(args: { file_path: string; content: string }): ToolResult {
 }
 
 function execBash(args: { command: string; description?: string; timeout?: number }): ToolResult {
+  checkPermission("bash", args.command);
   const timeout = args.timeout ?? 120_000;
   let output = "";
   let exitCode: number | null = 0;
@@ -235,6 +281,7 @@ function execBash(args: { command: string; description?: string; timeout?: numbe
 
 function execGlob(args: { pattern: string; path?: string }): ToolResult {
   const dir = assertPath(args.path ?? CWD);
+  checkPermission("glob", dir);
   try {
     const out = execSync(
       `shopt -s globstar nullglob; cd "${dir}" && printf '%s\n' ${args.pattern} 2>/dev/null | head -200`,
@@ -253,6 +300,7 @@ function execGlob(args: { pattern: string; path?: string }): ToolResult {
 
 function execGrep(args: { pattern: string; path?: string; include?: string }): ToolResult {
   const dir = assertPath(args.path ?? CWD);
+  checkPermission("grep", dir);
   let cmd = `rg --no-heading --line-number`;
   if (args.include) cmd += ` --glob "${args.include}"`;
   cmd += ` "${args.pattern}" "${dir}" 2>/dev/null | head -500`;
