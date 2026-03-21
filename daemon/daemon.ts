@@ -169,8 +169,9 @@ class SubprocessPool {
       "--model", modelId,
       "--include-partial-messages",
       "--permission-mode", process.env.CLWND_PERMISSION_MODE ?? "acceptEdits",
-      // Disable built-in tools that our MCP server replaces
-      "--disallowedTools", "Read,Edit,Write,Bash,Glob,Grep",
+      // Disable built-in tools — our MCP server replaces file/bash tools,
+      // and Claude CLI internal tools aren't available in OpenCode
+      "--disallowedTools", "Read,Edit,Write,Bash,Glob,Grep,ToolSearch,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree",
       // Auto-approve our MCP tools
       "--allowedTools", "mcp__clwnd__read,mcp__clwnd__edit,mcp__clwnd__write,mcp__clwnd__bash,mcp__clwnd__glob,mcp__clwnd__grep",
       // Register our MCP server
