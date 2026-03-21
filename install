@@ -55,7 +55,12 @@ do_build() {
 }
 
 plugin_ref() {
-  echo "file://$CLWND_SRC/plugins/opencode/dist/index.js"
+  # Use npm package by default; file:// only if CLWND_DEV is set
+  if [ -n "$CLWND_DEV" ]; then
+    echo "file://$CLWND_SRC/plugins/opencode/dist/index.js"
+  else
+    echo "@clwnd/opencode"
+  fi
 }
 
 configure_opencode() {
