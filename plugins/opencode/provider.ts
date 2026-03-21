@@ -136,6 +136,22 @@ function extractText(prompt: LanguageModelV2Prompt): string {
   return "";
 }
 
+function extractSystemPrompt(prompt: LanguageModelV2Prompt): string {
+  const parts: string[] = [];
+  for (const m of prompt) {
+    if (m.role === "system") {
+      if (typeof m.content === "string") {
+        parts.push(m.content);
+      } else if (Array.isArray(m.content)) {
+        for (const p of m.content as Array<{ type: string; text?: string }>) {
+          if (p.type === "text" && p.text) parts.push(p.text);
+        }
+      }
+    }
+  }
+  return parts.join("\n\n");
+}
+
 // Fetch session permission rules from OpenCode
 async function getSessionPermissions(client: any, sessionId: string): Promise<Array<{ permission: string; pattern: string; action: string }>> {
   if (!client) return [];
@@ -193,6 +209,7 @@ export class ClwndModel implements LanguageModelV2 {
     // pollute the main Claude CLI session with --resume
     const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
     const text = extractText(opts.prompt);
+    const systemPrompt = extractSystemPrompt(opts.prompt);
     const warnings: LanguageModelV2CallWarning[] = [];
     const cwd = this.config.cwd ?? process.cwd();
     const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
@@ -223,6 +240,7 @@ export class ClwndModel implements LanguageModelV2 {
         cwd,
         modelId: this.modelId,
         text,
+        systemPrompt,
         permissions,
       }).then(async (resp) => {
         if (!resp.body) { abort(); return; }
@@ -317,6 +335,7 @@ export class ClwndModel implements LanguageModelV2 {
     const isTitle = isAuxiliaryCall(opts);
     const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
     const text = extractText(opts.prompt);
+    const systemPrompt = extractSystemPrompt(opts.prompt);
     const warnings: LanguageModelV2CallWarning[] = [];
     const cwd = this.config.cwd ?? process.cwd();
     const self = this;
@@ -358,6 +377,7 @@ export class ClwndModel implements LanguageModelV2 {
             cwd,
             modelId: self.modelId,
             text,
+            systemPrompt,
             permissions,
           });
         } catch (e) {

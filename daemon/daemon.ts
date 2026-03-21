@@ -92,9 +92,9 @@ class SubprocessPool {
 
   constructor(private cliPath = "claude") {}
 
-  sendSpawn(poolKey: string, modelId: string, handler: StreamHandler, claudeSessionId?: string, permissions?: unknown[]): void {
+  sendSpawn(poolKey: string, modelId: string, handler: StreamHandler, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string): void {
     let entry = this.procs.get(poolKey);
-    if (!entry) entry = this.spawnProc(poolKey, modelId, claudeSessionId, permissions);
+    if (!entry) entry = this.spawnProc(poolKey, modelId, claudeSessionId, permissions, systemPrompt);
     handler.onChunk("stream_start", {});
     entry.handlers.set(handler.opencodeSessionId, handler);
   }
@@ -146,7 +146,7 @@ class SubprocessPool {
     this.procs.clear();
   }
 
-  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[]): ProcEntry {
+  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string): ProcEntry {
     // Update MCP server permissions for this request
     mcpSetPerms((permissions ?? []) as any);
 
@@ -175,6 +175,9 @@ class SubprocessPool {
     ];
     if (claudeSessionId) {
       cmd.push("--resume", claudeSessionId);
+    }
+    if (systemPrompt) {
+      cmd.push("--append-system-prompt", systemPrompt);
     }
     const proc = spawn({
       cmd,
@@ -639,6 +642,7 @@ Bun.serve({
       return req.json().then(async (body: IpcToDaemon) => {
         const { opencodeSessionId, cwd, modelId, text } = body;
         const permissions = (body.permissions ?? []) as unknown[];
+        const systemPrompt = (body.systemPrompt as string) || undefined;
 
         // Wait for any in-flight request on this session to finish
         const prev = sessionLocks.get(opencodeSessionId);
@@ -720,7 +724,7 @@ Bun.serve({
               },
             };
 
-            pool.sendSpawn(poolKey, session.modelId, h, resumeSessionId, permissions);
+            pool.sendSpawn(poolKey, session.modelId, h, resumeSessionId, permissions, systemPrompt);
             pool.sendPrompt(opencodeSessionId, poolKey, text ?? "");
           },
           cancel() {
