@@ -42,7 +42,7 @@ function mapToolName(name: string): string {
 // Tools that OpenCode should execute (providerExecuted: false).
 // MCP server still runs them for Claude CLI, but we tell OpenCode
 // to also execute them natively for state/UI integration.
-const BROKERED_TOOLS = new Set(["webfetch", "websearch", "todowrite"]);
+const BROKERED_TOOLS = new Set(["webfetch", "todowrite"]);
 
 // snake_case → camelCase field mapping per tool
 const INPUT_FIELD_MAP: Record<string, Record<string, string>> = {
