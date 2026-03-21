@@ -46,6 +46,22 @@ const INPUT_FIELD_MAP: Record<string, Record<string, string>> = {
 
 function mapToolInput(toolName: string, input: string): string {
   const ocName = mapToolName(toolName);
+
+  // TodoWrite: ensure each todo has 'priority', remove 'activeForm'
+  if (ocName === "todowrite") {
+    try {
+      const parsed = JSON.parse(input);
+      if (parsed.todos && Array.isArray(parsed.todos)) {
+        parsed.todos = parsed.todos.map((t: any) => ({
+          content: t.content ?? "",
+          status: t.status ?? "pending",
+          priority: t.priority ?? "medium",
+        }));
+      }
+      return JSON.stringify(parsed);
+    } catch { return input; }
+  }
+
   const fieldMap = INPUT_FIELD_MAP[ocName];
   if (!fieldMap || Object.keys(fieldMap).length === 0) return input;
   try {
