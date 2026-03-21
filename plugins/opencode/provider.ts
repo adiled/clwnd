@@ -439,13 +439,17 @@ export class ClwndModel implements LanguageModelV2 {
                   emit({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
                 }
                 const u = msg.usage as Record<string, unknown> | undefined;
+                const cacheRead = (u?.cache_read_input_tokens ?? 0) as number;
+                const cacheWrite = (u?.cache_creation_input_tokens ?? 0) as number;
+                const inputBase = (u?.input_tokens ?? u?.inputTokens ?? 0) as number;
                 emit({
                   type: "finish",
                   finishReason: (msg.finishReason ?? "stop") as LanguageModelV2FinishReason,
                   usage: {
-                    inputTokens: (u?.input_tokens ?? u?.inputTokens) as number | undefined,
+                    inputTokens: inputBase + cacheRead + cacheWrite,
                     outputTokens: (u?.output_tokens ?? u?.outputTokens) as number | undefined,
                     totalTokens: undefined,
+                    cache: { read: cacheRead, write: cacheWrite },
                   },
                   providerMetadata: msg.providerMetadata ?? {},
                 } as LanguageModelV2StreamPart);
