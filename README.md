@@ -6,7 +6,7 @@
 curl -fsSL https://raw.githubusercontent.com/adiled/clwnd/main/install | bash
 ```
 
-clwnd.
+clwnd ([/klwʊnd/](https://ipa-reader.com/?text=%2Fklw%CA%8And%2F)).
 
 ```
 ~/.local/share/clwnd/src/install update
