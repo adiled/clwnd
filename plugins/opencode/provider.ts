@@ -113,20 +113,12 @@ async function ipcCall(msg: IpcToDaemon): Promise<void> {
   if (!r.ok) throw new Error(`clwnd IPC ${r.status}`);
 }
 
-// Detect title generation calls — these should NOT resume or persist sessions
-function isTitleCall(prompt: LanguageModelV2Prompt): boolean {
-  for (const m of prompt) {
-    if (m.role === "user") {
-      const text = typeof m.content === "string"
-        ? m.content
-        : (m.content as Array<{ type: string; text?: string }>)
-            .filter(p => p.type === "text" && p.text)
-            .map(p => p.text)
-            .join("");
-      if (text.includes("Generate a title")) return true;
-    }
-  }
-  return false;
+// Detect auxiliary calls (title generation, etc.) that should NOT
+// resume or persist sessions. These have no tools and no system prompt.
+function isAuxiliaryCall(opts: { prompt: LanguageModelV2Prompt; tools?: unknown[] | unknown }): boolean {
+  const hasTools = Array.isArray(opts.tools) && opts.tools.length > 0;
+  const hasSystem = opts.prompt.some(m => m.role === "system");
+  return !hasTools && !hasSystem;
 }
 
 function extractText(prompt: LanguageModelV2Prompt): string {
@@ -196,7 +188,7 @@ export class ClwndModel implements LanguageModelV2 {
     response: { id: string; timestamp: Date; modelId: string };
     providerMetadata: Record<string, unknown>;
   }> {
-    const isTitle = isTitleCall(opts.prompt);
+    const isTitle = isAuxiliaryCall(opts);
     // Title generation calls get a throwaway session ID so they don't
     // pollute the main Claude CLI session with --resume
     const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
@@ -322,7 +314,7 @@ export class ClwndModel implements LanguageModelV2 {
     rawCall: { raw: unknown; rawHeaders: unknown };
     warnings: LanguageModelV2CallWarning[];
   }> {
-    const isTitle = isTitleCall(opts.prompt);
+    const isTitle = isAuxiliaryCall(opts);
     const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
     const text = extractText(opts.prompt);
     const warnings: LanguageModelV2CallWarning[] = [];
