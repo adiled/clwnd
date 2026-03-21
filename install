@@ -38,7 +38,8 @@ ensure_dirs() {
 ensure_source() {
   if [ -d "$CLWND_SRC/.git" ]; then
     echo "[source] updating $CLWND_SRC..."
-    git -C "$CLWND_SRC" pull --ff-only
+    git -C "$CLWND_SRC" fetch --depth=1 origin
+    git -C "$CLWND_SRC" reset --hard origin/main
   else
     echo "[source] cloning to $CLWND_SRC..."
     git clone "$CLWND_REPO" "$CLWND_SRC"

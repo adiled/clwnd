@@ -142,6 +142,19 @@ export const TOOLS = [
       required: ["pattern"],
     },
   },
+  {
+    name: "webfetch",
+    description: "Fetch content from a URL. Returns the page content as markdown, text, or HTML.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        url: { type: "string", description: "The URL to fetch content from" },
+        format: { type: "string", description: "Output format: markdown (default), text, or html", enum: ["markdown", "text", "html"] },
+        timeout: { type: "number", description: "Timeout in seconds (default 30, max 120)" },
+      },
+      required: ["url"],
+    },
+  },
 ];
 
 // ─── Tool Execution ─────────────────────────────────────────────────────────
@@ -309,7 +322,69 @@ function execGrep(args: { pattern: string; path?: string; include?: string }): T
   }
 }
 
-export function executeTool(name: string, args: Record<string, unknown>): ToolResult {
+async function execWebfetch(args: { url: string; format?: string; timeout?: number }): Promise<ToolResult> {
+  checkPermission("webfetch", args.url);
+
+  if (!args.url.startsWith("http://") && !args.url.startsWith("https://")) {
+    return { output: "Error: URL must start with http:// or https://", title: args.url };
+  }
+
+  const timeout = Math.min((args.timeout ?? 30) * 1000, 120_000);
+  const format = args.format ?? "markdown";
+
+  const headers: Record<string, string> = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+    "Accept": format === "html"
+      ? "text/html,application/xhtml+xml,*/*;q=0.8"
+      : "text/markdown;q=1.0, text/plain;q=0.8, text/html;q=0.7, */*;q=0.1",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
+
+  try {
+    let response = await fetch(args.url, { signal: AbortSignal.timeout(timeout), headers });
+
+    // Retry with honest UA if Cloudflare blocks
+    if (response.status === 403 && response.headers.get("cf-mitigated") === "challenge") {
+      response = await fetch(args.url, { signal: AbortSignal.timeout(timeout), headers: { ...headers, "User-Agent": "clwnd" } });
+    }
+
+    if (!response.ok) {
+      return { output: `Error: HTTP ${response.status}`, title: args.url };
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    const text = await response.text();
+
+    // HTML → markdown conversion via simple stripping if markdown requested
+    let output = text;
+    if (format === "markdown" && contentType.includes("text/html")) {
+      // Strip tags, keep text — basic conversion
+      output = text
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    } else if (format === "text" && contentType.includes("text/html")) {
+      output = text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    }
+
+    // Truncate if too large
+    if (output.length > 500_000) {
+      output = output.slice(0, 500_000) + "\n\n[truncated]";
+    }
+
+    return {
+      output,
+      title: `${args.url} (${contentType.split(";")[0]})`,
+      metadata: {},
+    };
+  } catch (e: any) {
+    return { output: `Error fetching ${args.url}: ${e.message}`, title: args.url };
+  }
+}
+
+export async function executeTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
   switch (name) {
     case "read": return execRead(args as any);
     case "edit": return execEdit(args as any);
@@ -317,13 +392,14 @@ export function executeTool(name: string, args: Record<string, unknown>): ToolRe
     case "bash": return execBash(args as any);
     case "glob": return execGlob(args as any);
     case "grep": return execGrep(args as any);
+    case "webfetch": return execWebfetch(args as any);
     default: return { output: `Unknown tool: ${name}` };
   }
 }
 
 // ─── MCP JSON-RPC handler ───────────────────────────────────────────────────
 
-export function handleMcpRequest(body: { jsonrpc: string; id?: number | string; method: string; params?: any }): unknown {
+export async function handleMcpRequest(body: { jsonrpc: string; id?: number | string; method: string; params?: any }): Promise<unknown> {
   switch (body.method) {
     case "initialize":
       return {
@@ -345,7 +421,7 @@ export function handleMcpRequest(body: { jsonrpc: string; id?: number | string; 
       const name = body.params?.name as string;
       const args = (body.params?.arguments ?? {}) as Record<string, unknown>;
       try {
-        const result = executeTool(name, args);
+        const result = await executeTool(name, args);
         const content: Array<{ type: string; text: string }> = [
           { type: "text", text: result.output },
         ];

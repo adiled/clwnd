@@ -168,9 +168,9 @@ class SubprocessPool {
       "--permission-mode", process.env.CLWND_PERMISSION_MODE ?? "acceptEdits",
       // Disable built-in tools — our MCP server replaces file/bash tools,
       // and Claude CLI internal tools aren't available in OpenCode
-      "--disallowedTools", "Read,Edit,Write,Bash,Glob,Grep,ToolSearch,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree",
+      "--disallowedTools", "Read,Edit,Write,Bash,Glob,Grep,WebFetch,ToolSearch,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree",
       // Auto-approve our MCP tools
-      "--allowedTools", "mcp__clwnd__read,mcp__clwnd__edit,mcp__clwnd__write,mcp__clwnd__bash,mcp__clwnd__glob,mcp__clwnd__grep",
+      "--allowedTools", "mcp__clwnd__read,mcp__clwnd__edit,mcp__clwnd__write,mcp__clwnd__bash,mcp__clwnd__glob,mcp__clwnd__grep,mcp__clwnd__webfetch",
       // Register our MCP server
       "--mcp-config", mcpConfig,
     ];
@@ -792,7 +792,7 @@ const mcpServer = Bun.serve({
     if (req.method !== "POST") return new Response("clwnd-mcp", { status: 200 });
     try {
       const body = await req.json();
-      const result = handleMcpRequest(body);
+      const result = await handleMcpRequest(body);
       if (!result) return new Response("", { status: 204 });
       return Response.json(result);
     } catch (e: any) {

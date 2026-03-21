@@ -5,3 +5,4 @@ bun.lock
 .claude/
 *.md
 !README.md
+dev

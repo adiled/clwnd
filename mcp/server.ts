@@ -11,10 +11,10 @@ import { loadPermissionsFromFile, handleMcpRequest } from "./tools.ts";
 loadPermissionsFromFile();
 
 const rl = createInterface({ input: process.stdin });
-rl.on("line", (line: string) => {
+rl.on("line", async (line: string) => {
   if (!line.trim()) return;
   try {
-    const result = handleMcpRequest(JSON.parse(line));
+    const result = await handleMcpRequest(JSON.parse(line));
     if (result) process.stdout.write(JSON.stringify(result) + "\n");
   } catch (e: any) {
     process.stdout.write(JSON.stringify({ jsonrpc: "2.0", error: { code: -32700, message: `Parse error: ${e.message}` } }) + "\n");

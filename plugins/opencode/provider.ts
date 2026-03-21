@@ -126,7 +126,7 @@ function isAuxiliaryCall(opts: { prompt: LanguageModelV2Prompt; tools?: unknown[
 // We map OpenCode tool names to our MCP tool names.
 const OC_TO_MCP: Record<string, string> = {
   read: "read", edit: "edit", write: "write", bash: "bash",
-  glob: "glob", grep: "grep", apply_patch: "edit",
+  glob: "glob", grep: "grep", apply_patch: "edit", webfetch: "webfetch",
 };
 
 function deriveAllowedTools(opts: { tools?: Array<{ name: string }> | unknown }): string[] {
