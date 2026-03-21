@@ -147,28 +147,13 @@ class SubprocessPool {
   }
 
   private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[]): ProcEntry {
-    // MCP server config — route file/bash tools through our MCP server
-    // instead of Claude CLI's built-in tools
-    const mcpServerPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "mcp", "server.ts");
+    // Update MCP server permissions for this request
+    mcpSetPerms((permissions ?? []) as any);
 
-    // Write permissions to a temp file the MCP server reads
-    const permFile = `${STATE_DIR}/.mcp-perms-${poolKey}.json`;
-    try {
-      mkdirSync(STATE_DIR, { recursive: true });
-      writeFileSync(permFile, JSON.stringify(permissions ?? []));
-    } catch {}
-
+    // MCP config — point Claude CLI to our persistent HTTP MCP server
     const mcpConfig = JSON.stringify({
       mcpServers: {
-        clwnd: {
-          type: "stdio",
-          command: process.env.BUN_PATH ?? "bun",
-          args: [mcpServerPath],
-          env: {
-            CLWND_CWD: process.env.CLWND_CWD ?? process.env.HOME ?? "/",
-            CLWND_PERMISSIONS_FILE: permFile,
-          },
-        },
+        clwnd: { type: "http", url: MCP_URL },
       },
     });
 
@@ -772,9 +757,36 @@ Bun.serve({
   },
 });
 
+// ─── MCP HTTP Server (persistent, no cold start) ────────────────────────────
+
+import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms } from "../mcp/tools.ts";
+
+const MCP_PORT = parseInt(process.env.CLWND_MCP_PORT ?? "0") || 0;
+
+const MCP_HOST = process.env.CLWND_HOST ?? "127.0.0.1";
+
+const mcpServer = Bun.serve({
+  port: MCP_PORT,
+  hostname: MCP_HOST,
+  async fetch(req) {
+    if (req.method !== "POST") return new Response("clwnd-mcp", { status: 200 });
+    try {
+      const body = await req.json();
+      const result = handleMcpRequest(body);
+      if (!result) return new Response("", { status: 204 });
+      return Response.json(result);
+    } catch (e: any) {
+      return Response.json({ jsonrpc: "2.0", error: { code: -32700, message: e.message } });
+    }
+  },
+});
+
+const MCP_URL = `http://${MCP_HOST}:${mcpServer.port}`;
+mcpSetCwd(process.env.CLWND_CWD ?? process.env.HOME ?? "/");
+
 process.on("SIGINT",  () => { pool.killAll(); process.exit(0); });
 process.on("SIGTERM", () => { pool.killAll(); process.exit(0); });
 process.on("uncaughtException",  e => console.error("uncaught:", e));
 process.on("unhandledRejection", e => console.error("unhandled:", e));
 
-info("ready", { http: HTTP, pid: process.pid });
+info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid });
