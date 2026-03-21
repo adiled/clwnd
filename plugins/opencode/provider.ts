@@ -169,6 +169,27 @@ function isBrokeredToolReturn(prompt: LanguageModelV2Prompt): boolean {
   return false;
 }
 
+function extractBrokeredReturn(prompt: LanguageModelV2Prompt): { toolCallId: string | null; result: string | null } {
+  let toolCallId: string | null = null;
+  let result: string | null = null;
+  for (let i = prompt.length - 1; i >= 0; i--) {
+    const m = prompt[i];
+    if (m.role === "tool" && Array.isArray(m.content)) {
+      for (const part of m.content as Array<{ type: string; toolCallId?: string; result?: unknown }>) {
+        if (part.type === "tool-result") {
+          toolCallId = part.toolCallId ?? null;
+          const r = part.result as any;
+          if (typeof r === "string") result = r;
+          else if (r?.output) result = String(r.output);
+          else result = JSON.stringify(r);
+        }
+      }
+      break;
+    }
+  }
+  return { toolCallId, result };
+}
+
 function extractText(prompt: LanguageModelV2Prompt): string {
   for (let i = prompt.length - 1; i >= 0; i--) {
     const m = prompt[i];
@@ -394,9 +415,18 @@ export class ClwndModel implements LanguageModelV2 {
     const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
     const allowedTools = isTitle ? [] : deriveAllowedTools(opts);
 
-    // If OpenCode is sending back a brokered tool result, don't call Claude CLI.
-    // Claude already responded in the previous turn. Just finish cleanly.
+    // If OpenCode is sending back a brokered tool result, rewrite Claude CLI's
+    // JSONL so future --resume picks up OpenCode's version.
     if (isBrokeredReturn) {
+      const { toolCallId, result } = extractBrokeredReturn(opts.prompt);
+      if (toolCallId && result) {
+        ipcCall({
+          action: "rewrite_tool_result",
+          opencodeSessionId: sid,
+          toolUseId: toolCallId,
+          result,
+        }).catch(() => {});
+      }
       const stream = new ReadableStream<LanguageModelV2StreamPart>({
         start(controller) {
           controller.enqueue({ type: "finish", finishReason: "stop", usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined }, providerMetadata: {} } as LanguageModelV2StreamPart);

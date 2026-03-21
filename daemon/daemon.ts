@@ -1,6 +1,6 @@
 import { spawn, type Subprocess } from "bun";
 import { EventEmitter } from "events";
-import { existsSync, unlinkSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from "fs";
+import { existsSync, unlinkSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, readdirSync } from "fs";
 import { randomUUID } from "crypto";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -168,9 +168,9 @@ class SubprocessPool {
       "--permission-mode", process.env.CLWND_PERMISSION_MODE ?? "acceptEdits",
       // Disable built-in tools — our MCP server replaces file/bash tools,
       // and Claude CLI internal tools aren't available in OpenCode
-      "--disallowedTools", "Read,Edit,Write,Bash,Glob,Grep,WebFetch,ToolSearch,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree",
+      "--disallowedTools", "Read,Edit,Write,Bash,Glob,Grep,ToolSearch,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree",
       // Auto-approve our MCP tools
-      "--allowedTools", "mcp__clwnd__read,mcp__clwnd__edit,mcp__clwnd__write,mcp__clwnd__bash,mcp__clwnd__glob,mcp__clwnd__grep,mcp__clwnd__webfetch",
+      "--allowedTools", "mcp__clwnd__read,mcp__clwnd__edit,mcp__clwnd__write,mcp__clwnd__bash,mcp__clwnd__glob,mcp__clwnd__grep",
       // Register our MCP server
       "--mcp-config", mcpConfig,
     ];
@@ -420,6 +420,59 @@ function getLastEntryUuid(path: string): string | null {
   return null;
 }
 
+// Find a Claude CLI JSONL session file by session ID
+function findClaudeJsonl(claudeSessionId: string): string | null {
+  const base = `${process.env.HOME}/.claude/projects`;
+  try {
+    const dirs = readdirSync(base);
+    for (const dir of dirs) {
+      const candidate = `${base}/${dir}/${claudeSessionId}.jsonl`;
+      if (existsSync(candidate)) return candidate;
+    }
+  } catch {}
+  return null;
+}
+
+// Rewrite a tool_result in the JSONL session file by tool_use_id
+function rewriteToolResult(claudeSessionId: string, toolUseId: string, newContent: string): boolean {
+  const sessionPath = findClaudeJsonl(claudeSessionId);
+  if (!sessionPath) {
+    trace("jsonl.rewrite.notfound", { claudeSessionId, toolUseId });
+    return false;
+  }
+  try {
+    const data = readFileSync(sessionPath, "utf-8");
+    const lines = data.split("\n");
+    let changed = false;
+    const rewritten = lines.map(line => {
+      if (!line.trim()) return line;
+      try {
+        const entry = JSON.parse(line);
+        if (entry.message?.content && Array.isArray(entry.message.content)) {
+          for (const block of entry.message.content) {
+            if (block.type === "tool_result" && block.tool_use_id === toolUseId) {
+              block.content = typeof newContent === "string"
+                ? [{ type: "text", text: newContent }]
+                : newContent;
+              changed = true;
+            }
+          }
+          if (changed) return JSON.stringify(entry);
+        }
+      } catch {}
+      return line;
+    });
+    if (changed) {
+      writeFileSync(sessionPath, rewritten.join("\n"));
+      info("jsonl.rewrite", { toolUseId, path: sessionPath });
+    }
+    return changed;
+  } catch (e: any) {
+    trace("jsonl.rewrite.error", { toolUseId, error: e.message });
+    return false;
+  }
+}
+
 function createClaudeSession(cwd: string, id: string): string {
   const dir = getSessionDir(cwd);
   const path = getSessionPath(cwd, id);
@@ -539,6 +592,14 @@ function handleAction(msg: IpcToDaemon, pool: SubprocessPool): void {
     case "abort": {
       const session = sessions.get(msg.opencodeSessionId);
       if (session) pool.abort(msg.opencodeSessionId, session.modelId);
+      break;
+    }
+
+    case "rewrite_tool_result": {
+      const session = sessions.get(msg.opencodeSessionId);
+      if (session?.claudeSessionId && msg.toolUseId && msg.result) {
+        rewriteToolResult(session.claudeSessionId, msg.toolUseId as string, msg.result as string);
+      }
       break;
     }
 
