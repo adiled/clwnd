@@ -24,9 +24,8 @@ run_as_clwnd() {
 CLAUDE_HELP=$(run_as_clwnd "claude --help 2>&1")
 OPENCODE_HELP=$(run_as_clwnd "opencode --help 2>&1 | cat")
 
-# Extract built-in TUI commands from the SDK types
-OC_SDK_TYPES="$CLWND_SRC/node_modules/@opencode-ai/sdk/dist/gen/types.gen.d.ts"
-OC_TUI_COMMANDS=$(grep 'session\.list.*session\.new' "$OC_SDK_TYPES" 2>/dev/null | grep -oP '"[a-z]+\.[a-z._]+"' | tr -d '"' | sort -u | paste -sd, - || echo "unavailable")
+# Extract built-in TUI commands from the SDK types (must run as clwnd to access the file)
+OC_TUI_COMMANDS=$(run_as_clwnd "grep 'session\.list.*session\.new' node_modules/@opencode-ai/sdk/dist/gen/types.gen.d.ts 2>/dev/null | grep -oP '\"[a-z]+\.[a-z._]+\"' | tr -d '\"' | sort -u | paste -sd, -")
 
 # ─── Capture versions ────────────────────────────────────────────────────────
 
@@ -134,7 +133,7 @@ Look ONLY at the OpenCode built-in TUI commands listed above. For each TUI comma
 Then a line: \`Last updated: YYYY-MM-DD HH:MM UTC\` using the timestamp provided in the input.
 
 ## Rules
-- Only output the issue body markdown. No preamble, no explanation.
+- CRITICAL: Output ONLY the raw markdown. No preamble, no "Here is...", no "I'll generate...", no explanation. Start directly with "## Tool Calls".
 - Derive status ONLY from test results. If a test passes, it works. If it fails, use ❌ status.
 - For CC Equivalent, use actual CLI flag/command names from the reference, not "Yes"/"No"/"Not applicable".
 - CRITICAL: Test Coverage column must ONLY contain comma-separated suite names from this exact set: \`smoke\`, \`e2e\`, \`e2e-serve\`, \`e2e-human\`. Nothing else. No test names, no descriptions, no qualifiers. Examples: "smoke, e2e-serve" or "e2e" or "—". Any other format is wrong.
