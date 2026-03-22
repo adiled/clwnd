@@ -105,42 +105,13 @@ function skipIfDead() {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-describe("e2e-serve-asks: permission ask triggers OC prompt", () => {
-  test("edit triggers permission.asked event in OC", async () => {
+describe("e2e-serve-asks: permission ask via /allow command", () => {
+  test("edit with ask permission: /allow approves and edit proceeds", async () => {
     skipIfDead();
     const sid = await createSession();
 
-    // Listen for permission.asked events via SSE
-    const ctrl = new AbortController();
-    const askedEvents: any[] = [];
-
-    const listener = (async () => {
-      try {
-        const resp = await fetch(`${BASE}/event`, { signal: ctrl.signal });
-        const reader = resp.body?.getReader();
-        if (!reader) return;
-        const decoder = new TextDecoder();
-        let buffer = "";
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() ?? "";
-          for (const line of lines) {
-            if (!line.startsWith("data: ")) continue;
-            try {
-              const event = JSON.parse(line.slice(6));
-              if (event.type === "permission.asked" || event.type === "permission.updated") {
-                askedEvents.push(event);
-              }
-            } catch {}
-          }
-        }
-      } catch {}
-    })();
-
-    // Send edit — don't wait for completion, just fire it
+    // Fire the edit request — this will block because the PreToolUse hook
+    // holds while waiting for /allow or /deny
     const editPromise = fetch(`${BASE}/session/${sid}/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -148,20 +119,23 @@ describe("e2e-serve-asks: permission ask triggers OC prompt", () => {
         model: MODEL,
         parts: [{ type: "text", text: `Edit ${join(PROJECT_DIR, "hello.txt")} — change "hello" to "hi"` }],
       }),
-      signal: AbortSignal.timeout(60_000),
-    }).catch(() => {});
+      signal: AbortSignal.timeout(180_000),
+    }).then(r => r.json()).catch(() => null);
 
-    // Wait up to 30s for permission.asked to appear
-    const deadline = Date.now() + 30_000;
-    while (Date.now() < deadline && askedEvents.length === 0) {
-      await Bun.sleep(1_000);
-    }
+    // Wait for the permission toast to appear (daemon calls plugin, plugin shows toast)
+    await Bun.sleep(10_000);
 
-    ctrl.abort();
-    await listener.catch(() => {});
+    // Send /allow command to approve the permission
+    await api(`/session/${sid}/command`, {
+      method: "POST",
+      body: JSON.stringify({ command: "allow", arguments: "" }),
+    });
+
+    // Wait for the edit to complete
     await editPromise;
 
-    // The permission.asked event should have fired
-    expect(askedEvents.length).toBeGreaterThan(0);
+    // Verify the edit happened
+    const content = await Bun.file(join(PROJECT_DIR, "hello.txt")).text();
+    expect(content).toContain("hi");
   }, TIMEOUT);
 });
