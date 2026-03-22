@@ -1,6 +1,6 @@
-import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
 import { spawn, type Subprocess } from "bun";
-import { existsSync, rmSync, mkdirSync, readFileSync } from "fs";
+import { existsSync, rmSync, mkdirSync } from "fs";
 import { join } from "path";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -8,8 +8,12 @@ import { join } from "path";
 const PORT = 14567;
 const BASE = `http://127.0.0.1:${PORT}`;
 const MODEL = { providerID: "opencode-clwnd", modelID: "claude-haiku-4-5" };
-const PROJECT_DIR = "/tmp/clwnd-e2e-serve-project";
+const SUITE_DIR = "/tmp/clwnd-e2e-serve";
+const PROJECT_DIR = join(SUITE_DIR, "project");
 const TIMEOUT = 180_000;
+
+// Track sessions created during each test for cleanup
+const activeSessions: string[] = [];
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -26,11 +30,24 @@ async function createSession(): Promise<string> {
     method: "POST",
     body: JSON.stringify({ directory: PROJECT_DIR }),
   });
-  return (r as any).id;
+  const sid = (r as any).id;
+  if (sid) activeSessions.push(sid);
+  return sid;
+}
+
+async function deleteSession(sid: string): Promise<void> {
+  try {
+    const proc = spawn({
+      cmd: ["opencode", "session", "delete", sid],
+      cwd: PROJECT_DIR,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    await proc.exited;
+  } catch {}
 }
 
 async function sendMessage(sessionID: string, text: string, agent?: string): Promise<{ info: any; parts: any[] }> {
-  // POST /session/:id/message blocks until the response is complete
   const r = await fetch(`${BASE}/session/${sessionID}/message`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -43,24 +60,12 @@ async function sendMessage(sessionID: string, text: string, agent?: string): Pro
   return r.json() as any;
 }
 
-async function sendCommand(sessionID: string, command: string, args?: string): Promise<any> {
-  return api(`/session/${sessionID}/command`, {
-    method: "POST",
-    body: JSON.stringify({ command, arguments: args ?? "" }),
-  });
-}
-
 async function getSession(sessionID: string): Promise<any> {
   return api(`/session/${sessionID}`);
 }
 
 async function getMessages(sessionID: string): Promise<any[]> {
   const r = await api(`/session/${sessionID}/message`);
-  return (r as any) ?? [];
-}
-
-async function getTodos(sessionID: string): Promise<any[]> {
-  const r = await api(`/session/${sessionID}/todo`);
   return (r as any) ?? [];
 }
 
@@ -71,22 +76,51 @@ function extractResponseText(resp: { info: any; parts: any[] }): string {
     .join("");
 }
 
-// ─── Lifecycle ──────────────────────────────────────────────────────────────
+async function serverIsAlive(): Promise<boolean> {
+  try {
+    const r = await fetch(`${BASE}/session/status`);
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function killPort(port: number): Promise<void> {
+  try {
+    const proc = spawn({
+      cmd: ["sh", "-c", `lsof -ti :${port} | xargs -r kill -9`],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    await proc.exited;
+    await Bun.sleep(500);
+  } catch {}
+}
+
+// ─── Suite Lifecycle ────────────────────────────────────────────────────────
 
 let server: Subprocess;
 
 beforeAll(async () => {
-  // Create project dir
-  if (existsSync(PROJECT_DIR)) rmSync(PROJECT_DIR, { recursive: true });
+  // Kill any lingering processes on our port
+  await killPort(PORT);
+
+  // Create suite directory structure
+  if (existsSync(SUITE_DIR)) rmSync(SUITE_DIR, { recursive: true });
   mkdirSync(PROJECT_DIR, { recursive: true });
 
+  // Init git repo in project dir
   const gitInit = spawn({ cmd: ["git", "init"], cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe" });
   await gitInit.exited;
   await Bun.write(join(PROJECT_DIR, "hello.txt"), "hello world\n");
 
+  // Claude permissions for MCP tools
   mkdirSync(join(PROJECT_DIR, ".claude"), { recursive: true });
   await Bun.write(join(PROJECT_DIR, ".claude", "settings.json"), JSON.stringify({
-    permissions: { allow: ["mcp__clwnd__read(*)", "mcp__clwnd__edit(*)", "mcp__clwnd__write(*)", "mcp__clwnd__bash(*)", "mcp__clwnd__glob(*)", "mcp__clwnd__grep(*)"] },
+    permissions: { allow: [
+      "mcp__clwnd__read(*)", "mcp__clwnd__edit(*)", "mcp__clwnd__write(*)",
+      "mcp__clwnd__bash(*)", "mcp__clwnd__glob(*)", "mcp__clwnd__grep(*)",
+    ] },
   }, null, 2));
 
   const gitAdd = spawn({ cmd: ["git", "add", "."], cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe" });
@@ -98,7 +132,7 @@ beforeAll(async () => {
   });
   await gitCommit.exited;
 
-  // Start opencode serve
+  // Start opencode serve — ONCE for the entire suite
   server = spawn({
     cmd: ["opencode", "serve", "--port", String(PORT), "--hostname", "127.0.0.1"],
     cwd: PROJECT_DIR,
@@ -107,27 +141,64 @@ beforeAll(async () => {
     env: { ...process.env },
   });
 
-  // Wait for server to be ready
-  const deadline = Date.now() + 15_000;
+  // Wait for server readiness
+  const deadline = Date.now() + 20_000;
+  let ready = false;
   while (Date.now() < deadline) {
-    try {
-      const r = await fetch(`${BASE}/session/status`);
-      if (r.ok) break;
-    } catch {}
+    if (await serverIsAlive()) { ready = true; break; }
     await Bun.sleep(500);
   }
+  if (!ready) throw new Error("opencode serve failed to start within 20s");
 }, 30_000);
 
 afterAll(async () => {
-  try { server.kill(); } catch {}
-  await server.exited.catch(() => {});
-  if (existsSync(PROJECT_DIR)) rmSync(PROJECT_DIR, { recursive: true });
+  // Graceful shutdown: SIGTERM first, then SIGKILL
+  try { server.kill("SIGTERM"); } catch {}
+  const exited = Promise.race([
+    server.exited.catch(() => {}),
+    Bun.sleep(5_000).then(() => "timeout"),
+  ]);
+  if (await exited === "timeout") {
+    try { server.kill("SIGKILL"); } catch {}
+    await server.exited.catch(() => {});
+  }
+
+  // Kill anything still on the port
+  await killPort(PORT);
+
+  // Cleanup suite directory
+  if (existsSync(SUITE_DIR)) rmSync(SUITE_DIR, { recursive: true });
+}, 15_000);
+
+// ─── Per-Test Cleanup ───────────────────────────────────────────────────────
+
+afterEach(async () => {
+  // Delete all sessions created during the test
+  while (activeSessions.length > 0) {
+    const sid = activeSessions.pop()!;
+    await deleteSession(sid);
+  }
+
+  // Reset hello.txt for tests that modify it
+  if (existsSync(PROJECT_DIR)) {
+    await Bun.write(join(PROJECT_DIR, "hello.txt"), "hello world\n");
+  }
 });
+
+// ─── Guard ──────────────────────────────────────────────────────────────────
+
+function skipIfDead() {
+  // Inline check — if server crashed, skip remaining tests gracefully
+  if (server?.exitCode !== null) {
+    throw new Error("opencode serve is no longer running — skipping");
+  }
+}
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe("e2e-serve: session basics", () => {
   test("create session and send message", async () => {
+    skipIfDead();
     const sid = await createSession();
     expect(sid).toBeTruthy();
 
@@ -137,6 +208,7 @@ describe("e2e-serve: session basics", () => {
   }, TIMEOUT);
 
   test("session continuity across turns", async () => {
+    skipIfDead();
     const sid = await createSession();
 
     await sendMessage(sid, "My favorite planet is Mars. Acknowledge.");
@@ -149,6 +221,7 @@ describe("e2e-serve: session basics", () => {
 
 describe("e2e-serve: agent switching", () => {
   test("switch from build to plan agent", async () => {
+    skipIfDead();
     const sid = await createSession();
 
     await sendMessage(sid, "Say hello", "build");
@@ -163,13 +236,13 @@ describe("e2e-serve: agent switching", () => {
         expect(userMsgs[1].agent).toBe("plan");
       }
     }
-    // Response should exist
     expect(resp).toBeDefined();
   }, TIMEOUT);
 });
 
 describe("e2e-serve: CWD from session", () => {
   test("session directory is used for file operations", async () => {
+    skipIfDead();
     const sid = await createSession();
     const session = await getSession(sid);
     expect(session.directory).toBe(PROJECT_DIR);
@@ -182,6 +255,7 @@ describe("e2e-serve: CWD from session", () => {
 
 describe("e2e-serve: todo sync", () => {
   test("todowrite creates todos in opencode", async () => {
+    skipIfDead();
     const sid = await createSession();
 
     const resp = await sendMessage(sid, "Use the TodoWrite tool to create todos: buy groceries, clean house");
@@ -192,15 +266,8 @@ describe("e2e-serve: todo sync", () => {
 });
 
 describe("e2e-serve: tool rendering metadata", () => {
-  test("edit produces tool part with correct name", async () => {
-    const sid = await createSession();
-
-    const resp = await sendMessage(sid, `Read ${join(PROJECT_DIR, "hello.txt")} then change "hello" to "hi" in it`);
-    const toolParts = (resp.parts ?? []).filter((p: any) => p.type === "tool" && (p.tool === "edit" || p.tool === "read"));
-    expect(toolParts.length).toBeGreaterThan(0);
-  }, TIMEOUT);
-
   test("read produces tool part with correct name", async () => {
+    skipIfDead();
     const sid = await createSession();
 
     const resp = await sendMessage(sid, `Read ${join(PROJECT_DIR, "hello.txt")}`);
@@ -208,7 +275,17 @@ describe("e2e-serve: tool rendering metadata", () => {
     expect(toolParts.length).toBeGreaterThan(0);
   }, TIMEOUT);
 
+  test("edit produces tool part with correct name", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    const resp = await sendMessage(sid, `Read ${join(PROJECT_DIR, "hello.txt")} then change "hello" to "hi" in it`);
+    const toolParts = (resp.parts ?? []).filter((p: any) => p.type === "tool" && (p.tool === "edit" || p.tool === "read"));
+    expect(toolParts.length).toBeGreaterThan(0);
+  }, TIMEOUT);
+
   test("bash produces tool part with output metadata", async () => {
+    skipIfDead();
     const sid = await createSession();
 
     const resp = await sendMessage(sid, 'Run: echo "BASH_RENDER_TEST"');
@@ -220,6 +297,7 @@ describe("e2e-serve: tool rendering metadata", () => {
   }, TIMEOUT);
 
   test("webfetch produces tool part with correct name", async () => {
+    skipIfDead();
     const sid = await createSession();
 
     const resp = await sendMessage(sid, "Fetch https://example.com");
@@ -228,10 +306,10 @@ describe("e2e-serve: tool rendering metadata", () => {
   }, TIMEOUT);
 
   test("websearch produces tool part", async () => {
+    skipIfDead();
     const sid = await createSession();
 
     const resp = await sendMessage(sid, "Search the web for opencode");
-    const toolParts = (resp.parts ?? []).filter((p: any) => p.type === "tool" && (p.tool === "websearch" || p.tool === "WebSearch"));
     // WebSearch may not be available without Exa — just verify no crash
     expect(resp).toBeDefined();
   }, TIMEOUT);
