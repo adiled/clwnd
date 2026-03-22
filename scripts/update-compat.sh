@@ -122,7 +122,7 @@ Extract the duration from each test suite output (bun test prints it at the end,
 Then a "## Environment" section with a table: Component | Version — using the versions provided in the input.
 
 ### Section 4: "## Potentially Uncovered"
-Compare the OpenCode built-in TUI commands, OpenCode CLI flags, and Claude Code CLI flags against what the test suites actually exercise. List any commands or flags that exist in the references but have NO corresponding test coverage. Only list items relevant to the provider bridge — skip navigation (page up/down, first/last), UI (prompt.clear, prompt.submit), and purely cosmetic flags. Format as a bullet list, one line per item, with the source (e.g., "OC TUI: \`session.compact\`" or "CC flag: \`--effort\`").
+Look ONLY at the OpenCode built-in TUI commands listed above. For each TUI command, determine if the test suites exercise the feature it represents. List any TUI commands that have NO corresponding test coverage. Skip navigation commands (page.up, page.down, half.page.up, half.page.down, first, last) and pure UI commands (prompt.clear, prompt.submit) — these don't touch the provider. Format as a bullet list: \`command.name\` — one-line description of what it does. Do NOT list CLI flags from either tool — only OpenCode TUI commands.
 
 Then a line: \`Last updated: YYYY-MM-DD HH:MM UTC\` using the timestamp provided in the input.
 
