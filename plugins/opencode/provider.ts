@@ -243,6 +243,43 @@ function extractText(prompt: LanguageModelV2Prompt): string {
   return "";
 }
 
+/**
+ * Extract prior conversation history from the prompt, excluding the current
+ * (last) user message and system messages. Used to seed a fresh Claude CLI
+ * process with context from a pre-clwnd session or after daemon restart.
+ *
+ * Only called once per session (tracked by seededSessions). Returns null if
+ * there are no prior user/assistant turns to inject.
+ */
+const seededSessions = new Set<string>();
+
+function extractHistory(prompt: LanguageModelV2Prompt): string | null {
+  // Find the last user message index — everything before it is history
+  let lastUserIdx = -1;
+  for (let i = prompt.length - 1; i >= 0; i--) {
+    if (prompt[i].role === "user") { lastUserIdx = i; break; }
+  }
+  // No prior turns if the last user message is the first non-system message
+  const historyMsgs = prompt.slice(0, lastUserIdx).filter(m => m.role === "user" || m.role === "assistant");
+  if (historyMsgs.length === 0) return null;
+
+  const lines: string[] = [];
+  for (const m of historyMsgs) {
+    const role = m.role === "user" ? "User" : "Assistant";
+    let text = "";
+    if (typeof m.content === "string") {
+      text = m.content;
+    } else if (Array.isArray(m.content)) {
+      text = (m.content as Array<{ type: string; text?: string }>)
+        .filter(p => p.type === "text" && p.text)
+        .map(p => p.text!)
+        .join("\n");
+    }
+    if (text) lines.push(`${role}: ${text}`);
+  }
+  return lines.length > 0 ? lines.join("\n\n") : null;
+}
+
 function extractSystemPrompt(prompt: LanguageModelV2Prompt): string {
   const parts: string[] = [];
   for (const m of prompt) {
@@ -375,6 +412,17 @@ export class ClwndModel implements LanguageModelV2 {
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
+    // Seed fresh daemon sessions with prior OC conversation history (once only)
+    let historyContext: string | undefined;
+    if (!seededSessions.has(sid)) {
+      seededSessions.add(sid);
+      const history = extractHistory(opts.prompt);
+      if (history) {
+        historyContext = history;
+        trace("history.seed", { sid, turns: history.split("\n\n").length });
+      }
+    }
+
     let reasoning = "";
     let responseText = "";
     const toolCalls: LanguageModelV2Content[] = [];
@@ -404,6 +452,7 @@ export class ClwndModel implements LanguageModelV2 {
         systemPrompt,
         permissions,
         allowedTools,
+        historyContext,
       }).then(async (resp) => {
         if (!resp.body) { abort(); return; }
         const reader = resp.body.getReader();
@@ -517,6 +566,17 @@ export class ClwndModel implements LanguageModelV2 {
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
+    // Seed fresh daemon sessions with prior OC conversation history (once only)
+    let historyContext: string | undefined;
+    if (!seededSessions.has(sid)) {
+      seededSessions.add(sid);
+      const history = extractHistory(opts.prompt);
+      if (history) {
+        historyContext = history;
+        trace("history.seed", { sid, turns: history.split("\n\n").length });
+      }
+    }
+
     // Brokered tool return — OpenCode executed the tool, sending result back.
     // Claude already responded in the previous turn. Finish immediately.
     if (isBrokeredToolReturn(opts.prompt)) {
@@ -569,6 +629,7 @@ export class ClwndModel implements LanguageModelV2 {
             systemPrompt,
             permissions,
             allowedTools,
+            historyContext,
           });
         } catch (e) {
           emit({ type: "error", error: new Error(String(e)) } as LanguageModelV2StreamPart);

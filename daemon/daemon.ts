@@ -755,7 +755,11 @@ Bun.serve({
 
             // First turn: spawn process. Subsequent turns: reuse existing.
             pool.sendSpawn(poolKey, session.modelId, h, undefined, permissions, systemPrompt, allowedTools, cwd as string);
-            pool.sendPrompt(opencodeSessionId, poolKey, text ?? "");
+            const historyContext = body.historyContext as string | undefined;
+            const fullText = historyContext
+              ? `Here is the conversation history from this session:\n\n${historyContext}\n\nContinue from here. The user's new message:\n\n${text}`
+              : (text ?? "");
+            pool.sendPrompt(opencodeSessionId, poolKey, fullText);
           },
           cancel() {
             closed = true;
