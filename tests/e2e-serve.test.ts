@@ -304,6 +304,38 @@ describe("e2e-serve: CWD from session", () => {
   }, TIMEOUT);
 });
 
+describe("e2e-serve: abort recovery", () => {
+  test("session recovers after mid-turn abort", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Start a tool-using request
+    const ctrl = new AbortController();
+    const abortedReq = fetch(`${BASE}/session/${sid}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: MODEL,
+        parts: [{ type: "text", text: `Read ${join(PROJECT_DIR, "hello.txt")} and describe it in detail` }],
+      }),
+      signal: ctrl.signal,
+    }).catch(() => null);
+
+    // Wait for the request to be in flight, then abort
+    await Bun.sleep(3_000);
+    ctrl.abort();
+    await abortedReq;
+
+    // Wait for graceful shutdown + process respawn
+    await Bun.sleep(5_000);
+
+    // Session should recover — next message should work
+    const resp = await sendMessage(sid, "What is 2+2? Just the number.");
+    const text = extractResponseText(resp);
+    expect(text).toContain("4");
+  }, TIMEOUT);
+});
+
 describe("e2e-serve: provider migration", () => {
   test("switching from non-clwnd to clwnd model retains session context", async () => {
     skipIfDead();
