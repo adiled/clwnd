@@ -185,14 +185,18 @@ const OC_TO_MCP: Record<string, string> = {
 };
 
 function deriveAllowedTools(opts: { tools?: Array<{ name: string }> | unknown }): string[] {
-  if (!Array.isArray(opts.tools)) return ["read", "edit", "write", "bash", "glob", "grep"]; // default: all
+  if (!Array.isArray(opts.tools)) {
+    trace("deriveAllowedTools", { result: "all (no tools in opts)" });
+    return ["read", "edit", "write", "bash", "glob", "grep"];
+  }
   const ocTools = new Set((opts.tools as Array<{ name: string }>).map(t => t.name));
   const allowed: string[] = [];
   for (const [ocName, mcpName] of Object.entries(OC_TO_MCP)) {
     if (ocTools.has(ocName)) allowed.push(mcpName);
   }
-  // Deduplicate
-  return [...new Set(allowed)];
+  const result = [...new Set(allowed)];
+  trace("deriveAllowedTools", { ocTools: [...ocTools].join(","), allowed: result.join(",") });
+  return result;
 }
 
 function extractText(prompt: LanguageModelV2Prompt): string {
@@ -228,6 +232,31 @@ function extractSystemPrompt(prompt: LanguageModelV2Prompt): string {
     }
   }
   return parts.join("\n\n");
+}
+
+// Track agent changes per session by querying the latest message
+const sessionLastAgent = new Map<string, string>();
+
+async function detectAgentChange(client: any, sid: string): Promise<string | null> {
+  if (!client) return null;
+  try {
+    const resp = await client.session.messages({ path: { sessionID: sid } });
+    const messages = resp.data ?? [];
+    // Find the latest user message — it has the current agent
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg.role === "user" && msg.agent) {
+        const prev = sessionLastAgent.get(sid);
+        const current = msg.agent;
+        if (prev && prev !== current) {
+          trace("agent.changed", { sid, old: prev, new: current });
+        }
+        sessionLastAgent.set(sid, current);
+        return current;
+      }
+    }
+  } catch {}
+  return null;
 }
 
 // Fetch session permission rules from OpenCode
@@ -288,6 +317,7 @@ export class ClwndModel implements LanguageModelV2 {
     const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
     const text = extractText(opts.prompt);
     const systemPrompt = extractSystemPrompt(opts.prompt);
+    if (!isTitle) await detectAgentChange(this.config.client, sid);
     const warnings: LanguageModelV2CallWarning[] = [];
     const cwd = this.config.cwd ?? process.cwd();
     const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
@@ -416,6 +446,7 @@ export class ClwndModel implements LanguageModelV2 {
     const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
     const text = extractText(opts.prompt);
     const systemPrompt = extractSystemPrompt(opts.prompt);
+    if (!isTitle) await detectAgentChange(this.config.client, sid);
     const warnings: LanguageModelV2CallWarning[] = [];
     const cwd = this.config.cwd ?? process.cwd();
     const self = this;
