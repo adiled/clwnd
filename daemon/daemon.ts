@@ -939,7 +939,13 @@ const mcpServer = Bun.serve({
         if (action === "allow") return hookAllow();
         if (action === "deny") return hookDeny("Denied by session permission rules");
 
-        // "ask" — hold this response, expose via /permission-pending,
+        // "ask" — treated as allow until a viable UX solution is found.
+        // Infrastructure exists (pendingAsk, /permission-pending, /permission-respond)
+        // but OC's session lock prevents in-band user interaction during a turn.
+        // See PERMISSION_ASK_PROPOSAL.md for investigation history.
+        if (action === "ask") return hookAllow();
+
+        // TODO: hold this response, expose via /permission-pending,
         // wait for /permission-respond to resolve it
         const askId = randomUUID();
         trace("permission.ask.hold", { id: askId, tool: toolName, path });
