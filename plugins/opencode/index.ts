@@ -16,20 +16,6 @@ function onDaemonMessage(type: string, handler: ChannelHandler): void {
   channelHandlers.set(type, handler);
 }
 
-// Pending requests waiting for async resolution (e.g., user interaction)
-const pendingRequests = new Map<string, {
-  resolve: (result: any) => void;
-  type: string;
-  payload: any;
-}>();
-
-function resolvePending(id: string, result: any): boolean {
-  const entry = pendingRequests.get(id);
-  if (!entry) return false;
-  pendingRequests.delete(id);
-  entry.resolve(result);
-  return true;
-}
 
 async function startCallbackServer(): Promise<string> {
   const server = Bun.serve({
@@ -78,6 +64,19 @@ async function startCallbackServer(): Promise<string> {
 // ─── Permission Ask Handler ────────────────────────────────────────────────
 
 function registerPermissionHandler(): void {
+  // Import PermissionNext directly from OC's internals — we're inside OC's process
+  let PermissionNext: any = null;
+  try {
+    PermissionNext = require("@/permission/next").PermissionNext;
+  } catch {
+    try {
+      // Fallback: try relative path from opencode's node_modules
+      PermissionNext = require("@opencode-ai/opencode/src/permission/next").PermissionNext;
+    } catch {
+      trace("permission.import.failed", { msg: "PermissionNext not available" });
+    }
+  }
+
   onDaemonMessage("permission-ask", async (payload: {
     id: string;
     sessionId: string;
@@ -87,25 +86,31 @@ function registerPermissionHandler(): void {
   }) => {
     trace("permission.ask", { id: payload.id, tool: payload.tool, path: payload.path });
 
-    // Store as pending — resolved when OC's permission.ask hook or event fires
-    const decision = await new Promise<"allow" | "deny">((resolve) => {
-      pendingRequests.set(payload.id, {
-        resolve,
-        type: "permission-ask",
-        payload,
+    if (!PermissionNext) {
+      trace("permission.ask.no-module");
+      return { decision: "deny" };
+    }
+
+    try {
+      // Call PermissionNext.ask() directly — this creates a pending permission,
+      // publishes permission.asked on OC's bus, and the TUI shows the prompt.
+      // The returned promise resolves when the user responds.
+      await PermissionNext.ask({
+        sessionID: payload.sessionId,
+        permission: payload.tool,
+        patterns: [payload.path ?? "*"],
+        metadata: payload.input,
+        always: [payload.path ?? "*"],
+        ruleset: [], // empty — we already evaluated the ruleset in the daemon
       });
-
-      // Timeout: default to deny after 120s
-      setTimeout(() => {
-        if (pendingRequests.has(payload.id)) {
-          pendingRequests.delete(payload.id);
-          trace("permission.timeout", { id: payload.id });
-          resolve("deny");
-        }
-      }, 120_000);
-    });
-
-    return { decision };
+      // If ask() resolves, user approved
+      trace("permission.ask.approved", { id: payload.id });
+      return { decision: "allow" };
+    } catch (e: any) {
+      // If ask() rejects, user denied
+      trace("permission.ask.denied", { id: payload.id, err: e?.message });
+      return { decision: "deny" };
+    }
   });
 }
 
@@ -127,37 +132,6 @@ export const clwndPlugin: Plugin = async (input) => {
       output.headers["x-clwnd-agent"] = typeof ctx.agent === "string"
         ? ctx.agent
         : (ctx.agent as any)?.name ?? JSON.stringify(ctx.agent);
-    },
-    // OC asks us about a permission — match against pending requests
-    "permission.ask": async (permission, output) => {
-      for (const [id, entry] of pendingRequests) {
-        if (entry.type !== "permission-ask") continue;
-        const toolMatch = permission.type === entry.payload.tool ||
-          permission.type === `mcp__clwnd__${entry.payload.tool}`;
-        if (toolMatch) {
-          trace("permission.ask.matched", { permId: permission.id, reqId: id });
-          output.status = "ask";
-          entry.payload._permissionId = permission.id;
-          return;
-        }
-      }
-    },
-    // Watch for permission replies and resolve pending requests
-    event: async ({ event }) => {
-      if (event.type === "permission.replied") {
-        const props = (event as any).properties;
-        const permId = props?.permissionID;
-        const response = props?.response; // "once" | "always" | "reject"
-
-        for (const [id, entry] of pendingRequests) {
-          if (entry.type === "permission-ask" && entry.payload._permissionId === permId) {
-            const decision = response === "reject" ? "deny" : "allow";
-            trace("permission.replied", { reqId: id, response, decision });
-            resolvePending(id, decision);
-            return;
-          }
-        }
-      }
     },
   };
 };
