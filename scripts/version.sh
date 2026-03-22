@@ -42,3 +42,7 @@ git push
 git push --tags
 
 echo "released v$NEXT"
+
+# Update compatibility report
+echo "updating compat report..."
+bash "$ROOT/scripts/update-compat.sh"
