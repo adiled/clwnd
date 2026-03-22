@@ -19,6 +19,11 @@ run_as_clwnd() {
   su -l "$CLWND_USER" -c "cd $CLWND_SRC && $1" 2>&1 || true
 }
 
+# ─── Capture CLI references ──────────────────────────────────────────────────
+
+CLAUDE_HELP=$(run_as_clwnd "claude --help 2>&1")
+OPENCODE_HELP=$(run_as_clwnd "opencode --help 2>&1 | cat")
+
 # ─── Capture versions ────────────────────────────────────────────────────────
 
 CLWND_COMMIT=$(git -C "$(dirname "$0")/.." rev-parse --short HEAD)
@@ -46,7 +51,13 @@ E2E_HUMAN=$(run_as_clwnd "bun test ./tests/e2e-human.test.ts")
 
 # ─── Build the prompt ────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT='You generate a GitHub issue body for the clwnd compatibility index.
+TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+PROMPT_DIR=$(mktemp -d)
+trap "rm -rf $PROMPT_DIR" EXIT
+
+cat > "$PROMPT_DIR/system.txt" <<SYSEOF
+You generate a GitHub issue body for the clwnd compatibility index.
 
 ## What is clwnd
 
@@ -54,12 +65,24 @@ clwnd is a daemon + OpenCode plugin that bridges Claude Code CLI subscriptions i
 
 ## Architecture
 
-- **Claude CLI tools (Read, Edit, Write, Bash, Glob, Grep)**: Disallowed on Claude CLI side, replaced by MCP equivalents (`mcp__clwnd__read`, etc.). Tool names are mapped to OpenCode native names for UI rendering (e.g., `Read` → `read`, `file_path` → `filePath`).
-- **Brokered tools (WebFetch, TodoWrite, WebSearch)**: Claude CLI executes them via MCP AND OpenCode re-executes them for UI state sync. Plugin emits `providerExecuted: false`.
+- **Claude CLI tools (Read, Edit, Write, Bash, Glob, Grep)**: Disallowed on Claude CLI side, replaced by MCP equivalents (\`mcp__clwnd__read\`, etc.). Tool names are mapped to OpenCode native names for UI rendering (e.g., Read → \`read\`, file_path → \`filePath\`).
+- **Brokered tools (WebFetch, TodoWrite, WebSearch)**: Claude CLI executes them via MCP AND OpenCode re-executes them for UI state sync. Plugin emits \`providerExecuted: false\`.
 - **Pass-through tools (Task, Skill, TodoRead, TaskOutput, CronCreate, etc.)**: Claude CLI built-ins that pass through without special handling. Some are mapped for display.
-- **Agent switching**: Detected via `chat.headers` hook injecting `x-clwnd-agent` header. Agent name controls tool allowlisting (plan mode denies edit/write).
+- **Agent switching**: Detected via \`chat.headers\` hook injecting \`x-clwnd-agent\` header. Agent name controls tool allowlisting (plan mode denies edit/write).
 - **Session continuity**: Persistent claude process per OpenCode session. No respawn between turns.
-- **Auxiliary calls**: Title gen, compaction, summarization routed to `small_model` (free opencode/* model). Safety net via `isAuxiliaryCall()` if they reach us.
+- **Auxiliary calls**: Title gen, compaction, summarization routed to \`small_model\` (free opencode/* model). Safety net via \`isAuxiliaryCall()\` if they reach us.
+
+## OpenCode CLI reference (live)
+
+\`\`\`
+${OPENCODE_HELP}
+\`\`\`
+
+## Claude Code CLI reference (live)
+
+\`\`\`
+${CLAUDE_HELP}
+\`\`\`
 
 ## Your task
 
@@ -70,41 +93,37 @@ A table with columns: Tool | Claude CLI | MCP | Brokered | OC Native UI | Test C
 
 For each tool:
 - **Status**: ✅ Working (if tests pass), ❌ Failing (if tests fail), ⚠️ Partial/Display only (if pass-through or limited), 🔇 Untested (if no test covers it)
-- **Test Coverage**: List the test name(s) that cover this tool, or "—" if none
+- **Test Coverage**: comma-separated list of suites where the tool was tested (e.g., "smoke, e2e-serve"), or "—" if none. Do NOT list individual test names here.
 - Use the tool architecture described above to fill Claude CLI, MCP, Brokered, OC Native UI columns
 
 Tools to include: Read, Edit, Write, Bash, Glob, Grep, WebFetch, WebSearch, TodoWrite, Task, Skill, TodoRead, TaskOutput/TaskStop, CronCreate/Delete/List
 
 ### Section 2: "## OpenCode Feature Compatibility"
-Two tables.
-
-Table 1 — Core features with columns: Feature | Status | Test Coverage | Notes
-Features: Agent switching, Plan mode, Permissions (session), Permissions (agent), System prompt, Session continuity, CWD/directory
-
-Table 2 — Extended features with columns: Feature | OC Feature | CC Equivalent | Status | Test Coverage | Notes
-Features: Compaction, Snapshots/Revert, Model variants, File attachments, Cost tracking, Session forking, Title generation
-
-For each:
+One table with columns: Feature | OC Feature | CC Equivalent | Status | Test Coverage
+- **OC Feature**: The actual OpenCode feature/command/config name (e.g., \`session compact\`, \`--fork\`, \`small_model\`, \`--agent\`)
+- **CC Equivalent**: The actual Claude Code CLI equivalent flag, command, or feature name (e.g., \`--effort\`, \`--fork-session\`, \`--resume\`, \`--agent\`). Use the CLI reference above to find exact names. If there is genuinely no CC equivalent, write "—".
 - **Status**: ✅ Working (tests pass), ❌ Not working (tests fail), ⚠️ Partial, 🔇 Untested
-- **Test Coverage**: exact test name(s) from the output
-- **Notes**: brief explanation of how it works or why it fails. If a test failed, include a one-line summary of the failure.
+- **Test Coverage**: comma-separated list of suites where the feature was tested (e.g., "smoke, e2e-serve"), or "—" if none. Do NOT list individual test names.
+
+Features to include: Agent switching, Plan mode, Permissions (session), Permissions (agent), System prompt, Session continuity, CWD/directory, Compaction, Snapshots/Revert, Model variants, File attachments, Cost tracking, Session forking, Title generation
 
 ### Section 3: "## Test Summary"
-A compact summary table: Suite | Pass | Fail | Skip | Total
+A compact summary table: Suite | Pass | Fail | Skip | Total | Duration
+Extract the duration from each test suite output (bun test prints it at the end, e.g., "[110.66s]").
 
 Then a "## Environment" section with a table: Component | Version — using the versions provided in the input.
 
-Then a line: `Last updated: YYYY-MM-DD HH:MM UTC` using the timestamp provided in the input.
+Then a line: \`Last updated: YYYY-MM-DD HH:MM UTC\` using the timestamp provided in the input.
 
 ## Rules
 - Only output the issue body markdown. No preamble, no explanation.
-- Derive status ONLY from test results. If a test passes, it works. If it fails, note what failed.
-- Use the exact test names from the output as test coverage references.
-- Keep notes concise — max one sentence.'
+- Derive status ONLY from test results. If a test passes, it works. If it fails, use ❌ status.
+- For CC Equivalent, use actual CLI flag/command names from the reference, not "Yes"/"No"/"Not applicable".
+- CRITICAL: Test Coverage column must ONLY contain comma-separated suite names from this exact set: \`smoke\`, \`e2e\`, \`e2e-serve\`, \`e2e-human\`. Nothing else. No test names, no descriptions, no qualifiers. Examples: "smoke, e2e-serve" or "e2e" or "—". Any other format is wrong.
+SYSEOF
 
-TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
-
-USER_PROMPT="Here are the test suite results. Generate the compatibility index issue body.
+cat > "$PROMPT_DIR/user.txt" <<USREOF
+Here are the test suite results. Generate the compatibility index issue body.
 
 === VERSIONS ===
 clwnd: v${CLWND_VERSION} (${CLWND_COMMIT})
@@ -123,11 +142,14 @@ ${E2E}
 ${E2E_SERVE}
 
 === E2E-HUMAN TESTS ===
-${E2E_HUMAN}"
+${E2E_HUMAN}
+USREOF
 
 # ─── Call Claude, update issue ───────────────────────────────────────────────
 
 echo "Generating compatibility index..."
+SYSTEM_PROMPT=$(cat "$PROMPT_DIR/system.txt")
+USER_PROMPT=$(cat "$PROMPT_DIR/user.txt")
 BODY=$(claude -p --model claude-sonnet-4-5 --output-format text --system-prompt "$SYSTEM_PROMPT" "$USER_PROMPT")
 
 echo "Updating issue #8..."
