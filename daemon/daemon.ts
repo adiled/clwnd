@@ -139,6 +139,10 @@ class SubprocessPool {
     }
   }
 
+  getEntry(poolKey: string): ProcEntry | undefined {
+    return this.procs.get(poolKey);
+  }
+
   status(): Array<{ model: string; pid?: number; sessions: string[] }> {
     const out: Array<{ model: string; pid?: number; sessions: string[] }> = [];
     for (const [id, e] of this.procs) {
@@ -849,10 +853,29 @@ Bun.serve({
           },
           cancel() {
             closed = true;
-            // Kill the process — it's mid-turn with an unfinished tool call.
-            // Next turn will spawn fresh. Without this, the process stays in
-            // a bad state waiting for a tool result that will never come.
-            pool.destroy(opencodeSessionId, poolKey);
+            // Send shutdown_request to gracefully stop the current turn.
+            // The process may be mid-tool-execution — shutdown_request lets
+            // Claude CLI clean up rather than leaving it in a bad state.
+            const entry = pool.getEntry(poolKey);
+            if (entry?.proc.stdin) {
+              try {
+                entry.proc.stdin.write(JSON.stringify({
+                  type: "shutdown_request",
+                  requestId: randomUUID(),
+                  from: "clwnd",
+                  reason: "user cancelled",
+                  timestamp: new Date().toISOString(),
+                }) + "\n");
+              } catch {}
+              // Give it a moment to shut down, then destroy if still alive
+              setTimeout(() => {
+                if (pool.getEntry(poolKey)) {
+                  pool.destroy(opencodeSessionId, poolKey);
+                }
+              }, 3_000);
+            } else {
+              pool.destroy(opencodeSessionId, poolKey);
+            }
             releaseLock!();
           },
         });
