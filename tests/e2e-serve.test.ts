@@ -377,38 +377,63 @@ describe("e2e-serve: compaction", () => {
 });
 
 describe("e2e-serve: snapshots and revert", () => {
-  test("file changes via MCP are tracked by OC snapshots", async () => {
+  test("file written via clwnd MCP exists on disk", async () => {
     skipIfDead();
     const sid = await createSession();
+    const filePath = join(PROJECT_DIR, "snapshot-test.txt");
 
-    // Make a file change via Claude (goes through MCP)
-    await sendMessage(sid, `Write the text "SNAPSHOT_TEST" to ${join(PROJECT_DIR, "snap-test.txt")}`);
+    // Claude writes a file through clwnd MCP → fs.writeFileSync
+    await sendMessage(sid, `Write exactly the text "SNAPSHOT_CONTENT" to ${filePath}`);
 
-    // Check session for snapshot info
-    const session = await getSession(sid);
-    // Session should have been updated (snapshot taken)
-    expect(session.time.updated).toBeGreaterThan(session.time.created);
+    // File should exist on disk
+    expect(existsSync(filePath)).toBe(true);
+    const content = await Bun.file(filePath).text();
+    expect(content).toContain("SNAPSHOT_CONTENT");
   }, TIMEOUT);
 
-  test("revert restores files changed via MCP", async () => {
+  test("revert restores file to pre-edit state", async () => {
     skipIfDead();
     const sid = await createSession();
+    const filePath = join(PROJECT_DIR, "hello.txt");
 
-    // Create a file
-    await sendMessage(sid, `Write "REVERT_ORIGINAL" to ${join(PROJECT_DIR, "revert-test.txt")}`);
+    // Verify original content
+    const before = await Bun.file(filePath).text();
+    expect(before).toContain("hello world");
 
-    // Get messages to find the message ID for revert
+    // Claude edits the file through clwnd MCP
+    const editResp = await sendMessage(sid, `Change the contents of ${filePath} to exactly "EDITED BY CLAUDE"`);
+
+    // File should be changed on disk
+    const afterEdit = await Bun.file(filePath).text();
+    expect(afterEdit).toContain("EDITED BY CLAUDE");
+
+    // Find the assistant message that did the edit
     const msgs = await getMessages(sid);
-    const assistantMsg = msgs.find((m: any) => m.role === "assistant");
+    const assistantMsg = (Array.isArray(msgs) ? msgs : []).find((m: any) => m.role === "assistant");
 
-    if (assistantMsg) {
-      // Attempt revert
-      const revertResp = await api(`/session/${sid}/revert`, {
+    if (!assistantMsg) {
+      // If messages API doesn't return messages, use the response info
+      const msgId = editResp.info?.id;
+      expect(msgId).toBeTruthy();
+
+      // Revert using the message ID from the response
+      await api(`/session/${sid}/revert`, {
+        method: "POST",
+        body: JSON.stringify({ messageID: msgId }),
+      });
+    } else {
+      await api(`/session/${sid}/revert`, {
         method: "POST",
         body: JSON.stringify({ messageID: assistantMsg.id }),
       });
-      expect(revertResp).toBeDefined();
     }
+
+    // Wait for revert to take effect (OC restores from snapshot)
+    await Bun.sleep(2_000);
+
+    // File should be restored to original content
+    const afterRevert = await Bun.file(filePath).text();
+    expect(afterRevert).toContain("hello world");
   }, TIMEOUT);
 });
 
