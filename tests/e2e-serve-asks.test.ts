@@ -122,14 +122,47 @@ describe("e2e-serve-asks: permission ask via /allow command", () => {
       signal: AbortSignal.timeout(180_000),
     }).then(r => r.json()).catch(() => null);
 
-    // Wait for the permission toast to appear (daemon calls plugin, plugin shows toast)
-    await Bun.sleep(10_000);
+    // Poll for toast/permission event via SSE, then send /allow
+    const ctrl = new AbortController();
+    const approver = (async () => {
+      try {
+        const resp = await fetch(`${BASE}/event`, { signal: ctrl.signal });
+        const reader = resp.body?.getReader();
+        if (!reader) return;
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            try {
+              const event = JSON.parse(line.slice(6));
+              // Toast with "Permission required" means the hook is waiting
+              if (event.payload?.type === "tui.toast.show" &&
+                  event.payload?.properties?.title === "Permission required") {
+                // Small delay to ensure the pending state is set
+                await Bun.sleep(500);
+                await api(`/session/${sid}/command`, {
+                  method: "POST",
+                  body: JSON.stringify({ command: "allow", arguments: "" }),
+                });
+                return;
+              }
+            } catch {}
+          }
+        }
+      } catch {}
+    })();
 
-    // Send /allow command to approve the permission
-    await api(`/session/${sid}/command`, {
-      method: "POST",
-      body: JSON.stringify({ command: "allow", arguments: "" }),
-    });
+    // Wait for edit to complete (approver will send /allow when toast appears)
+    await Promise.race([editPromise, Bun.sleep(60_000)]);
+
+    ctrl.abort();
+    await approver.catch(() => {});
 
     // Wait for the edit to complete
     await editPromise;
