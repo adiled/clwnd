@@ -24,8 +24,12 @@ run_as_clwnd() {
 CLAUDE_HELP=$(run_as_clwnd "claude --help 2>&1")
 OPENCODE_HELP=$(run_as_clwnd "opencode --help 2>&1 | cat")
 
-# Extract built-in TUI commands from the SDK types (must run as clwnd to access the file)
-OC_TUI_COMMANDS=$(run_as_clwnd "grep 'session\.list.*session\.new' node_modules/@opencode-ai/sdk/dist/gen/types.gen.d.ts 2>/dev/null | grep -oP '\"[a-z]+\.[a-z._]+\"' | tr -d '\"' | sort -u | paste -sd, -")
+# Extract built-in TUI commands from the SDK types
+OC_SDK_TYPES=$(find /home/$CLWND_USER/.config/opencode /home/$CLWND_USER/.opencode -path "*/sdk/dist/gen/types.gen.d.ts" 2>/dev/null | head -1)
+OC_TUI_COMMANDS=""
+if [ -n "$OC_SDK_TYPES" ]; then
+  OC_TUI_COMMANDS=$(grep 'session\.list.*session\.new' "$OC_SDK_TYPES" | grep -oP '"[a-z]+\.[a-z._]+"' | tr -d '"' | sort -u | paste -sd, -)
+fi
 
 # ─── Capture versions ────────────────────────────────────────────────────────
 
