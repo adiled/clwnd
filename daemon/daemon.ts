@@ -165,6 +165,20 @@ class SubprocessPool {
       },
     });
 
+    // Hook config — PreToolUse hook for permission checking
+    const hookUrl = `${MCP_URL}/permission-check`;
+    const hooksSettings = JSON.stringify({
+      hooks: {
+        PreToolUse: [{
+          matcher: "mcp__clwnd__.*",
+          hooks: [{
+            type: "http",
+            url: hookUrl,
+          }],
+        }],
+      },
+    });
+
     const cmd = [
       this.cliPath, "-p",
       "--verbose",
@@ -180,6 +194,8 @@ class SubprocessPool {
       "--allowedTools", "mcp__clwnd__read,mcp__clwnd__edit,mcp__clwnd__write,mcp__clwnd__bash,mcp__clwnd__glob,mcp__clwnd__grep",
       // Register our MCP server
       "--mcp-config", mcpConfig,
+      // PreToolUse hook for OC permission gating
+      "--settings", hooksSettings,
     ];
     // System prompt set once at spawn — persistent process keeps it
     if (systemPrompt) {
@@ -351,6 +367,36 @@ class SubprocessPool {
       }
     }
   }
+}
+
+// ─── Plugin Callback (daemon → plugin reverse channel) ──────────────────────
+
+let pluginCallbackUrl: string | null = null;
+
+// Permission rules stored per-session, forwarded from OC via the provider
+const sessionPermissions = new Map<string, Array<{ permission: string; pattern: string; action: string }>>();
+
+export function setSessionPermissions(sessionId: string, rules: Array<{ permission: string; pattern: string; action: string }>): void {
+  sessionPermissions.set(sessionId, rules);
+}
+
+function getPermissionAction(tool: string, path?: string): "allow" | "deny" | "ask" {
+  // Check all sessions' permissions (the tool call comes from Claude CLI
+  // which doesn't know the OC session ID — we check all active sessions)
+  for (const [, rules] of sessionPermissions) {
+    for (const rule of rules) {
+      if (rule.permission !== tool && rule.permission !== "*") continue;
+      if (path) {
+        const pat = rule.pattern;
+        if (pat === "*" || path.startsWith(pat.replace("/*", "/")) || path === pat) {
+          return rule.action as "allow" | "deny" | "ask";
+        }
+      } else {
+        return rule.action as "allow" | "deny" | "ask";
+      }
+    }
+  }
+  return "allow"; // default: allow if no rule matches
 }
 
 // ─── Session State (persisted) ───────────────────────────────────────────────
@@ -657,6 +703,15 @@ Bun.serve({
       });
     }
 
+    // Plugin registers its callback URL for daemon → plugin communication
+    if (req.method === "POST" && url.pathname === "/callback") {
+      return req.json().then((body: { url: string }) => {
+        pluginCallbackUrl = body.url;
+        info("callback.registered", { url: body.url });
+        return new Response("ok");
+      }).catch(() => new Response("error", { status: 400 }));
+    }
+
     // Streaming endpoint: POST /stream — spawn + prompt, stream NDJSON response
     // Serialized per session: OpenCode may fire concurrent calls for the same
     // session (small model + main). We serialize to avoid racing --resume.
@@ -669,6 +724,11 @@ Bun.serve({
 
         // Update MCP server CWD per-turn (may change via opencode-dir /cd)
         if (cwd) mcpSetCwd(cwd as string);
+
+        // Store permissions for the PreToolUse hook's permission-check endpoint
+        if (permissions.length > 0) {
+          setSessionPermissions(opencodeSessionId, permissions as any);
+        }
 
         // Wait for any in-flight request on this session to finish
         const prev = sessionLocks.get(opencodeSessionId);
@@ -820,6 +880,67 @@ const mcpServer = Bun.serve({
   port: MCP_PORT,
   hostname: MCP_HOST,
   async fetch(req) {
+    const url = new URL(req.url);
+
+    // PreToolUse hook calls this to check permissions
+    if (req.method === "POST" && url.pathname === "/permission-check") {
+      try {
+        const body = await req.json();
+        const toolName = ((body.tool_name ?? "") as string).replace("mcp__clwnd__", "");
+        const path = (body.tool_input?.file_path ?? body.tool_input?.path) as string | undefined;
+        const sessionId = body.session_id as string;
+
+        // Find OC session for this Claude session
+        let ocSessionId: string | undefined;
+        for (const [id, s] of sessions) {
+          if (s.claudeSessionId === sessionId || id === sessionId) {
+            ocSessionId = id;
+            break;
+          }
+        }
+
+        const action = getPermissionAction(toolName, path);
+        trace("permission.hook", { tool: toolName, path, action, ocSid: ocSessionId });
+
+        // Claude CLI hook response format
+        const hookAllow = () => Response.json({
+          hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+        });
+        const hookDeny = (reason: string) => Response.json({
+          hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
+        });
+
+        if (action === "allow") return hookAllow();
+        if (action === "deny") return hookDeny("Denied by session permission rules");
+
+        // "ask" — relay to plugin via callback, hold response until user answers
+        if (!pluginCallbackUrl) {
+          return hookDeny("Permission required but no plugin callback registered");
+        }
+
+        const resp = await fetch(pluginCallbackUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: randomUUID(),
+            sessionId: ocSessionId ?? sessionId,
+            tool: toolName,
+            path,
+            input: body.tool_input ?? {},
+          }),
+          signal: AbortSignal.timeout(120_000),
+        });
+        const result = await resp.json() as { decision: "allow" | "deny" };
+        return result.decision === "allow" ? hookAllow() : hookDeny("Denied by user");
+      } catch (e) {
+        trace("permission.hook.error", { err: String(e) });
+        return Response.json({
+          hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Permission check failed" },
+        });
+      }
+    }
+
+    // MCP JSON-RPC
     if (req.method !== "POST") return new Response("clwnd-mcp", { status: 200 });
     try {
       const body = await req.json();
