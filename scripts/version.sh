@@ -35,8 +35,10 @@ console.log('  updated ' + p);
 "
 done
 
-echo ""
-echo "Version bumped to $NEXT"
-echo "Now run:"
-echo "  git add -A && git commit -m 'v$NEXT' && git tag v$NEXT"
-echo "  git push && git push --tags"
+git add -A
+git commit -m "v$NEXT"
+git tag "v$NEXT"
+git push
+git push --tags
+
+echo "released v$NEXT"
