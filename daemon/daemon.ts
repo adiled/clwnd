@@ -556,6 +556,18 @@ function handleAction(msg: IpcToDaemon, pool: SubprocessPool): void {
       break;
     }
 
+    case "cleanup": {
+      // Kill subprocess AND remove session state. Used by tests.
+      const session = sessions.get(msg.opencodeSessionId);
+      if (session) {
+        pool.destroy(msg.opencodeSessionId, session.modelId);
+        sessions.delete(msg.opencodeSessionId);
+        saveSessions();
+        trace("cleanup", { sid: msg.opencodeSessionId });
+      }
+      break;
+    }
+
     case "status": {
       emitBroadcast({ action: "status_reply", opencodeSessionId: msg.opencodeSessionId, procs: pool.status() });
       break;

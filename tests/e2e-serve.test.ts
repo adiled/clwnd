@@ -36,7 +36,19 @@ async function createSession(): Promise<string> {
   return sid;
 }
 
+const DAEMON_SOCK = (process.env.CLWND_SOCKET ?? `${process.env.XDG_RUNTIME_DIR ?? "/tmp"}/clwnd/clwnd.sock`) + ".http";
+
 async function deleteSession(sid: string): Promise<void> {
+  // 1. Tell daemon to kill the claude subprocess and drop session state
+  try {
+    await fetch("http://localhost/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }),
+      unix: DAEMON_SOCK,
+    } as RequestInit);
+  } catch {}
+  // 2. Delete from opencode's side
   try {
     const proc = spawn({
       cmd: ["opencode", "session", "delete", sid],
@@ -282,18 +294,23 @@ describe("e2e-serve: CWD from session", () => {
   }, TIMEOUT);
 });
 
-describe("e2e-serve: todo sync", () => {
-  test("todowrite creates todos visible in opencode", async () => {
+describe("e2e-serve: brokered tools", () => {
+  test("todowrite completes without error", async () => {
     skipIfDead();
     const sid = await createSession();
 
-    // Claude executes TodoWrite via MCP, OpenCode re-executes for UI sync
+    // Brokered: Claude executes TodoWrite via MCP, OpenCode re-executes for UI sync
     const resp = await sendMessage(sid, "Use the TodoWrite tool to create todos: buy groceries, clean house");
-    // Brokered tool — Claude's response text should confirm the action
-    // The blocking API returns the brokered return (empty), so check messages
-    const msgs = await getMessages(sid);
-    const assistantMsgs = msgs.filter((m: any) => m.role === "assistant");
-    expect(assistantMsgs.length).toBeGreaterThan(0);
+    expect(resp.info?.error).toBeUndefined();
+  }, TIMEOUT);
+
+  test("webfetch completes without error", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Brokered: Claude fetches via MCP, OpenCode re-executes for UI sync
+    const resp = await sendMessage(sid, "Fetch https://example.com and tell me what the page contains");
+    expect(resp.info?.error).toBeUndefined();
   }, TIMEOUT);
 });
 
@@ -328,15 +345,4 @@ describe("e2e-serve: tool rendering metadata", () => {
     }
   }, TIMEOUT);
 
-  test("webfetch response visible in messages", async () => {
-    skipIfDead();
-    const sid = await createSession();
-
-    // Brokered tool — Claude fetches via MCP, OpenCode re-executes for UI
-    await sendMessage(sid, "Fetch https://example.com and tell me what the page contains");
-    // Check messages API for Claude's response about the page content
-    const msgs = await getMessages(sid);
-    const assistantMsgs = msgs.filter((m: any) => m.role === "assistant");
-    expect(assistantMsgs.length).toBeGreaterThan(0);
-  }, TIMEOUT);
 });

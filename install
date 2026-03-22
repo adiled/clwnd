@@ -140,6 +140,24 @@ if (config.provider['opencode-clwnd']) {
 fs.mkdirSync(require('path').dirname(configPath), { recursive: true });
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
 "
+
+  # Set small_model to a free opencode model for title gen (avoids spawning claude processes)
+  local FREE_MODEL
+  FREE_MODEL=$(opencode models 2>/dev/null | grep -m1 'opencode/.*-free' || true)
+  if [ -n "$FREE_MODEL" ]; then
+    bun -e "
+const fs = require('fs');
+const p = '${OPENCODE_CONFIG}';
+const c = JSON.parse(fs.readFileSync(p, 'utf8'));
+if (!c.small_model || c.small_model.includes('-free')) {
+  c.small_model = '${FREE_MODEL}';
+  fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n');
+  console.log('  small_model: ${FREE_MODEL}');
+} else {
+  console.log('  small_model already set: ' + c.small_model);
+}
+"
+  fi
 }
 
 register_service() {
