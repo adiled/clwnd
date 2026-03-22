@@ -5,9 +5,6 @@ const SOCK_PATH = (process.env.CLWND_SOCKET ??
   (process.env.XDG_RUNTIME_DIR ? `${process.env.XDG_RUNTIME_DIR}/clwnd/clwnd.sock` : "/tmp/clwnd/clwnd.sock")) + ".http";
 
 // ─── Daemon ↔ Plugin Channel ───────────────────────────────────────────────
-// Generic bidirectional communication. The daemon POSTs typed messages to the
-// plugin's callback server. Handlers are registered per message type.
-// Used for: permission asks, question tool, and any future interactive flow.
 
 type ChannelHandler = (payload: any) => Promise<any>;
 const channelHandlers = new Map<string, ChannelHandler>();
@@ -15,7 +12,6 @@ const channelHandlers = new Map<string, ChannelHandler>();
 function onDaemonMessage(type: string, handler: ChannelHandler): void {
   channelHandlers.set(type, handler);
 }
-
 
 async function startCallbackServer(): Promise<string> {
   const server = Bun.serve({
@@ -26,17 +22,11 @@ async function startCallbackServer(): Promise<string> {
       try {
         const body = await req.json() as { type: string; id: string; payload: any };
         trace("channel.recv", { type: body.type, id: body.id });
-
         const handler = channelHandlers.get(body.type);
-        if (!handler) {
-          trace("channel.no-handler", { type: body.type });
-          return Response.json({ error: `no handler for ${body.type}` }, { status: 404 });
-        }
-
+        if (!handler) return Response.json({ error: `no handler for ${body.type}` }, { status: 404 });
         const result = await handler(body.payload);
         return Response.json({ id: body.id, result });
       } catch (e) {
-        trace("channel.error", { err: String(e) });
         return Response.json({ error: String(e) }, { status: 500 });
       }
     },
@@ -45,7 +35,6 @@ async function startCallbackServer(): Promise<string> {
   const url = `http://127.0.0.1:${server.port}`;
   trace("channel.started", { url });
 
-  // Register with daemon
   try {
     await fetch("http://localhost/callback", {
       method: "POST",
@@ -61,116 +50,19 @@ async function startCallbackServer(): Promise<string> {
   return url;
 }
 
-// ─── Permission Ask Handler ────────────────────────────────────────────────
+// ─── Permission Ask State ──────────────────────────────────────────────────
 
-function registerPermissionHandler(): void {
-  // Find PermissionNext and GlobalBus from OC's loaded modules.
-  // We're inside OC's Bun process — all modules are in memory.
-  let PermissionNext: any = null;
-  let GlobalBus: any = null;
+interface PendingPermission {
+  resolve: (decision: "allow" | "deny") => void;
+  tool: string;
+  path?: string;
+  sessionId: string;
+  timestamp: number;
+}
 
-  // Scan require.cache for OC's internal modules
-  try {
-    const cache = require.cache;
-    const cacheKeys = cache ? Object.keys(cache) : [];
-    trace("cache.scan", { count: cacheKeys.length });
-    // Log a sample of keys to understand the module system
-    const interesting = cacheKeys.filter(k => k.includes("bus") || k.includes("permission") || k.includes("event") || k.includes("opencode"));
-    trace("cache.interesting", { keys: interesting.slice(0, 10).join("|") || "none" });
+const pendingPermission: { current: PendingPermission | null } = { current: null };
 
-    if (cache) {
-      for (const [key, mod] of Object.entries(cache as Record<string, any>)) {
-        const exports = mod?.exports ?? mod;
-        if (!exports || typeof exports !== "object") continue;
-        if (!PermissionNext && exports.PermissionNext?.ask) {
-          PermissionNext = exports.PermissionNext;
-          trace("permission.found.cache", { key });
-        }
-        if (!GlobalBus && exports.GlobalBus?.emit) {
-          GlobalBus = exports.GlobalBus;
-          trace("globalbus.found.cache", { key });
-        }
-        // Also check default export
-        if (!PermissionNext && exports.default?.PermissionNext?.ask) {
-          PermissionNext = exports.default.PermissionNext;
-          trace("permission.found.cache.default", { key });
-        }
-        if (!GlobalBus && exports.default?.GlobalBus?.emit) {
-          GlobalBus = exports.default.GlobalBus;
-          trace("globalbus.found.cache.default", { key });
-        }
-        if (PermissionNext && GlobalBus) break;
-      }
-    }
-  } catch (e) {
-    trace("cache.scan.error", { err: String(e) });
-  }
-
-  // Fallback: try Bun's internal module resolution
-  if (!PermissionNext || !GlobalBus) {
-    const paths = [
-      "src/permission/next",
-      "@/permission/next",
-      "src/bus/global",
-      "@/bus/global",
-    ];
-    for (const p of paths) {
-      try {
-        const mod = require(p);
-        if (!PermissionNext && mod.PermissionNext?.ask) {
-          PermissionNext = mod.PermissionNext;
-          trace("permission.found.require", { path: p });
-        }
-        if (!GlobalBus && mod.GlobalBus?.emit) {
-          GlobalBus = mod.GlobalBus;
-          trace("globalbus.found.require", { path: p });
-        }
-      } catch {}
-    }
-  }
-
-  // Path C: Try dynamic import() — Bun may resolve embedded modules differently
-  if (!PermissionNext) {
-    const dynamicPaths = [
-      // Bun single-file executable paths
-      "$bunfs/root/src/permission/next",
-      "$bunfs/root/src/permission/next.ts",
-      // Process main module relative
-      "../../src/permission/next",
-    ];
-    for (const p of dynamicPaths) {
-      try {
-        const mod = require(p);
-        if (mod?.PermissionNext?.ask) {
-          PermissionNext = mod.PermissionNext;
-          trace("permission.found.dynamic", { path: p });
-          break;
-        }
-      } catch {}
-    }
-  }
-
-  if (!GlobalBus) {
-    const busPaths = [
-      "$bunfs/root/src/bus/global",
-      "$bunfs/root/src/bus/global.ts",
-      "../../src/bus/global",
-    ];
-    for (const p of busPaths) {
-      try {
-        const mod = require(p);
-        if (mod?.GlobalBus?.emit) {
-          GlobalBus = mod.GlobalBus;
-          trace("globalbus.found.dynamic", { path: p });
-          break;
-        }
-      } catch {}
-    }
-  }
-
-  if (!PermissionNext) trace("permission.not-found");
-  if (!GlobalBus) trace("globalbus.not-found");
-
+function registerPermissionHandler(client: any, serverUrl: URL): void {
   onDaemonMessage("permission-ask", async (payload: {
     id: string;
     sessionId: string;
@@ -180,35 +72,46 @@ function registerPermissionHandler(): void {
   }) => {
     trace("permission.ask", { id: payload.id, tool: payload.tool, path: payload.path });
 
-    if (!PermissionNext && !GlobalBus) {
-      trace("permission.ask.no-module");
-      return { decision: "deny" };
+    // Show toast telling user to /allow or /deny
+    const pathDisplay = payload.path ?? "*";
+    try {
+      await client.tui.showToast({
+        body: {
+          title: "Permission required",
+          message: `${payload.tool} on ${pathDisplay} — type /allow or /deny`,
+          variant: "warning" as const,
+          duration: 30000,
+        },
+      });
+    } catch (e) {
+      trace("permission.toast.failed", { err: String(e) });
     }
 
-    // Path A: PermissionNext.ask() — creates pending, emits event, awaits user response
-    if (PermissionNext) {
-      try {
-        await PermissionNext.ask({
-          sessionID: payload.sessionId,
-          permission: payload.tool,
-          patterns: [payload.path ?? "*"],
-          metadata: payload.input,
-          always: [payload.path ?? "*"],
-          ruleset: [], // empty — daemon already evaluated
-        });
-        trace("permission.ask.approved", { id: payload.id });
-        return { decision: "allow" };
-      } catch (e: any) {
-        trace("permission.ask.denied", { id: payload.id, err: e?.message });
-        return { decision: "deny" };
-      }
-    }
+    // Wait for /allow or /deny command, or timeout/interruption
+    const decision = await new Promise<"allow" | "deny">((resolve) => {
+      pendingPermission.current = {
+        resolve,
+        tool: payload.tool,
+        path: payload.path,
+        sessionId: payload.sessionId,
+        timestamp: Date.now(),
+      };
 
-    // Path B: GlobalBus.emit — emit the event directly, poll for reply
-    // This creates no pending state in PermissionNext, so we must handle
-    // the reply ourselves via SSE subscription
-    trace("permission.ask.globalbus-fallback", { id: payload.id });
-    return { decision: "deny" }; // TODO: implement GlobalBus fallback
+      // Timeout after 120s — deny by default
+      setTimeout(() => {
+        if (pendingPermission.current?.timestamp === Date.now()) {
+          // Stale check — only timeout if this is still the same request
+        }
+        if (pendingPermission.current?.resolve === resolve) {
+          pendingPermission.current = null;
+          trace("permission.timeout", { id: payload.id });
+          resolve("deny");
+        }
+      }, 120_000);
+    });
+
+    trace("permission.decided", { id: payload.id, decision });
+    return { decision };
   });
 }
 
@@ -218,8 +121,7 @@ export const clwndPlugin: Plugin = async (input) => {
   setSharedClient(input.client);
   const provider = createClwnd({ client: input.client, pluginInput: input });
 
-  // Start the daemon ↔ plugin channel
-  registerPermissionHandler();
+  registerPermissionHandler(input.client, input.serverUrl);
   startCallbackServer().catch(() => {});
 
   return {
@@ -231,8 +133,40 @@ export const clwndPlugin: Plugin = async (input) => {
         ? ctx.agent
         : (ctx.agent as any)?.name ?? JSON.stringify(ctx.agent);
     },
+    // Intercept /allow and /deny commands
+    "command.execute.before": async (input, output) => {
+      const cmd = input.command;
+      if (cmd === "allow" || cmd === "deny") {
+        const pending = pendingPermission.current;
+        if (pending) {
+          const decision = cmd === "allow" ? "allow" : "deny";
+          trace("permission.command", { cmd, tool: pending.tool, decision });
+          pendingPermission.current = null;
+          pending.resolve(decision as "allow" | "deny");
+          // Clear parts so nothing gets sent to the model
+          output.parts = [];
+        } else {
+          trace("permission.command.no-pending", { cmd });
+          // No pending permission — clear parts, show toast
+          try {
+            await input.client?.tui?.showToast?.({
+              body: { message: "No pending permission request", variant: "info" as const, duration: 3000 },
+            });
+          } catch {}
+          output.parts = [];
+        }
+      }
+    },
+    // If user sends a regular message while permission is pending, auto-deny
+    "chat.message": async (ctx, output) => {
+      if (pendingPermission.current) {
+        trace("permission.interrupted", { by: "chat.message" });
+        const pending = pendingPermission.current;
+        pendingPermission.current = null;
+        pending.resolve("deny");
+      }
+    },
   };
 };
 
-// Provider loader looks for exports starting with "create".
 export { createClwnd };

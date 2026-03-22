@@ -137,6 +137,17 @@ if (config.provider['opencode-clwnd']) {
   console.log('  added clwnd provider with ' + Object.keys(models).length + ' models');
 }
 
+// Register /allow and /deny commands for permission ask flow
+if (!config.command) config.command = {};
+if (!config.command.allow) {
+  config.command.allow = { template: 'allow', description: 'Allow pending clwnd permission' };
+  console.log('  added /allow command');
+}
+if (!config.command.deny) {
+  config.command.deny = { template: 'deny', description: 'Deny pending clwnd permission' };
+  console.log('  added /deny command');
+}
+
 fs.mkdirSync(require('path').dirname(configPath), { recursive: true });
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
 "
