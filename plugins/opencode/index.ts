@@ -72,20 +72,16 @@ function registerPermissionHandler(client: any, serverUrl: URL): void {
   }) => {
     trace("permission.ask", { id: payload.id, tool: payload.tool, path: payload.path });
 
-    // Show toast telling user to /allow or /deny
+    // Show toast telling user to /allow or /deny (fire and forget — don't block)
     const pathDisplay = payload.path ?? "*";
-    try {
-      await client.tui.showToast({
-        body: {
-          title: "Permission required",
-          message: `${payload.tool} on ${pathDisplay} — type /allow or /deny`,
-          variant: "warning" as const,
-          duration: 30000,
-        },
-      });
-    } catch (e) {
-      trace("permission.toast.failed", { err: String(e) });
-    }
+    client.tui.showToast({
+      body: {
+        title: "Permission required",
+        message: `${payload.tool} on ${pathDisplay} — type /allow or /deny`,
+        variant: "warning" as const,
+        duration: 30000,
+      },
+    }).then(() => trace("permission.toast.shown")).catch((e: any) => trace("permission.toast.failed", { err: String(e) }));
 
     // Wait for /allow or /deny command, or timeout/interruption
     const decision = await new Promise<"allow" | "deny">((resolve) => {
