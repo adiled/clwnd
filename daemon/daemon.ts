@@ -182,7 +182,7 @@ class SubprocessPool {
       "--permission-prompt-tool", "mcp__clwnd__permission_prompt",
       // Disable built-in tools — our MCP server replaces file/bash tools,
       // and interactive tools would hang in -p mode
-      "--disallowedTools", "Read,Edit,Write,Bash,Glob,Grep,ToolSearch,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree,AskUserQuestion,Skill",
+      "--disallowedTools", "Read,Edit,Write,Bash,Glob,Grep,ToolSearch,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree,AskUserQuestion",
       // Register our MCP server
       "--mcp-config", mcpConfig,
     ];
