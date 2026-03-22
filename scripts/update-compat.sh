@@ -19,6 +19,19 @@ run_as_clwnd() {
   su -l "$CLWND_USER" -c "cd $CLWND_SRC && $1" 2>&1 || true
 }
 
+# ─── Capture versions ────────────────────────────────────────────────────────
+
+CLWND_COMMIT=$(git -C "$(dirname "$0")/.." rev-parse --short HEAD)
+CLWND_VERSION=$(grep '"version"' package.json | head -1 | sed 's/.*"\([0-9.]*\)".*/\1/')
+CLAUDE_VERSION=$(run_as_clwnd "claude --version 2>/dev/null | head -1" | tr -d '\n')
+OPENCODE_VERSION=$(run_as_clwnd "opencode --version 2>/dev/null | head -1" | tr -d '\n')
+BUN_VERSION=$(run_as_clwnd "bun --version 2>/dev/null" | tr -d '\n')
+
+echo "clwnd: v${CLWND_VERSION} (${CLWND_COMMIT})"
+echo "claude: ${CLAUDE_VERSION}"
+echo "opencode: ${OPENCODE_VERSION}"
+echo "bun: ${BUN_VERSION}"
+
 echo "Running smoke tests..."
 SMOKE=$(run_as_clwnd "bun test ./tests/smoke.test.ts")
 
@@ -79,7 +92,9 @@ For each:
 ### Section 3: "## Test Summary"
 A compact summary table: Suite | Pass | Fail | Skip | Total
 
-Then a line: `Last updated: YYYY-MM-DD` using today'"'"'s date.
+Then a "## Environment" section with a table: Component | Version — using the versions provided in the input.
+
+Then a line: `Last updated: YYYY-MM-DD HH:MM UTC` using the timestamp provided in the input.
 
 ## Rules
 - Only output the issue body markdown. No preamble, no explanation.
@@ -87,7 +102,16 @@ Then a line: `Last updated: YYYY-MM-DD` using today'"'"'s date.
 - Use the exact test names from the output as test coverage references.
 - Keep notes concise — max one sentence.'
 
+TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+
 USER_PROMPT="Here are the test suite results. Generate the compatibility index issue body.
+
+=== VERSIONS ===
+clwnd: v${CLWND_VERSION} (${CLWND_COMMIT})
+claude: ${CLAUDE_VERSION}
+opencode: ${OPENCODE_VERSION}
+bun: ${BUN_VERSION}
+timestamp: ${TIMESTAMP}
 
 === SMOKE TESTS ===
 ${SMOKE}
