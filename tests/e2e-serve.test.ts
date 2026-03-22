@@ -352,6 +352,25 @@ describe("e2e-serve: provider migration", () => {
   }, TIMEOUT);
 });
 
+describe("e2e-serve: model switch history", () => {
+  test("switching clwnd → free → clwnd retains context from free model turn", async () => {
+    skipIfDead();
+    const sid = await createSession();
+    const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
+
+    // Turn 1: clwnd model establishes context
+    await sendMessage(sid, "My secret animal is PENGUIN. Acknowledge.");
+
+    // Turn 2: switch to free model, establish different context
+    await sendMessage(sid, "My secret number is 7777. Acknowledge.", undefined, TIMEOUT, freeModel);
+
+    // Turn 3: switch back to clwnd — should know about BOTH secrets
+    const resp = await sendMessage(sid, "What is my secret number?");
+    const text = extractResponseText(resp).toLowerCase();
+    expect(text).toContain("7777");
+  }, TIMEOUT);
+});
+
 describe("e2e-serve: brokered tools", () => {
   test("todowrite completes without error", async () => {
     skipIfDead();
