@@ -329,21 +329,28 @@ async function getSessionDirectory(client: any, sessionId: string): Promise<stri
 }
 
 // Fetch session permission rules from OpenCode
-const lastPermissions = new Map<string, string>();
+
+// Cache agent permission rules — fetched once per agent name
+const agentPermissionCache = new Map<string, Array<{ permission: string; pattern: string; action: string }>>();
 
 async function getSessionPermissions(client: any, sessionId: string): Promise<Array<{ permission: string; pattern: string; action: string }>> {
   if (!client) return [];
+  const agentName = sessionLastAgent.get(sessionId) ?? "build";
+
+  // Check cache first
+  if (agentPermissionCache.has(agentName)) return agentPermissionCache.get(agentName)!;
+
   try {
-    const resp = await client.session.get({ path: { sessionID: sessionId } });
-    const perms = resp.data?.permission ?? [];
-    const key = JSON.stringify(perms);
-    const prev = lastPermissions.get(sessionId);
-    if (prev !== key) {
-      trace("permissions.changed", { sid: sessionId, count: perms.length });
-      lastPermissions.set(sessionId, key);
-    }
+    // Fetch all agents and find the matching one
+    const resp = await client.app.agents();
+    const agents = resp.data ?? [];
+    const agent = agents.find((a: any) => a.name === agentName);
+    const perms = agent?.permission ?? [];
+    agentPermissionCache.set(agentName, perms);
+    trace("permissions.loaded", { agent: agentName, count: perms.length });
     return perms;
-  } catch {
+  } catch (e) {
+    trace("permissions.error", { agent: agentName, err: String(e) });
     return [];
   }
 }
