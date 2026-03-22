@@ -153,8 +153,23 @@ async function ipcCall(msg: IpcToDaemon): Promise<void> {
   if (!r.ok) throw new Error(`clwnd IPC ${r.status}`);
 }
 
-// Detect auxiliary calls (title generation, etc.) that should NOT
-// resume or persist sessions. These have no tools defined.
+/**
+ * Detect auxiliary calls — provider calls with no tools attached.
+ *
+ * OpenCode uses `small_model` (config) for lightweight tasks that don't need
+ * tools: title generation, session compaction, and summarization. When
+ * `small_model` is set (the daemon auto-detects a free opencode/* model on
+ * startup), these calls are routed to that provider and never reach us.
+ *
+ * This guard exists as a safety net for when `small_model` is unset or the
+ * free model is unavailable — in that case OpenCode falls back to the main
+ * provider (us). We return an empty response immediately rather than spawning
+ * a claude CLI process for something that doesn't need session context, MCP
+ * tools, or any clwnd machinery.
+ *
+ * Detection: auxiliary calls have no tools in `opts.tools`. All real chat
+ * calls from OpenCode always include the tool list.
+ */
 function isAuxiliaryCall(opts: { prompt: LanguageModelV2Prompt; tools?: unknown[] | unknown }): boolean {
   const hasTools = Array.isArray(opts.tools) && opts.tools.length > 0;
   return !hasTools;
@@ -337,17 +352,28 @@ export class ClwndModel implements LanguageModelV2 {
     response: { id: string; timestamp: Date; modelId: string };
     providerMetadata: Record<string, unknown>;
   }> {
-    const isTitle = isAuxiliaryCall(opts);
-    // Title generation calls get a throwaway session ID so they don't
-    // pollute the main Claude CLI session with --resume
-    const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
+    // Auxiliary call (title gen, compaction) — reject gracefully, see isAuxiliaryCall TSDoc
+    if (isAuxiliaryCall(opts)) {
+      trace("auxiliary.reject", { method: "doGenerate" });
+      return {
+        content: [{ type: "text" as const, text: "" }],
+        finishReason: "stop" as LanguageModelV2FinishReason,
+        usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined },
+        warnings: [],
+        request: { body: {} },
+        response: { id: generateId(), timestamp: new Date(), modelId: this.modelId },
+        providerMetadata: {},
+      };
+    }
+
+    const sid = opts.headers?.["x-opencode-session"] ?? generateId();
     const text = extractText(opts.prompt);
     const systemPrompt = extractSystemPrompt(opts.prompt);
-    if (!isTitle) detectAgent(sid, opts.headers);
+    detectAgent(sid, opts.headers);
     const warnings: LanguageModelV2CallWarning[] = [];
-    const cwd = (!isTitle && this.config.client ? await getSessionDirectory(this.config.client, sid) : null) ?? this.config.cwd ?? process.cwd();
-    const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
-    const allowedTools = isTitle ? [] : deriveAllowedTools(sid, opts);
+    const cwd = (this.config.client ? await getSessionDirectory(this.config.client, sid) : null) ?? this.config.cwd ?? process.cwd();
+    const permissions = await getSessionPermissions(this.config.client, sid);
+    const allowedTools = deriveAllowedTools(sid, opts);
 
     let reasoning = "";
     let responseText = "";
@@ -468,17 +494,28 @@ export class ClwndModel implements LanguageModelV2 {
     rawCall: { raw: unknown; rawHeaders: unknown };
     warnings: LanguageModelV2CallWarning[];
   }> {
-    const isTitle = isAuxiliaryCall(opts);
-    const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
+    // Auxiliary call (title gen, compaction) — reject gracefully, see isAuxiliaryCall TSDoc
+    if (isAuxiliaryCall(opts)) {
+      trace("auxiliary.reject", { method: "doStream" });
+      const stream = new ReadableStream<LanguageModelV2StreamPart>({
+        start(controller) {
+          controller.enqueue({ type: "finish", finishReason: "stop", usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined }, providerMetadata: {} } as LanguageModelV2StreamPart);
+          controller.close();
+        },
+      });
+      return { stream, rawCall: { raw: {}, rawHeaders: {} }, warnings: [] };
+    }
+
+    const sid = opts.headers?.["x-opencode-session"] ?? generateId();
     const text = extractText(opts.prompt);
     const systemPrompt = extractSystemPrompt(opts.prompt);
-    if (!isTitle) detectAgent(sid, opts.headers);
+    detectAgent(sid, opts.headers);
     const warnings: LanguageModelV2CallWarning[] = [];
-    const cwd = (!isTitle && this.config.client ? await getSessionDirectory(this.config.client, sid) : null) ?? this.config.cwd ?? process.cwd();
+    const cwd = (this.config.client ? await getSessionDirectory(this.config.client, sid) : null) ?? this.config.cwd ?? process.cwd();
     const self = this;
     const toolInputAccum = new Map<string, string>();
-    const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
-    const allowedTools = isTitle ? [] : deriveAllowedTools(sid, opts);
+    const permissions = await getSessionPermissions(this.config.client, sid);
+    const allowedTools = deriveAllowedTools(sid, opts);
 
     // Brokered tool return — OpenCode executed the tool, sending result back.
     // Claude already responded in the previous turn. Finish immediately.
