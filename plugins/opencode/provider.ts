@@ -244,27 +244,32 @@ function extractText(prompt: LanguageModelV2Prompt): string {
 }
 
 /**
- * Extract prior conversation history from the prompt, excluding the current
- * (last) user message and system messages. Used to seed a fresh Claude CLI
- * process with context from a pre-clwnd session or after daemon restart.
- *
- * Only called once per session (tracked by seededSessions). Returns null if
- * there are no prior user/assistant turns to inject.
+ * Extract conversation history from the prompt that the persistent Claude CLI
+ * process hasn't seen yet. Tracks how many history messages were last injected
+ * per session. If the prompt has new turns (e.g., from model switches), injects
+ * only the new ones. Returns null if there's nothing new to inject.
  */
-const seededSessions = new Set<string>();
+const seededCount = new Map<string, number>();
 
-function extractHistory(prompt: LanguageModelV2Prompt): string | null {
+function extractHistory(prompt: LanguageModelV2Prompt, sessionId?: string): string | null {
   // Find the last user message index — everything before it is history
   let lastUserIdx = -1;
   for (let i = prompt.length - 1; i >= 0; i--) {
     if (prompt[i].role === "user") { lastUserIdx = i; break; }
   }
-  // No prior turns if the last user message is the first non-system message
   const historyMsgs = prompt.slice(0, lastUserIdx).filter(m => m.role === "user" || m.role === "assistant");
   if (historyMsgs.length === 0) return null;
 
+  // Check if there are new messages since last seed
+  const prevCount = sessionId ? (seededCount.get(sessionId) ?? 0) : 0;
+  if (historyMsgs.length <= prevCount) return null;
+  if (sessionId) seededCount.set(sessionId, historyMsgs.length);
+
+  // Only inject messages the process hasn't seen
+  const newMsgs = historyMsgs.slice(prevCount);
+
   const lines: string[] = [];
-  for (const m of historyMsgs) {
+  for (const m of newMsgs) {
     const role = m.role === "user" ? "User" : "Assistant";
     let text = "";
     if (typeof m.content === "string") {
@@ -419,15 +424,12 @@ export class ClwndModel implements LanguageModelV2 {
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
-    // Seed fresh daemon sessions with prior OC conversation history (once only)
+    // Inject conversation history the persistent process hasn't seen
     let historyContext: string | undefined;
-    if (!seededSessions.has(sid)) {
-      seededSessions.add(sid);
-      const history = extractHistory(opts.prompt);
-      if (history) {
-        historyContext = history;
-        trace("history.seed", { sid, turns: history.split("\n\n").length });
-      }
+    const history = extractHistory(opts.prompt, sid);
+    if (history) {
+      historyContext = history;
+      trace("history.seed", { sid, turns: history.split("\n\n").length });
     }
 
     let reasoning = "";
@@ -573,15 +575,12 @@ export class ClwndModel implements LanguageModelV2 {
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
-    // Seed fresh daemon sessions with prior OC conversation history (once only)
+    // Inject conversation history the persistent process hasn't seen
     let historyContext: string | undefined;
-    if (!seededSessions.has(sid)) {
-      seededSessions.add(sid);
-      const history = extractHistory(opts.prompt);
-      if (history) {
-        historyContext = history;
-        trace("history.seed", { sid, turns: history.split("\n\n").length });
-      }
+    const history = extractHistory(opts.prompt, sid);
+    if (history) {
+      historyContext = history;
+      trace("history.seed", { sid, turns: history.split("\n\n").length });
     }
 
     // Brokered tool return — OpenCode executed the tool, sending result back.
