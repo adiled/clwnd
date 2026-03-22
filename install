@@ -35,14 +35,39 @@ ensure_dirs() {
   mkdir -p "$CLWND_CONFIG" "$CLWND_DATA" "$CLWND_STATE" "$CLWND_RUNTIME"
 }
 
+latest_tag() {
+  git -C "$CLWND_SRC" ls-remote --tags --sort=-v:refname origin "v*" 2>/dev/null | head -1 | sed 's|.*refs/tags/||'
+}
+
+current_tag() {
+  git -C "$CLWND_SRC" describe --tags --exact-match 2>/dev/null || echo "none"
+}
+
 ensure_source() {
   if [ -d "$CLWND_SRC/.git" ]; then
-    echo "[source] updating $CLWND_SRC..."
-    git -C "$CLWND_SRC" fetch --depth=1 origin
-    git -C "$CLWND_SRC" reset --hard origin/main
+    local LATEST
+    LATEST=$(latest_tag)
+    local CURRENT
+    CURRENT=$(current_tag)
+
+    if [ "$CMD" = "update" ] && [ "$CURRENT" = "$LATEST" ] && [ "$LATEST" != "" ]; then
+      echo "[source] already at $LATEST — nothing to update"
+      exit 0
+    fi
+
+    echo "[source] updating $CLWND_SRC to $LATEST..."
+    git -C "$CLWND_SRC" fetch --depth=1 origin tag "$LATEST"
+    git -C "$CLWND_SRC" checkout "$LATEST" 2>/dev/null || git -C "$CLWND_SRC" reset --hard "$LATEST"
   else
     echo "[source] cloning to $CLWND_SRC..."
-    git clone "$CLWND_REPO" "$CLWND_SRC"
+    git clone --depth=1 "$CLWND_REPO" "$CLWND_SRC"
+    cd "$CLWND_SRC"
+    local LATEST
+    LATEST=$(latest_tag)
+    if [ -n "$LATEST" ]; then
+      git fetch --depth=1 origin tag "$LATEST"
+      git checkout "$LATEST" 2>/dev/null || true
+    fi
   fi
 }
 
