@@ -19,10 +19,11 @@ run_as_clwnd() {
   su -l "$CLWND_USER" -c "cd $CLWND_SRC && $1" 2>&1 || true
 }
 
-# ─── Capture CLI references ──────────────────────────────────────────────────
+# ─── Capture CLI references and config schema ────────────────────────────────
 
 CLAUDE_HELP=$(run_as_clwnd "claude --help 2>&1")
 OPENCODE_HELP=$(run_as_clwnd "opencode --help 2>&1 | cat")
+OC_CONFIG_SCHEMA=$(curl -s https://opencode.ai/config.json 2>/dev/null || echo "{}")
 
 # ─── Capture versions ────────────────────────────────────────────────────────
 
@@ -84,6 +85,12 @@ ${OPENCODE_HELP}
 ${CLAUDE_HELP}
 \`\`\`
 
+## OpenCode config schema (live from https://opencode.ai/config.json)
+
+\`\`\`json
+${OC_CONFIG_SCHEMA}
+\`\`\`
+
 ## Your task
 
 Given the test suite output below, generate the issue body with these exact sections:
@@ -112,6 +119,9 @@ A compact summary table: Suite | Pass | Fail | Skip | Total | Duration
 Extract the duration from each test suite output (bun test prints it at the end, e.g., "[110.66s]").
 
 Then a "## Environment" section with a table: Component | Version — using the versions provided in the input.
+
+### Section 4: "## Potentially Uncovered"
+Compare the OpenCode config schema fields, CLI commands/flags, and Claude Code CLI flags against what the test suites actually exercise. List any OpenCode or Claude Code features that exist in the references but have NO corresponding test coverage. Only list features that are user-facing and relevant to the provider bridge (skip purely cosmetic/UI config like themes, layout, keybindings). Format as a bullet list, one line per feature, with the source (e.g., "OC config: \`field_name\`" or "CC flag: \`--flag\`").
 
 Then a line: \`Last updated: YYYY-MM-DD HH:MM UTC\` using the timestamp provided in the input.
 
