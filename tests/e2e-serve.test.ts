@@ -60,7 +60,7 @@ async function deleteSession(sid: string): Promise<void> {
   } catch {}
 }
 
-async function sendMessage(sessionID: string, text: string, agent?: string, timeoutMs = 120_000): Promise<{ info: any; parts: any[] }> {
+async function sendMessage(sessionID: string, text: string, agent?: string, timeoutMs = 120_000, model = MODEL): Promise<{ info: any; parts: any[] }> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -68,7 +68,7 @@ async function sendMessage(sessionID: string, text: string, agent?: string, time
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: MODEL,
+        model,
         agent,
         parts: [{ type: "text", text }],
       }),
@@ -291,6 +291,22 @@ describe("e2e-serve: CWD from session", () => {
     const resp = await sendMessage(sid, `Read the file ${join(PROJECT_DIR, "hello.txt")} and tell me what it says`);
     const text = extractResponseText(resp).toLowerCase();
     expect(text).toContain("hello world");
+  }, TIMEOUT);
+});
+
+describe("e2e-serve: provider migration", () => {
+  test("switching from non-clwnd to clwnd model retains session context", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Simulate pre-clwnd usage: send message with a free OC model (not clwnd)
+    const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
+    await sendMessage(sid, "My project codename is MOONSHOT. Remember this.", undefined, TIMEOUT, freeModel);
+
+    // User switches to clwnd model — this is the migration moment
+    const resp = await sendMessage(sid, "What is my project codename?");
+    const text = extractResponseText(resp).toLowerCase();
+    expect(text).toContain("moonshot");
   }, TIMEOUT);
 });
 
