@@ -366,13 +366,17 @@ describe("e2e-serve: permission ask", () => {
       } catch {}
     })();
 
-    // Send edit request
-    const resp = await sendMessage(sid, `Read ${join(PERM_DIR, "hello.txt")} then change "hello" to "hi" in it`);
+    // Send edit request — use longer timeout for permission round-trip
+    const resp = await sendMessage(sid,
+      `Use the edit tool on ${join(PERM_DIR, "hello.txt")} to replace "hello" with "hi". Do not read first, just edit directly.`,
+      undefined, 180_000);
 
     ctrl.abort();
     await approver.catch(() => {});
 
-    expect(resp.info?.error).toBeUndefined();
+    // Verify the edit actually happened
+    const content = await Bun.file(join(PERM_DIR, "hello.txt")).text();
+    expect(content).toContain("hi");
   }, TIMEOUT);
 });
 

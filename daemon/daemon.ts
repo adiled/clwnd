@@ -744,6 +744,7 @@ Bun.serve({
         if (cwd) mcpSetCwd(cwd as string);
 
         // Store permissions for the PreToolUse hook's permission-check endpoint
+        trace("permissions.received", { sid: opencodeSessionId, count: permissions.length });
         if (permissions.length > 0) {
           setSessionPermissions(opencodeSessionId, permissions as any);
         }
