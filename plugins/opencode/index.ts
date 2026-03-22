@@ -1,4 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin";
+import { tool } from "@opencode-ai/plugin";
 import { createClwnd, setSharedClient, trace } from "./provider.ts";
 
 const SOCK_PATH = (process.env.CLWND_SOCKET ??
@@ -51,18 +52,22 @@ async function startCallbackServer(): Promise<string> {
 }
 
 // ─── Permission Ask State ──────────────────────────────────────────────────
+// When the daemon holds a permission_prompt MCP call and sends permission_ask
+// on the stream, the provider emits a phantom tool call for clwnd_permission.
+// OC executes it → the plugin tool's execute() fires → calls ctx.ask() →
+// TUI dialog → user responds → we resolve the pending permission here →
+// daemon unblocks permission_prompt → Claude CLI proceeds.
 
 interface PendingPermission {
   resolve: (decision: "allow" | "deny") => void;
   tool: string;
   path?: string;
-  sessionId: string;
-  timestamp: number;
+  askId: string;
 }
 
 const pendingPermission: { current: PendingPermission | null } = { current: null };
 
-function registerPermissionHandler(client: any, serverUrl: URL): void {
+function registerPermissionHandler(): void {
   onDaemonMessage("permission-ask", async (payload: {
     id: string;
     sessionId: string;
@@ -72,38 +77,23 @@ function registerPermissionHandler(client: any, serverUrl: URL): void {
   }) => {
     trace("permission.ask", { id: payload.id, tool: payload.tool, path: payload.path });
 
-    // Show toast telling user to /allow or /deny (fire and forget — don't block)
-    const pathDisplay = payload.path ?? "*";
-    client.tui.showToast({
-      body: {
-        title: "Permission required",
-        message: `${payload.tool} on ${pathDisplay} — type /allow or /deny`,
-        variant: "warning" as const,
-        duration: 30000,
-      },
-    }).then(() => trace("permission.toast.shown")).catch((e: any) => trace("permission.toast.failed", { err: String(e) }));
-
-    // Wait for /allow or /deny command, or timeout/interruption
+    // Wait for the plugin tool to resolve this via ctx.ask()
     const decision = await new Promise<"allow" | "deny">((resolve) => {
       pendingPermission.current = {
         resolve,
         tool: payload.tool,
         path: payload.path,
-        sessionId: payload.sessionId,
-        timestamp: Date.now(),
+        askId: payload.id,
       };
 
-      // Timeout after 120s — deny by default
+      // Timeout after 5 min — deny by default
       setTimeout(() => {
-        if (pendingPermission.current?.timestamp === Date.now()) {
-          // Stale check — only timeout if this is still the same request
-        }
-        if (pendingPermission.current?.resolve === resolve) {
+        if (pendingPermission.current?.askId === payload.id) {
           pendingPermission.current = null;
           trace("permission.timeout", { id: payload.id });
           resolve("deny");
         }
-      }, 120_000);
+      }, 300_000);
     });
 
     trace("permission.decided", { id: payload.id, decision });
@@ -117,7 +107,7 @@ export const clwndPlugin: Plugin = async (input) => {
   setSharedClient(input.client);
   const provider = createClwnd({ client: input.client, pluginInput: input });
 
-  registerPermissionHandler(input.client, input.serverUrl);
+  registerPermissionHandler();
   startCallbackServer().catch(() => {});
 
   return {
@@ -129,38 +119,48 @@ export const clwndPlugin: Plugin = async (input) => {
         ? ctx.agent
         : (ctx.agent as any)?.name ?? JSON.stringify(ctx.agent);
     },
-    // Intercept /allow and /deny commands
-    "command.execute.before": async (input, output) => {
-      const cmd = input.command;
-      if (cmd === "allow" || cmd === "deny") {
-        const pending = pendingPermission.current;
-        if (pending) {
-          const decision = cmd === "allow" ? "allow" : "deny";
-          trace("permission.command", { cmd, tool: pending.tool, decision });
-          pendingPermission.current = null;
-          pending.resolve(decision as "allow" | "deny");
-          // Clear parts so nothing gets sent to the model
-          output.parts = [];
-        } else {
-          trace("permission.command.no-pending", { cmd });
-          // No pending permission — clear parts, show toast
-          try {
-            await input.client?.tui?.showToast?.({
-              body: { message: "No pending permission request", variant: "info" as const, duration: 3000 },
-            });
-          } catch {}
-          output.parts = [];
-        }
-      }
-    },
-    // If user sends a regular message while permission is pending, auto-deny
-    "chat.message": async (ctx, output) => {
-      if (pendingPermission.current) {
-        trace("permission.interrupted", { by: "chat.message" });
-        const pending = pendingPermission.current;
-        pendingPermission.current = null;
-        pending.resolve("deny");
-      }
+    // Plugin tool for permission prompts. The provider emits a phantom call
+    // to this tool with providerExecuted: false. OC executes it via
+    // resolveTools() → execute() → ctx.ask() → TUI permission dialog.
+    tool: {
+      clwnd_permission: tool({
+        description: "Permission prompt for clwnd file system operations",
+        args: {
+          tool: tool.schema.string().describe("Tool name requesting permission"),
+          path: tool.schema.string().optional().describe("File path"),
+        },
+        async execute(args, ctx) {
+          trace("clwnd_permission.execute", { tool: args.tool, path: args.path });
+
+          // Call ctx.ask() — this triggers OC's PermissionNext.ask() → TUI dialog
+          await ctx.ask({
+            permission: args.tool === "edit" || args.tool === "write" ? "edit" : args.tool,
+            patterns: [args.path ?? "*"],
+            metadata: { tool: args.tool, filepath: args.path },
+            always: [args.path ?? "*"],
+          });
+
+          // User approved. Tell daemon to unblock the permission_prompt MCP.
+          trace("clwnd_permission.approved", { tool: args.tool });
+          if (pendingPermission.current?.tool === args.tool) {
+            const askId = pendingPermission.current.askId;
+            pendingPermission.current = null;
+            // Resolve daemon's pendingAsk via HTTP
+            try {
+              await fetch("http://localhost/permission-phantom-result", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ askId, decision: "allow" }),
+                unix: SOCK_PATH,
+              } as RequestInit);
+            } catch (e) {
+              trace("clwnd_permission.resolve.failed", { err: String(e) });
+            }
+          }
+
+          return `Permission granted for ${args.tool}`;
+        },
+      }),
     },
   };
 };

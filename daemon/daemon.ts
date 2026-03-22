@@ -294,6 +294,9 @@ class SubprocessPool {
 
     const emit = (type: string, data: Record<string, unknown>) => handler!.onChunk(type, data);
 
+    // Log every message type for debugging
+    trace("stdout.msg", { type: m.type as string, subtype: (m.subtype as string) ?? "" });
+
     // Handle permission requests from Claude CLI's native permission protocol
     if (m.type === "permission_request") {
       const requestId = m.request_id as string;
@@ -731,6 +734,8 @@ const HTTP = SOCK + ".http";
 const pool = new SubprocessPool(process.env.CLAUDE_CLI_PATH ?? "claude");
 
 const sessionLocks = new Map<string, Promise<void>>();
+// Active stream senders per session — for injecting messages into the provider's stream
+const activeStreamSenders = new Map<string, (msg: IpcToPlugin) => void>();
 const pendingEvents = new Map<string, IpcToPlugin[]>();
 const sseClients = new Map<string, (msg: IpcToPlugin) => void>();
 
@@ -788,6 +793,19 @@ Bun.serve({
       });
     }
 
+    // Phantom permission result — provider tells daemon the ctx.ask() outcome
+    if (req.method === "POST" && url.pathname === "/permission-phantom-result") {
+      return req.json().then((body: { askId: string; decision: "allow" | "deny" }) => {
+        const entry = pendingAsk.get(body.askId);
+        if (entry) {
+          pendingAsk.delete(body.askId);
+          entry.resolve(body.decision);
+          trace("phantom.resolved", { askId: body.askId, decision: body.decision });
+        }
+        return new Response("ok");
+      }).catch(() => new Response("error", { status: 400 }));
+    }
+
     // Plugin registers its callback URL for daemon → plugin communication
     if (req.method === "POST" && url.pathname === "/callback") {
       return req.json().then((body: { url: string }) => {
@@ -828,6 +846,9 @@ Bun.serve({
         const lock = new Promise<void>(r => { releaseLock = r; });
         sessionLocks.set(opencodeSessionId, lock);
 
+        // Persistent process: poolKey = opencodeSessionId (one process per OC session)
+        const poolKey = opencodeSessionId;
+
         const stream = new ReadableStream({
           start(controller) {
             const send = (msg: IpcToPlugin) => {
@@ -836,6 +857,9 @@ Bun.serve({
                 controller.enqueue(encoder.encode(JSON.stringify(msg) + "\n"));
               } catch { closed = true; }
             };
+
+            // Register stream sender so MCP handlers can inject messages
+            activeStreamSenders.set(opencodeSessionId, send);
 
             // Get or create persistent session
             let session = sessions.get(opencodeSessionId);
@@ -853,8 +877,6 @@ Bun.serve({
               saveSessions();
             }
 
-            // Persistent process: poolKey = opencodeSessionId (one process per OC session)
-            const poolKey = opencodeSessionId;
 
             trace("stream.start", { sid: opencodeSessionId, isNew: isNewSession, sessions: sessions.size });
 
@@ -885,6 +907,7 @@ Bun.serve({
                 });
                 // Remove handler but DON'T destroy process — it stays alive for next turn
                 pool.abort(opencodeSessionId, poolKey);
+                activeStreamSenders.delete(opencodeSessionId);
                 releaseLock!();
                 if (!closed) { closed = true; try { controller.close(); } catch {} }
               },
@@ -1113,20 +1136,15 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>) =
   if (action === "allow") return { decision: "allow" as const };
   if (action === "deny") return { decision: "deny" as const };
 
-  // "ask" — treat as allow until UX surface exists for user to respond
-  // Infrastructure is proven (e2e-serve-asks test passes) but real users
-  // have no way to call /permission-respond from inside OC's TUI yet.
-  // TODO: enable hold when UX surface is available
-  return { decision: "allow" as const };
-
-  // "ask" — hold until user responds via /permission-respond
+  // "ask" — hold MCP response, send phantom permission ask on the active stream
+  // so the provider can emit a phantom tool call to trigger OC's ctx.ask() dialog
   const askId = randomUUID();
   trace("permission.ask.hold", { id: askId, tool, path });
 
-  // Notify plugin to show toast
-  askPlugin("permission-ask", {
-    id: askId, sessionId: "", tool, path, input,
-  }).catch(() => {});
+  // Send permission_ask on the active stream so the provider sees it
+  for (const [, sender] of activeStreamSenders) {
+    sender({ action: "permission_ask", opencodeSessionId: "", tool, path, input, askId } as unknown as IpcToPlugin);
+  }
 
   return new Promise<{ decision: "allow" | "deny" }>((resolve) => {
     pendingAsk.set(askId, {

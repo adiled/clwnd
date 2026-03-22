@@ -11,13 +11,11 @@ const SUITE_DIR = join(HOME, ".clwnd-e2e-serve-asks");
 const PROJECT_DIR = join(SUITE_DIR, "project");
 const TIMEOUT = 240_000;
 const activeSessions: string[] = [];
-
 const DAEMON_SOCK = (process.env.CLWND_SOCKET ?? `${process.env.XDG_RUNTIME_DIR ?? "/tmp"}/clwnd/clwnd.sock`) + ".http";
 
 async function api(path: string, opts?: RequestInit) {
   return (await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...opts?.headers },
-    ...opts,
+    headers: { "Content-Type": "application/json", ...opts?.headers }, ...opts,
   })).json();
 }
 
@@ -34,22 +32,13 @@ async function deleteSession(sid: string): Promise<void> {
 }
 
 async function sh(cmd: string): Promise<void> {
-  const p = spawn({ cmd: ["sh", "-c", cmd], stdout: "pipe", stderr: "pipe" });
-  await p.exited;
+  const p = spawn({ cmd: ["sh", "-c", cmd], stdout: "pipe", stderr: "pipe" }); await p.exited;
 }
 
 async function nuke(pid?: number): Promise<void> {
   if (pid) { await sh(`pkill -TERM -P ${pid} 2>/dev/null; kill -TERM ${pid} 2>/dev/null`); await Bun.sleep(1_000); await sh(`pkill -KILL -P ${pid} 2>/dev/null; kill -KILL ${pid} 2>/dev/null`); await Bun.sleep(500); }
   await sh(`pkill -KILL -f "opencode serve.*--port ${PORT}" 2>/dev/null`); await Bun.sleep(500);
   await sh(`lsof -ti :${PORT} | xargs -r kill -9 2>/dev/null`); await Bun.sleep(500);
-}
-
-async function getMcpPort(): Promise<number> {
-  const out = await new Response(
-    spawn({ cmd: ["journalctl", "--user", "-u", "clwnd", "-n", "10", "--no-pager", "-o", "cat"], stdout: "pipe", stderr: "pipe" }).stdout
-  ).text();
-  const match = out.match(/mcp=http:\/\/127\.0\.0\.1:(\d+)/);
-  return match ? parseInt(match[1]) : 0;
 }
 
 let server: Subprocess;
@@ -71,7 +60,6 @@ beforeAll(async () => {
     ] },
   }, null, 2));
 
-  // OC project config — edit requires ask
   await Bun.write(join(PROJECT_DIR, "opencode.json"), JSON.stringify({
     permission: { edit: "ask" },
   }, null, 2));
@@ -111,18 +99,13 @@ function skipIfDead() {
   if (server?.exitCode !== null) throw new Error("opencode serve is no longer running");
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
-
-describe("e2e-serve-asks: permission ask via MCP permission_prompt tool", () => {
-  test("edit with ask permission: approve via daemon endpoint", async () => {
+describe("e2e-serve-asks: permission dialog via phantom tool call", () => {
+  test("edit with ask permission creates OC permission prompt and proceeds on approval", async () => {
     skipIfDead();
     const sid = await createSession();
-    const mcpPort = await getMcpPort();
-    expect(mcpPort).toBeGreaterThan(0);
-    const DAEMON_MCP = `http://127.0.0.1:${mcpPort}`;
 
-    // Fire edit request — the permission_prompt MCP tool will hold
-    // because OC's agent has edit=ask, so the daemon waits for /permission-respond
+    // Fire edit — triggers permission_prompt MCP → daemon holds →
+    // phantom clwnd_permission tool call → OC ctx.ask() → pending permission
     const editPromise = fetch(`${BASE}/session/${sid}/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -133,28 +116,32 @@ describe("e2e-serve-asks: permission ask via MCP permission_prompt tool", () => 
       signal: AbortSignal.timeout(180_000),
     }).then(r => r.json()).catch(() => null);
 
-    // Poll daemon for pending permission, then approve
-    const approver = (async () => {
-      for (let i = 0; i < 60; i++) {
-        await Bun.sleep(2_000);
-        try {
-          const pending = await fetch(`${DAEMON_MCP}/permission-pending`).then(r => r.json()) as any[];
-          if (pending && pending.length > 0) {
-            await fetch(`${DAEMON_MCP}/permission-respond`, {
+    // Poll GET /permission for pending permissions and auto-approve
+    let approved = false;
+    for (let i = 0; i < 60; i++) {
+      await Bun.sleep(2_000);
+      try {
+        const pending = await fetch(`${BASE}/permission`).then(r => r.json()) as any[];
+        if (pending && pending.length > 0) {
+          for (const perm of pending) {
+            await fetch(`${BASE}/permission/${perm.id}/reply`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ id: pending[0].id, decision: "allow" }),
+              body: JSON.stringify({ reply: "once" }),
             });
-            return;
+            approved = true;
           }
-        } catch {}
-      }
-    })();
+          if (approved) break;
+        }
+      } catch {}
+    }
 
     await editPromise;
-    await approver;
 
-    // Verify the edit happened
+    // Permission dialog was created and approved
+    expect(approved).toBe(true);
+
+    // File should be edited
     const content = await Bun.file(join(PROJECT_DIR, "hello.txt")).text();
     expect(content).toContain("hi");
   }, TIMEOUT);
