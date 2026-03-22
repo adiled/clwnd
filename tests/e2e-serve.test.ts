@@ -292,6 +292,15 @@ describe("e2e-serve: CWD from session", () => {
     const text = extractResponseText(resp).toLowerCase();
     expect(text).toContain("hello world");
   }, TIMEOUT);
+
+  test("bash commands run in the session directory", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    const resp = await sendMessage(sid, 'Run this exact command: pwd');
+    const text = extractResponseText(resp);
+    expect(text).toContain(PROJECT_DIR);
+  }, TIMEOUT);
 });
 
 describe("e2e-serve: provider migration", () => {
