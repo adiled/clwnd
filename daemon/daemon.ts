@@ -618,6 +618,7 @@ onBroadcast((msg) => {
 });
 
 for (const p of [SOCK, HTTP]) {
+  mkdirSync(dirname(p), { recursive: true });
   if (existsSync(p)) { try { unlinkSync(p); } catch {} }
 }
 
