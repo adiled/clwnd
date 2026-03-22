@@ -2,19 +2,34 @@
 set -e
 cd "$(dirname "$0")/.."
 
-# ─── Run all test suites, capture output ─────────────────────────────────────
+CLWND_USER="${CLWND_DEV_USER:-clwnd}"
+CLWND_SRC="$(eval echo ~$CLWND_USER)/.local/share/clwnd/src"
+
+# ─── Sync test files to clwnd user ──────────────────────────────────────────
+
+echo "Syncing test files to $CLWND_USER..."
+for f in tests/smoke.test.ts tests/e2e.test.ts tests/e2e-serve.test.ts tests/e2e-human.test.ts; do
+  cp "$f" "$CLWND_SRC/$f"
+  chown "$CLWND_USER:$CLWND_USER" "$CLWND_SRC/$f"
+done
+
+# ─── Run all test suites as clwnd user ───────────────────────────────────────
+
+run_as_clwnd() {
+  su -l "$CLWND_USER" -c "cd $CLWND_SRC && $1" 2>&1 || true
+}
 
 echo "Running smoke tests..."
-SMOKE=$(bun test tests/smoke.test.ts 2>&1 || true)
+SMOKE=$(run_as_clwnd "bun test ./tests/smoke.test.ts")
 
 echo "Running e2e tests..."
-E2E=$(bun test tests/e2e.test.ts 2>&1 || true)
+E2E=$(run_as_clwnd "bun test ./tests/e2e.test.ts")
 
 echo "Running e2e-serve tests..."
-E2E_SERVE=$(su -l clwnd -c 'cd ~/.local/share/clwnd/src && bun test ./tests/e2e-serve.test.ts' 2>&1 || true)
+E2E_SERVE=$(run_as_clwnd "bun test ./tests/e2e-serve.test.ts")
 
 echo "Running e2e-human tests..."
-E2E_HUMAN=$(bun test tests/e2e-human.test.ts 2>&1 || true)
+E2E_HUMAN=$(run_as_clwnd "bun test ./tests/e2e-human.test.ts")
 
 # ─── Build the prompt ────────────────────────────────────────────────────────
 
