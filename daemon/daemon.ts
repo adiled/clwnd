@@ -880,3 +880,26 @@ process.on("uncaughtException",  e => console.error("uncaught:", e));
 process.on("unhandledRejection", e => console.error("unhandled:", e));
 
 info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid, version: CURRENT_VERSION });
+
+// Set small_model to a free opencode model so title gen doesn't spawn claude processes
+(async () => {
+  try {
+    const configHome = process.env.XDG_CONFIG_HOME ?? join(process.env.HOME ?? "", ".config");
+    const configPath = join(configHome, "opencode", "opencode.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    // Only touch if unset or already a -free model (don't override user choice)
+    if (config.small_model && !config.small_model.includes("-free")) return;
+    const home = process.env.HOME ?? "";
+    const opencodeBin = [join(home, ".opencode", "bin", "opencode"), "opencode"].find(p => existsSync(p)) ?? "opencode";
+    const proc = spawn({ cmd: [opencodeBin, "models"], stdout: "pipe", stderr: "pipe" });
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    const freeModels = out.split("\n").filter(l => l.includes("opencode/") && l.includes("-free")).map(l => l.trim());
+    if (freeModels.length === 0) return;
+    const pick = freeModels[Math.floor(Math.random() * freeModels.length)];
+    if (config.small_model === pick) return;
+    config.small_model = pick;
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+    info("small_model", { model: pick });
+  } catch {}
+})();
