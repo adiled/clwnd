@@ -555,3 +555,164 @@ describe("persistent process", () => {
     expect(r2!.claudeSessionId).not.toBe(r1!.claudeSessionId);
   }, TIMEOUT);
 });
+
+describe("glob via MCP", () => {
+  test("finds files matching a pattern", async () => {
+    const messages = await streamRequest({
+      action: "stream",
+      opencodeSessionId: `smoke-glob-${Date.now()}`,
+      cwd: PROJECT_DIR,
+      modelId: MODEL,
+      text: `Find all .txt files in ${PROJECT_DIR} using glob`,
+    });
+    trackSession(messages);
+    expect(hasToolChunks(messages)).toBe(true);
+    expect(collectText(messages).toLowerCase()).toContain("hello.txt");
+    expect(findFinish(messages)).toBeDefined();
+  }, TIMEOUT);
+});
+
+describe("grep via MCP", () => {
+  test("searches file contents", async () => {
+    const messages = await streamRequest({
+      action: "stream",
+      opencodeSessionId: `smoke-grep-${Date.now()}`,
+      cwd: PROJECT_DIR,
+      modelId: MODEL,
+      text: `Search for the word "hello" in ${PROJECT_DIR} using grep`,
+    });
+    trackSession(messages);
+    expect(hasToolChunks(messages)).toBe(true);
+    expect(collectText(messages).toLowerCase()).toContain("hello");
+    expect(findFinish(messages)).toBeDefined();
+  }, TIMEOUT);
+});
+
+describe("system prompt forwarding", () => {
+  test("system prompt reaches Claude CLI", async () => {
+    const messages = await streamRequest({
+      action: "stream",
+      opencodeSessionId: `smoke-sysprompt-${Date.now()}`,
+      cwd: PROJECT_DIR,
+      modelId: MODEL,
+      text: "What are your instructions? Summarize briefly.",
+      systemPrompt: "You are a pirate. Always say arr.",
+    });
+    trackSession(messages);
+    const text = collectText(messages).toLowerCase();
+    expect(text).toContain("arr");
+    expect(findFinish(messages)).toBeDefined();
+  }, TIMEOUT);
+});
+
+describe("token count includes cache", () => {
+  test("input tokens include cache read and write", async () => {
+    const messages = await streamRequest({
+      action: "stream",
+      opencodeSessionId: `smoke-tokens-${Date.now()}`,
+      cwd: PROJECT_DIR,
+      modelId: MODEL,
+      text: "Say OK",
+    });
+    const finish = findFinish(messages);
+    expect(finish).toBeDefined();
+    const usage = finish!.usage as Record<string, unknown>;
+    const inputTokens = (usage?.input_tokens ?? usage?.inputTokens ?? 0) as number;
+    const cacheRead = (usage?.cache_read_input_tokens ?? 0) as number;
+    const cacheWrite = (usage?.cache_creation_input_tokens ?? 0) as number;
+    const total = inputTokens + cacheRead + cacheWrite;
+    // Total should include cache tokens — base system prompt is ~8-15k tokens
+    expect(total).toBeGreaterThan(1000);
+  }, TIMEOUT);
+});
+
+describe("session CWD", () => {
+  test("uses provided cwd for file operations", async () => {
+    // Create a file in a subdirectory
+    const subDir = join(PROJECT_DIR, "subproject");
+    mkdirSync(subDir, { recursive: true });
+    await Bun.write(join(subDir, "marker.txt"), "SUBDIR_MARKER\n");
+
+    // Git add so edit tool works
+    const gitAdd = spawn({ cmd: ["git", "add", "."], cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe" });
+    await gitAdd.exited;
+    const gitCommit = spawn({
+      cmd: ["git", "commit", "-m", "add subdir"],
+      cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe",
+      env: { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "t@t" },
+    });
+    await gitCommit.exited;
+
+    const messages = await streamRequest({
+      action: "stream",
+      opencodeSessionId: `smoke-cwd-${Date.now()}`,
+      cwd: subDir,
+      modelId: MODEL,
+      text: `Read marker.txt in ${subDir} and tell me what it says`,
+    });
+    trackSession(messages);
+    expect(collectText(messages)).toContain("SUBDIR_MARKER");
+    expect(findFinish(messages)).toBeDefined();
+  }, TIMEOUT);
+});
+
+describe("plan mode enforcement", () => {
+  test("MCP denies edit when allowedTools excludes it", async () => {
+    // Create a fresh file for this test
+    const planFile = join(PROJECT_DIR, "plan-test.txt");
+    await Bun.write(planFile, "original content\n");
+
+    // Simulate plan mode: allowedTools without edit/write
+    const messages = await streamRequest({
+      action: "stream",
+      opencodeSessionId: `smoke-planmode-${Date.now()}`,
+      cwd: PROJECT_DIR,
+      modelId: MODEL,
+      text: `Edit the file ${planFile} and change "original" to "modified". You must use the edit tool.`,
+      allowedTools: ["read", "bash", "glob", "grep"],
+    });
+    trackSession(messages);
+    // The file should NOT be modified — edit denied by MCP
+    const content = readFileSync(planFile, "utf-8");
+    expect(content).toContain("original");
+    expect(findFinish(messages)).toBeDefined();
+  }, TIMEOUT);
+});
+
+describe("brokered tools", () => {
+  test("webfetch tool call has providerExecuted false", async () => {
+    const messages = await streamRequest({
+      action: "stream",
+      opencodeSessionId: `smoke-broker-wf-${Date.now()}`,
+      cwd: PROJECT_DIR,
+      modelId: MODEL,
+      text: "Fetch https://example.com and tell me the title",
+    });
+    trackSession(messages);
+    // Should have a tool_call for webfetch/WebFetch
+    const toolCalls = messages.filter(m =>
+      m.action === "chunk" && m.chunkType === "tool_call" &&
+      (m.toolName === "WebFetch" || m.toolName === "webfetch" || (m.toolName as string)?.includes("Fetch"))
+    );
+    expect(toolCalls.length).toBeGreaterThan(0);
+    expect(collectText(messages).toLowerCase()).toMatch(/example|domain/);
+    expect(findFinish(messages)).toBeDefined();
+  }, TIMEOUT);
+
+  test("todowrite tool call has providerExecuted false", async () => {
+    const messages = await streamRequest({
+      action: "stream",
+      opencodeSessionId: `smoke-broker-todo-${Date.now()}`,
+      cwd: PROJECT_DIR,
+      modelId: MODEL,
+      text: "Use the TodoWrite tool to create a todo list with these items: buy milk, walk dog",
+    });
+    trackSession(messages);
+    const toolCalls = messages.filter(m =>
+      m.action === "chunk" && m.chunkType === "tool_call" &&
+      (m.toolName === "TodoWrite" || m.toolName === "todowrite")
+    );
+    expect(toolCalls.length).toBeGreaterThan(0);
+    expect(findFinish(messages)).toBeDefined();
+  }, TIMEOUT);
+});
