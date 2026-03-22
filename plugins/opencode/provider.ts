@@ -201,9 +201,13 @@ function extractText(prompt: LanguageModelV2Prompt): string {
     if (m.role === "user") {
       if (typeof m.content === "string") return m.content;
       if (Array.isArray(m.content)) {
+        // Collect ALL text parts — plan mode and other synthetic instructions
+        // are injected as additional text parts in the same user message
+        const texts: string[] = [];
         for (const p of m.content as Array<{ type: string; text?: string }>) {
-          if (p.type === "text" && p.text) return p.text;
+          if (p.type === "text" && p.text) texts.push(p.text);
         }
+        if (texts.length > 0) return texts.join("\n\n");
       }
     }
   }
