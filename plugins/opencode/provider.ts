@@ -334,7 +334,7 @@ async function getSessionDirectory(client: any, sessionId: string): Promise<stri
 const agentPermissionCache = new Map<string, Array<{ permission: string; pattern: string; action: string }>>();
 
 async function getSessionPermissions(client: any, sessionId: string): Promise<Array<{ permission: string; pattern: string; action: string }>> {
-  if (!client) { trace("permissions.no-client"); return []; }
+  if (!client) return [];
   const agentName = sessionLastAgent.get(sessionId) ?? "build";
 
   // Check cache first
@@ -342,9 +342,7 @@ async function getSessionPermissions(client: any, sessionId: string): Promise<Ar
 
   try {
     // Fetch all agents and find the matching one
-    trace("permissions.fetching", { agent: agentName, hasApp: !!client.app, hasAgents: !!client.app?.agents });
     const resp = await client.app.agents();
-    trace("permissions.fetched", { agent: agentName, hasData: !!resp.data });
     const agents = resp.data ?? [];
     const agent = agents.find((a: any) => a.name === agentName);
     const perms = agent?.permission ?? [];

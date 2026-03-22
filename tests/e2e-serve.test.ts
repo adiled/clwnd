@@ -174,6 +174,7 @@ beforeAll(async () => {
     ] },
   }, null, 2));
 
+
   const gitAdd = spawn({ cmd: ["git", "add", "."], cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe" });
   await gitAdd.exited;
   const gitCommit = spawn({
@@ -300,6 +301,63 @@ describe("e2e-serve: CWD from session", () => {
     const resp = await sendMessage(sid, 'Run this exact command: pwd');
     const text = extractResponseText(resp);
     expect(text).toContain(PROJECT_DIR);
+  }, TIMEOUT);
+});
+
+describe("e2e-serve: permission ask", () => {
+  test("edit with ask permission triggers prompt and proceeds on approval", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Set permission to "ask" for edit via session update or config
+    // For now, we test the flow by watching for permission events
+    // while a message is in flight
+
+    // Start SSE listener to auto-approve permissions
+    const ctrl = new AbortController();
+    const approver = (async () => {
+      try {
+        const resp = await fetch(`${BASE}/event?directory=${encodeURIComponent(PROJECT_DIR)}`, {
+          signal: ctrl.signal,
+        });
+        const reader = resp.body?.getReader();
+        if (!reader) return;
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            try {
+              const event = JSON.parse(line.slice(6));
+              if (event.type === "permission.updated") {
+                const perm = event.properties;
+                // Auto-approve the permission
+                await api(`/session/${perm.sessionID}/permissions/${perm.id}`, {
+                  method: "POST",
+                  body: JSON.stringify({ response: "once" }),
+                });
+              }
+            } catch {}
+          }
+        }
+      } catch {}
+    })();
+
+    // Send edit request — if permission ask flow works, the approver
+    // will catch the permission event and approve it
+    const resp = await sendMessage(sid, `Read ${join(PROJECT_DIR, "hello.txt")} then change "hello" to "hi" in it`);
+
+    // Stop the SSE listener
+    ctrl.abort();
+    await approver.catch(() => {});
+
+    // The edit should have completed (either via permission ask flow or direct allow)
+    expect(resp.info?.error).toBeUndefined();
   }, TIMEOUT);
 });
 

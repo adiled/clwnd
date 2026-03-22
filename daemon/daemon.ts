@@ -399,22 +399,22 @@ export function setSessionPermissions(sessionId: string, rules: Array<{ permissi
 }
 
 function getPermissionAction(tool: string, path?: string): "allow" | "deny" | "ask" {
-  // Check all sessions' permissions (the tool call comes from Claude CLI
-  // which doesn't know the OC session ID — we check all active sessions)
+  // OC rules are ordered general → specific. Last matching rule wins.
+  let result: "allow" | "deny" | "ask" = "allow";
   for (const [, rules] of sessionPermissions) {
     for (const rule of rules) {
       if (rule.permission !== tool && rule.permission !== "*") continue;
       if (path) {
         const pat = rule.pattern;
         if (pat === "*" || path.startsWith(pat.replace("/*", "/")) || path === pat) {
-          return rule.action as "allow" | "deny" | "ask";
+          result = rule.action as "allow" | "deny" | "ask";
         }
-      } else {
-        return rule.action as "allow" | "deny" | "ask";
+      } else if (rule.pattern === "*") {
+        result = rule.action as "allow" | "deny" | "ask";
       }
     }
   }
-  return "allow"; // default: allow if no rule matches
+  return result;
 }
 
 // ─── Session State (persisted) ───────────────────────────────────────────────
