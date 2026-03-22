@@ -305,19 +305,38 @@ describe("e2e-serve: CWD from session", () => {
 });
 
 describe("e2e-serve: permission ask", () => {
+  const PERM_DIR = join(SUITE_DIR, "perm-ask");
+
   test("edit with ask permission triggers prompt and proceeds on approval", async () => {
     skipIfDead();
-    const sid = await createSession();
 
-    // Set permission to "ask" for edit via session update or config
-    // For now, we test the flow by watching for permission events
-    // while a message is in flight
+    // Set up isolated directory with edit=ask permission
+    mkdirSync(join(PERM_DIR, ".opencode"), { recursive: true });
+    mkdirSync(join(PERM_DIR, ".claude"), { recursive: true });
+    await Bun.write(join(PERM_DIR, ".opencode", "opencode.json"), JSON.stringify({
+      permission: { edit: "ask" },
+    }, null, 2));
+    await Bun.write(join(PERM_DIR, ".claude", "settings.json"), JSON.stringify({
+      permissions: { allow: [
+        "mcp__clwnd__read(*)", "mcp__clwnd__edit(*)", "mcp__clwnd__write(*)",
+        "mcp__clwnd__bash(*)", "mcp__clwnd__glob(*)", "mcp__clwnd__grep(*)",
+      ] },
+    }, null, 2));
+    await Bun.write(join(PERM_DIR, "hello.txt"), "hello world\n");
+
+    // Create session in the permission test directory
+    const r = await api("/session", {
+      method: "POST",
+      body: JSON.stringify({ directory: PERM_DIR }),
+    });
+    const sid = (r as any).id;
+    activeSessions.push(sid);
 
     // Start SSE listener to auto-approve permissions
     const ctrl = new AbortController();
     const approver = (async () => {
       try {
-        const resp = await fetch(`${BASE}/event?directory=${encodeURIComponent(PROJECT_DIR)}`, {
+        const resp = await fetch(`${BASE}/event?directory=${encodeURIComponent(PERM_DIR)}`, {
           signal: ctrl.signal,
         });
         const reader = resp.body?.getReader();
@@ -336,7 +355,6 @@ describe("e2e-serve: permission ask", () => {
               const event = JSON.parse(line.slice(6));
               if (event.type === "permission.updated") {
                 const perm = event.properties;
-                // Auto-approve the permission
                 await api(`/session/${perm.sessionID}/permissions/${perm.id}`, {
                   method: "POST",
                   body: JSON.stringify({ response: "once" }),
@@ -348,15 +366,12 @@ describe("e2e-serve: permission ask", () => {
       } catch {}
     })();
 
-    // Send edit request — if permission ask flow works, the approver
-    // will catch the permission event and approve it
-    const resp = await sendMessage(sid, `Read ${join(PROJECT_DIR, "hello.txt")} then change "hello" to "hi" in it`);
+    // Send edit request
+    const resp = await sendMessage(sid, `Read ${join(PERM_DIR, "hello.txt")} then change "hello" to "hi" in it`);
 
-    // Stop the SSE listener
     ctrl.abort();
     await approver.catch(() => {});
 
-    // The edit should have completed (either via permission ask flow or direct allow)
     expect(resp.info?.error).toBeUndefined();
   }, TIMEOUT);
 });
