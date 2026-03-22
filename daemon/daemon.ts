@@ -391,6 +391,14 @@ async function askPlugin<T = any>(type: string, payload: any, timeoutMs = 120_00
 
 // ─── Permission State ───────────────────────────────────────────────────────
 
+// Pending permission asks — held PreToolUse hook responses waiting for user decision
+const pendingAsk = new Map<string, {
+  resolve: (decision: "allow" | "deny") => void;
+  tool: string;
+  path?: string;
+  sessionId: string;
+}>();
+
 // Permission rules stored per-session, forwarded from OC via the provider
 const sessionPermissions = new Map<string, Array<{ permission: string; pattern: string; action: string }>>();
 
@@ -931,24 +939,63 @@ const mcpServer = Bun.serve({
         if (action === "allow") return hookAllow();
         if (action === "deny") return hookDeny("Denied by session permission rules");
 
-        // "ask" — relay to plugin, which triggers OC's permission UI
-        try {
-          const result = await askPlugin<{ decision: "allow" | "deny" }>("permission-ask", {
-            id: randomUUID(),
-            sessionId: ocSessionId ?? sessionId,
-            tool: toolName,
-            path,
-            input: body.tool_input ?? {},
-          });
-          return result.decision === "allow" ? hookAllow() : hookDeny("Denied by user");
-        } catch {
-          return hookDeny("Permission check unavailable");
-        }
+        // "ask" — hold this response, expose via /permission-pending,
+        // wait for /permission-respond to resolve it
+        const askId = randomUUID();
+        trace("permission.ask.hold", { id: askId, tool: toolName, path });
+
+        // Notify plugin to show toast (fire and forget)
+        askPlugin("permission-ask", {
+          id: askId, sessionId: ocSessionId ?? sessionId,
+          tool: toolName, path, input: body.tool_input ?? {},
+        }).catch(() => {});
+
+        // Hold until /permission-respond resolves this, or timeout
+        const decision = await new Promise<"allow" | "deny">((resolve) => {
+          pendingAsk.set(askId, { resolve, tool: toolName, path, sessionId: ocSessionId ?? sessionId });
+          setTimeout(() => {
+            if (pendingAsk.has(askId)) {
+              pendingAsk.delete(askId);
+              trace("permission.ask.timeout", { id: askId });
+              resolve("deny");
+            }
+          }, 300_000); // 5 min — PreToolUse hook timeout is 600s
+        });
+
+        trace("permission.ask.resolved", { id: askId, decision });
+        return decision === "allow" ? hookAllow() : hookDeny("Denied by user");
       } catch (e) {
         trace("permission.hook.error", { err: String(e) });
         return Response.json({
           hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Permission check failed" },
         });
+      }
+    }
+
+    // GET /permission-pending — list pending permission asks
+    if (req.method === "GET" && url.pathname === "/permission-pending") {
+      const pending = Array.from(pendingAsk.entries()).map(([id, p]) => ({
+        id, tool: p.tool, path: p.path, sessionId: p.sessionId,
+      }));
+      return Response.json(pending);
+    }
+
+    // POST /permission-respond — resolve a pending permission ask
+    if (req.method === "POST" && url.pathname === "/permission-respond") {
+      try {
+        const body = await req.json() as { id?: string; decision: "allow" | "deny" };
+        // If no id, resolve the first pending
+        const id = body.id ?? pendingAsk.keys().next().value;
+        if (!id || !pendingAsk.has(id as string)) {
+          return Response.json({ error: "no pending permission" }, { status: 404 });
+        }
+        const entry = pendingAsk.get(id as string)!;
+        pendingAsk.delete(id as string);
+        entry.resolve(body.decision);
+        trace("permission.respond", { id, decision: body.decision });
+        return Response.json({ ok: true });
+      } catch {
+        return Response.json({ error: "bad request" }, { status: 400 });
       }
     }
 
