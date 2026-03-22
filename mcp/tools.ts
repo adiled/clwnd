@@ -142,7 +142,28 @@ export const TOOLS = [
       required: ["pattern"],
     },
   },
+  {
+    name: "permission_prompt",
+    description: "Handle permission prompts from Claude CLI. Called automatically via --permission-prompt-tool.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        tool_name: { type: "string", description: "Name of the tool requesting permission" },
+        input: { type: "object", description: "Tool input arguments" },
+      },
+      required: ["tool_name"],
+    },
+  },
 ];
+
+// ─── Permission Prompt ──────────────────────────────────────────────────────
+
+// Callback for permission decisions — set by the daemon
+let permissionCallback: ((tool: string, input: Record<string, unknown>) => Promise<{ decision: "allow" | "deny" }>) | null = null;
+
+export function setPermissionCallback(cb: typeof permissionCallback): void {
+  permissionCallback = cb;
+}
 
 // ─── Tool Execution ─────────────────────────────────────────────────────────
 
@@ -309,6 +330,17 @@ function execGrep(args: { pattern: string; path?: string; include?: string }): T
   }
 }
 
+async function execPermissionPrompt(args: { tool_name: string; input?: Record<string, unknown> }): Promise<ToolResult> {
+  if (!permissionCallback) {
+    return { output: JSON.stringify({ behavior: "allow", updatedInput: args.input ?? {} }) };
+  }
+  const result = await permissionCallback(args.tool_name, args.input ?? {});
+  if (result.decision === "allow") {
+    return { output: JSON.stringify({ behavior: "allow", updatedInput: args.input ?? {} }) };
+  }
+  return { output: JSON.stringify({ behavior: "deny", message: "Permission denied by user" }) };
+}
+
 export async function executeTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
   switch (name) {
     case "read": return execRead(args as any);
@@ -317,6 +349,7 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
     case "bash": return execBash(args as any);
     case "glob": return execGlob(args as any);
     case "grep": return execGrep(args as any);
+    case "permission_prompt": return execPermissionPrompt(args as any);
     default: return { output: `Unknown tool: ${name}` };
   }
 }

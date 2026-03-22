@@ -169,20 +169,6 @@ class SubprocessPool {
       },
     });
 
-    // Hook config — PreToolUse hook for permission checking
-    const hookUrl = `${MCP_URL}/permission-check`;
-    const hooksSettings = JSON.stringify({
-      hooks: {
-        PreToolUse: [{
-          matcher: "mcp__clwnd__.*",
-          hooks: [{
-            type: "http",
-            url: hookUrl,
-          }],
-        }],
-      },
-    });
-
     const cmd = [
       this.cliPath, "-p",
       "--verbose",
@@ -190,16 +176,14 @@ class SubprocessPool {
       "--output-format", "stream-json",
       "--model", modelId,
       "--include-partial-messages",
-      "--permission-mode", process.env.CLWND_PERMISSION_MODE ?? "acceptEdits",
-      // Disable built-in tools — our MCP server replaces file/bash tools,
-      // and Claude CLI internal tools aren't available in OpenCode
+      // Default permission mode — Claude CLI calls our permission_prompt MCP
+      // tool for every permission decision instead of auto-approving
+      "--permission-mode", "default",
+      "--permission-prompt-tool", "mcp__clwnd__permission_prompt",
+      // Disable built-in tools — our MCP server replaces file/bash tools
       "--disallowedTools", "Read,Edit,Write,Bash,Glob,Grep,ToolSearch,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree",
-      // Auto-approve our MCP tools
-      "--allowedTools", "mcp__clwnd__read,mcp__clwnd__edit,mcp__clwnd__write,mcp__clwnd__bash,mcp__clwnd__glob,mcp__clwnd__grep",
       // Register our MCP server
       "--mcp-config", mcpConfig,
-      // PreToolUse hook for OC permission gating
-      "--settings", hooksSettings,
     ];
     // System prompt set once at spawn — persistent process keeps it
     if (systemPrompt) {
@@ -309,6 +293,77 @@ class SubprocessPool {
     if (!handler) return;
 
     const emit = (type: string, data: Record<string, unknown>) => handler!.onChunk(type, data);
+
+    // Handle permission requests from Claude CLI's native permission protocol
+    if (m.type === "permission_request") {
+      const requestId = m.request_id as string;
+      const toolName = ((m.tool_name ?? "") as string).replace("mcp__clwnd__", "");
+      const path = ((m.input as Record<string, unknown>)?.file_path ?? (m.input as Record<string, unknown>)?.path) as string | undefined;
+      const action = getPermissionAction(toolName, path);
+      trace("permission.stdin", { requestId, tool: toolName, path, action });
+
+      if (action === "deny") {
+        // Deny immediately
+        entry.proc.stdin?.write(JSON.stringify({
+          type: "permission_response",
+          request_id: requestId,
+          subtype: "error",
+          error: "Denied by session permission rules",
+        }) + "\n");
+      } else if (action === "ask") {
+        // Store as pending — resolved via /permission-respond endpoint
+        const askId = requestId;
+        trace("permission.ask.hold", { id: askId, tool: toolName, path });
+
+        // Notify plugin to show toast
+        askPlugin("permission-ask", {
+          id: askId, sessionId: entry.activeSession ?? "",
+          tool: toolName, path, input: m.input ?? {},
+        }).catch(() => {});
+
+        pendingAsk.set(askId, {
+          resolve: (decision) => {
+            if (decision === "allow") {
+              entry.proc.stdin?.write(JSON.stringify({
+                type: "permission_response",
+                request_id: requestId,
+                subtype: "success",
+                response: { updated_input: {}, permission_updates: [] },
+              }) + "\n");
+            } else {
+              entry.proc.stdin?.write(JSON.stringify({
+                type: "permission_response",
+                request_id: requestId,
+                subtype: "error",
+                error: "Denied by user",
+              }) + "\n");
+            }
+          },
+          tool: toolName,
+          path,
+          sessionId: entry.activeSession ?? "",
+        });
+
+        // Timeout after 5 min
+        setTimeout(() => {
+          if (pendingAsk.has(askId)) {
+            const p = pendingAsk.get(askId)!;
+            pendingAsk.delete(askId);
+            p.resolve("deny");
+            trace("permission.ask.timeout", { id: askId });
+          }
+        }, 300_000);
+      } else {
+        // Allow
+        entry.proc.stdin?.write(JSON.stringify({
+          type: "permission_response",
+          request_id: requestId,
+          subtype: "success",
+          response: { updated_input: {}, permission_updates: [] },
+        }) + "\n");
+      }
+      return;
+    }
 
     if (m.type === "content_block_start") {
       const block = (m.content_block ?? {}) as Record<string, unknown>;
@@ -923,7 +978,7 @@ Bun.serve({
 
 // ─── MCP HTTP Server (persistent, no cold start) ────────────────────────────
 
-import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms, setAllowedTools as mcpSetAllowed } from "../mcp/tools.ts";
+import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms, setAllowedTools as mcpSetAllowed, setPermissionCallback } from "../mcp/tools.ts";
 
 const MCP_PORT = parseInt(process.env.CLWND_MCP_PORT ?? "0") || 0;
 
@@ -1047,6 +1102,41 @@ const mcpServer = Bun.serve({
 
 const MCP_URL = `http://${MCP_HOST}:${mcpServer.port}`;
 mcpSetCwd(process.env.CLWND_CWD ?? process.env.HOME ?? "/");
+
+// Wire permission prompt MCP tool to daemon's permission logic
+setPermissionCallback(async (toolName: string, input: Record<string, unknown>) => {
+  const tool = toolName.replace("mcp__clwnd__", "");
+  const path = (input?.file_path ?? input?.path ?? input?.pattern) as string | undefined;
+  const action = getPermissionAction(tool, path);
+  trace("permission.mcp", { tool, path, action });
+
+  if (action === "allow") return { decision: "allow" as const };
+  if (action === "deny") return { decision: "deny" as const };
+
+  // "ask" — hold until user responds via /permission-respond
+  const askId = randomUUID();
+  trace("permission.ask.hold", { id: askId, tool, path });
+
+  // Notify plugin to show toast
+  askPlugin("permission-ask", {
+    id: askId, sessionId: "", tool, path, input,
+  }).catch(() => {});
+
+  return new Promise<{ decision: "allow" | "deny" }>((resolve) => {
+    pendingAsk.set(askId, {
+      resolve: (decision) => resolve({ decision }),
+      tool, path, sessionId: "",
+    });
+
+    setTimeout(() => {
+      if (pendingAsk.has(askId)) {
+        pendingAsk.delete(askId);
+        trace("permission.ask.timeout", { id: askId });
+        resolve({ decision: "deny" });
+      }
+    }, 300_000);
+  });
+});
 
 // ─── Auto-update ─────────────────────────────────────────────────────────────
 
