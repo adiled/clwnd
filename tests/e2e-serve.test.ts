@@ -346,3 +346,73 @@ describe("e2e-serve: tool rendering metadata", () => {
   }, TIMEOUT);
 
 });
+
+// ─── Not Yet Supported ──────────────────────────────────────────────────────
+// Skipped tests serve as a categorical index of features yet to be implemented.
+// Each describes what should work once the feature lands.
+
+describe("e2e-serve: compaction", () => {
+  test.skip("session compaction preserves conversation context (not yet supported)", () => {
+    // OC compaction and CC context management may conflict.
+    // Need to decide: let OC compact (via small_model), forward compacted
+    // context to CC, or let CC handle its own compaction independently.
+  });
+});
+
+describe("e2e-serve: snapshots and revert", () => {
+  test.skip("file changes via MCP are tracked by OC snapshots (not yet supported)", () => {
+    // MCP file writes bypass OC's file watcher. Snapshots may not capture
+    // changes made through the clwnd MCP server.
+  });
+
+  test.skip("revert restores files changed via MCP (not yet supported)", () => {
+    // Depends on snapshot tracking. If snapshots don't see MCP writes,
+    // revert won't know what to undo.
+  });
+});
+
+describe("e2e-serve: model variants", () => {
+  test.skip("reasoning effort variant is forwarded to Claude CLI (not yet supported)", () => {
+    // OC sends variant (e.g., high/low reasoning effort) in the message.
+    // Currently not forwarded — Claude CLI always uses default effort.
+  });
+});
+
+describe("e2e-serve: file attachments", () => {
+  test.skip("file attachments in messages are forwarded to Claude (not yet supported)", () => {
+    // OC supports file attachments in user messages. extractText() currently
+    // ignores non-text parts — attachments are silently dropped.
+  });
+});
+
+describe("e2e-serve: session forking", () => {
+  test.skip("forked session creates independent conversation branch (not yet supported)", () => {
+    // OC supports session forking. The daemon's session map is unaware of
+    // fork relationships — a forked session would start fresh in Claude CLI
+    // instead of branching from the parent's context.
+  });
+});
+
+describe("e2e-serve: cost tracking", () => {
+  test.skip("message cost reflects subscription pricing (not yet supported — partial)", () => {
+    // Tokens are forwarded but cost is always 0 because Claude CLI
+    // subscription has no per-token pricing. OC shows $0.00 for all messages.
+  });
+});
+
+describe("e2e-serve: tool pass-through", () => {
+  test.skip("TodoRead returns current todo state (not yet supported)", () => {
+    // TodoRead is a Claude CLI built-in that reads its own todo list.
+    // Not brokered or mapped — Claude sees its own todos, not OC's.
+  });
+
+  test.skip("Task/Skill tool calls render in OC UI (display only — partial)", () => {
+    // Task and Skill are mapped for display but not executed by OC.
+    // They show as tool calls in the UI but have no OC-side effect.
+  });
+
+  test.skip("Cron tools have OC equivalent (not yet supported — no OC equivalent)", () => {
+    // CronCreate/Delete/List are Claude CLI built-ins with no OC counterpart.
+    // Calls pass through to Claude but results aren't surfaced in OC.
+  });
+});
