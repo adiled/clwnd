@@ -22,6 +22,7 @@
     "test": "bun test tests/",
     "test:smoke": "bun test tests/smoke.test.ts",
     "test:e2e": "bun test tests/e2e.test.ts",
+    "test:e2e-serve": "bun test tests/e2e-serve.test.ts",
     "typecheck": "tsc --noEmit",
     "version:patch": "bun run scripts/version.sh patch",
     "version:minor": "bun run scripts/version.sh minor",
