@@ -184,18 +184,28 @@ const OC_TO_MCP: Record<string, string> = {
   glob: "glob", grep: "grep", apply_patch: "edit", webfetch: "webfetch",
 };
 
-function deriveAllowedTools(opts: { tools?: Array<{ name: string }> | unknown }): string[] {
-  if (!Array.isArray(opts.tools)) {
-    trace("deriveAllowedTools", { result: "all (no tools in opts)" });
-    return ["read", "edit", "write", "bash", "glob", "grep"];
+const lastAllowedTools = new Map<string, string>();
+
+// Agent-based tool restrictions
+const AGENT_DENY: Record<string, Set<string>> = {
+  plan: new Set(["edit", "write"]),
+};
+
+function deriveAllowedTools(sid: string, opts: { tools?: Array<{ name: string }> | unknown, headers?: Record<string, string | undefined> }): string[] {
+  const agent = opts.headers?.["x-clwnd-agent"] ?? "";
+  let agentName = agent;
+  try { const p = JSON.parse(agent); if (p?.name) agentName = p.name; } catch {}
+
+  const denied = AGENT_DENY[agentName] ?? new Set();
+  const all = ["read", "edit", "write", "bash", "glob", "grep", "webfetch"];
+  const result = all.filter(t => !denied.has(t));
+
+  const key = result.join(",");
+  const prev = lastAllowedTools.get(sid);
+  if (prev !== key) {
+    trace("allowedTools.changed", { sid, agent: agentName, old: prev ?? "none", new: key });
+    lastAllowedTools.set(sid, key);
   }
-  const ocTools = new Set((opts.tools as Array<{ name: string }>).map(t => t.name));
-  const allowed: string[] = [];
-  for (const [ocName, mcpName] of Object.entries(OC_TO_MCP)) {
-    if (ocTools.has(ocName)) allowed.push(mcpName);
-  }
-  const result = [...new Set(allowed)];
-  trace("deriveAllowedTools", { ocTools: [...ocTools].join(","), allowed: result.join(",") });
   return result;
 }
 
@@ -234,37 +244,42 @@ function extractSystemPrompt(prompt: LanguageModelV2Prompt): string {
   return parts.join("\n\n");
 }
 
-// Track agent changes per session by querying the latest message
+// Track agent per session via x-clwnd-agent header (injected by chat.headers hook)
 const sessionLastAgent = new Map<string, string>();
 
-async function detectAgentChange(client: any, sid: string): Promise<string | null> {
-  if (!client) return null;
+function detectAgent(sid: string, headers?: Record<string, string | undefined>): string | null {
+  const raw = headers?.["x-clwnd-agent"] ?? null;
+  if (!raw) return null;
+  // Parse agent name — could be string or JSON object
+  let agent = raw;
   try {
-    const resp = await client.session.messages({ path: { sessionID: sid } });
-    const messages = resp.data ?? [];
-    // Find the latest user message — it has the current agent
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg.role === "user" && msg.agent) {
-        const prev = sessionLastAgent.get(sid);
-        const current = msg.agent;
-        if (prev && prev !== current) {
-          trace("agent.changed", { sid, old: prev, new: current });
-        }
-        sessionLastAgent.set(sid, current);
-        return current;
-      }
-    }
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === "object" && parsed.name) agent = parsed.name;
   } catch {}
-  return null;
+  const prev = sessionLastAgent.get(sid);
+  if (prev && prev !== agent) {
+    trace("agent.changed", { sid, old: prev, new: agent });
+  }
+  sessionLastAgent.set(sid, agent);
+  trace("agent.current", { sid, agent });
+  return agent;
 }
 
 // Fetch session permission rules from OpenCode
+const lastPermissions = new Map<string, string>();
+
 async function getSessionPermissions(client: any, sessionId: string): Promise<Array<{ permission: string; pattern: string; action: string }>> {
   if (!client) return [];
   try {
     const resp = await client.session.get({ path: { sessionID: sessionId } });
-    return resp.data?.permission ?? [];
+    const perms = resp.data?.permission ?? [];
+    const key = JSON.stringify(perms);
+    const prev = lastPermissions.get(sessionId);
+    if (prev !== key) {
+      trace("permissions.changed", { sid: sessionId, count: perms.length });
+      lastPermissions.set(sessionId, key);
+    }
+    return perms;
   } catch {
     return [];
   }
@@ -317,11 +332,11 @@ export class ClwndModel implements LanguageModelV2 {
     const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
     const text = extractText(opts.prompt);
     const systemPrompt = extractSystemPrompt(opts.prompt);
-    if (!isTitle) await detectAgentChange(this.config.client, sid);
+    if (!isTitle) detectAgent(sid, opts.headers);
     const warnings: LanguageModelV2CallWarning[] = [];
     const cwd = this.config.cwd ?? process.cwd();
     const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
-    const allowedTools = isTitle ? [] : deriveAllowedTools(opts);
+    const allowedTools = isTitle ? [] : deriveAllowedTools(sid, opts);
 
     let reasoning = "";
     let responseText = "";
@@ -446,13 +461,13 @@ export class ClwndModel implements LanguageModelV2 {
     const sid = isTitle ? `title-${generateId()}` : (opts.headers?.["x-opencode-session"] ?? generateId());
     const text = extractText(opts.prompt);
     const systemPrompt = extractSystemPrompt(opts.prompt);
-    if (!isTitle) await detectAgentChange(this.config.client, sid);
+    if (!isTitle) detectAgent(sid, opts.headers);
     const warnings: LanguageModelV2CallWarning[] = [];
     const cwd = this.config.cwd ?? process.cwd();
     const self = this;
     const toolInputAccum = new Map<string, string>();
     const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
-    const allowedTools = isTitle ? [] : deriveAllowedTools(opts);
+    const allowedTools = isTitle ? [] : deriveAllowedTools(sid, opts);
 
     // Brokered tool return — OpenCode executed the tool, sending result back.
     // Claude already responded in the previous turn. Finish immediately.
