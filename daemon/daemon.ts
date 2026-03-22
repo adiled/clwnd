@@ -97,7 +97,7 @@ class SubprocessPool {
     if (!entry) {
       entry = this.spawnProc(poolKey, modelId, claudeSessionId, permissions, systemPrompt, allowedTools);
     } else {
-      // Persistent process: update permissions for this turn
+      // Persistent process: update per-turn state
       mcpSetPerms((permissions ?? []) as any);
       mcpSetAllowed(allowedTools);
     }
@@ -651,6 +651,9 @@ Bun.serve({
         const permissions = (body.permissions ?? []) as unknown[];
         const systemPrompt = (body.systemPrompt as string) || undefined;
         const allowedTools = (body.allowedTools as string[]) || undefined;
+
+        // Update MCP server CWD per-turn (may change via opencode-dir /cd)
+        if (cwd) mcpSetCwd(cwd as string);
 
         // Wait for any in-flight request on this session to finish
         const prev = sessionLocks.get(opencodeSessionId);

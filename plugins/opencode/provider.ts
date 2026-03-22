@@ -265,6 +265,17 @@ function detectAgent(sid: string, headers?: Record<string, string | undefined>):
   return agent;
 }
 
+// Fetch session directory from OpenCode (may change via opencode-dir /cd)
+async function getSessionDirectory(client: any, sessionId: string): Promise<string | null> {
+  if (!client) return null;
+  try {
+    const resp = await client.session.get({ path: { sessionID: sessionId } });
+    return resp.data?.directory ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // Fetch session permission rules from OpenCode
 const lastPermissions = new Map<string, string>();
 
@@ -334,7 +345,7 @@ export class ClwndModel implements LanguageModelV2 {
     const systemPrompt = extractSystemPrompt(opts.prompt);
     if (!isTitle) detectAgent(sid, opts.headers);
     const warnings: LanguageModelV2CallWarning[] = [];
-    const cwd = this.config.cwd ?? process.cwd();
+    const cwd = (!isTitle && this.config.client ? await getSessionDirectory(this.config.client, sid) : null) ?? this.config.cwd ?? process.cwd();
     const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
     const allowedTools = isTitle ? [] : deriveAllowedTools(sid, opts);
 
@@ -463,7 +474,7 @@ export class ClwndModel implements LanguageModelV2 {
     const systemPrompt = extractSystemPrompt(opts.prompt);
     if (!isTitle) detectAgent(sid, opts.headers);
     const warnings: LanguageModelV2CallWarning[] = [];
-    const cwd = this.config.cwd ?? process.cwd();
+    const cwd = (!isTitle && this.config.client ? await getSessionDirectory(this.config.client, sid) : null) ?? this.config.cwd ?? process.cwd();
     const self = this;
     const toolInputAccum = new Map<string, string>();
     const permissions = isTitle ? [] : await getSessionPermissions(this.config.client, sid);
