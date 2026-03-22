@@ -1,5 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin";
-import { createClwnd, trace } from "./provider.ts";
+import { createClwnd, setSharedClient, trace } from "./provider.ts";
 
 const SOCK_PATH = (process.env.CLWND_SOCKET ??
   (process.env.XDG_RUNTIME_DIR ? `${process.env.XDG_RUNTIME_DIR}/clwnd/clwnd.sock` : "/tmp/clwnd/clwnd.sock")) + ".http";
@@ -112,6 +112,7 @@ function registerPermissionHandler(): void {
 // ─── Plugin ────────────────────────────────────────────────────────────────
 
 export const clwndPlugin: Plugin = async (input) => {
+  setSharedClient(input.client);
   const provider = createClwnd({ client: input.client, pluginInput: input });
 
   // Start the daemon ↔ plugin channel

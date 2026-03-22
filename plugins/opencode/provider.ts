@@ -334,7 +334,7 @@ async function getSessionDirectory(client: any, sessionId: string): Promise<stri
 const agentPermissionCache = new Map<string, Array<{ permission: string; pattern: string; action: string }>>();
 
 async function getSessionPermissions(client: any, sessionId: string): Promise<Array<{ permission: string; pattern: string; action: string }>> {
-  if (!client) return [];
+  if (!client) { trace("permissions.no-client"); return []; }
   const agentName = sessionLastAgent.get(sessionId) ?? "build";
 
   // Check cache first
@@ -342,15 +342,17 @@ async function getSessionPermissions(client: any, sessionId: string): Promise<Ar
 
   try {
     // Fetch all agents and find the matching one
+    trace("permissions.fetching", { agent: agentName, hasApp: !!client.app, hasAgents: !!client.app?.agents });
     const resp = await client.app.agents();
+    trace("permissions.fetched", { agent: agentName, hasData: !!resp.data });
     const agents = resp.data ?? [];
     const agent = agents.find((a: any) => a.name === agentName);
     const perms = agent?.permission ?? [];
     agentPermissionCache.set(agentName, perms);
     trace("permissions.loaded", { agent: agentName, count: perms.length });
     return perms;
-  } catch (e) {
-    trace("permissions.error", { agent: agentName, err: String(e) });
+  } catch (e: any) {
+    trace("permissions.error", { agent: agentName, err: e?.message ?? String(e) });
     return [];
   }
 }
@@ -795,7 +797,13 @@ export class ClwndModel implements LanguageModelV2 {
   }
 }
 
+// Shared client — set by the plugin on init, used as fallback when the
+// provider loader calls createClwnd() without args.
+let sharedClient: any = null;
+export function setSharedClient(client: any): void { sharedClient = client; }
+
 export function createClwnd(config: ClwndConfig = {}) {
+  if (!config.client && sharedClient) config = { ...config, client: sharedClient };
   const fn = (modelId: string): LanguageModelV2 => new ClwndModel(modelId, config);
   fn.languageModel = (modelId: string) => new ClwndModel(modelId, config);
   return fn;
