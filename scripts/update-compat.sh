@@ -97,21 +97,28 @@ ${OC_TUI_COMMANDS}
 Given the test suite output below, generate the issue body with these exact sections:
 
 ### Section 1: "## Tool Calls"
-A table with columns: Tool | Claude CLI | MCP | Brokered | OC Native UI | Test Coverage | Status
+Table with EXACTLY these columns in this order: Tool | CC | clwnd | Brokered | OC | Cov | Status
 
-For each tool:
-- **Status**: ✅ Working (if tests pass), ❌ Failing (if tests fail), ⚠️ Partial/Display only (if pass-through or limited), 🔇 Untested (if no test covers it)
-- **Test Coverage**: comma-separated list of suites where the tool was tested (e.g., "smoke, e2e-serve"), or "—" if none. Do NOT list individual test names here.
-- Use the tool architecture described above to fill Claude CLI, MCP, Brokered, OC Native UI columns
+Column rules:
+- **Tool**: tool name
+- **CC**: Claude CLI side — "Disallowed" for MCP tools, "Built-in" for pass-through/brokered tools
+- **clwnd**: ✓ if handled by clwnd MCP, — if not
+- **Brokered**: ✓ if brokered (both sides execute), — if not
+- **OC**: ✓ if renders natively in OpenCode UI, — if not
+- **Cov**: comma-separated suite names, or — if none
+- **Status**: ✅ Working, ❌ Failing, ⚠️ Partial, 🔇 Untested
 
 Tools to include: Read, Edit, Write, Bash, Glob, Grep, WebFetch, WebSearch, TodoWrite, Task, Skill, TodoRead, TaskOutput/TaskStop, CronCreate/Delete/List
 
 ### Section 2: "## OpenCode Feature Compatibility"
-One table with columns: Feature | OC Feature | CC Equivalent | Status | Test Coverage
-- **OC Feature**: The actual OpenCode feature/command/config name (e.g., \`session compact\`, \`--fork\`, \`small_model\`, \`--agent\`)
-- **CC Equivalent**: The actual Claude Code CLI equivalent flag, command, or feature name (e.g., \`--effort\`, \`--fork-session\`, \`--resume\`, \`--agent\`). Use the CLI reference above to find exact names. If there is genuinely no CC equivalent, write "—".
-- **Status**: ✅ Working (tests pass), ❌ Not working (tests fail), ⚠️ Partial, 🔇 Untested
-- **Test Coverage**: comma-separated list of suites where the feature was tested (e.g., "smoke, e2e-serve"), or "—" if none. Do NOT list individual test names.
+Table with EXACTLY these columns in this order: Feature | OC | CC | Cov | Status
+
+Column rules:
+- **Feature**: feature name
+- **OC**: The actual OpenCode feature/command/config name (e.g., \`session compact\`, \`--fork\`, \`small_model\`). Use the CLI and TUI command references above.
+- **CC**: The actual Claude Code CLI equivalent flag or command (e.g., \`--effort\`, \`--fork-session\`, \`--resume\`). Use the CLI reference above. — if no equivalent.
+- **Cov**: comma-separated suite names, or — if none
+- **Status**: ✅ Working, ❌ Failing, ⚠️ Partial, 🔇 Untested
 
 Features to include: Agent switching, Plan mode, Permissions (session), Permissions (agent), System prompt, Session continuity, CWD/directory, Compaction, Snapshots/Revert, Model variants, File attachments, Cost tracking, Session forking, Title generation
 
