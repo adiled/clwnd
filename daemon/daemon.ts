@@ -849,6 +849,10 @@ Bun.serve({
           },
           cancel() {
             closed = true;
+            // Kill the process — it's mid-turn with an unfinished tool call.
+            // Next turn will spawn fresh. Without this, the process stays in
+            // a bad state waiting for a tool result that will never come.
+            pool.destroy(opencodeSessionId, poolKey);
             releaseLock!();
           },
         });
