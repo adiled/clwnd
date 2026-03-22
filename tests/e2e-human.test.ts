@@ -39,8 +39,8 @@ describe("e2e-human: working features (manual verification)", () => {
   });
 });
 
-describe("e2e-human: not yet supported (manual verification)", () => {
-  test.skip("question tool shows interactive dialog and Claude uses the answer (not yet supported)", () => {
+describe("e2e-human: requires TUI interaction (blocked)", () => {
+  test.skip("question tool shows interactive dialog and Claude uses the answer", () => {
     // 1. Ask: "Ask me what language I prefer for a new project"
     // 2. Verify: A question dialog appears
     // 3. Type an answer
@@ -48,31 +48,10 @@ describe("e2e-human: not yet supported (manual verification)", () => {
     // BLOCKED: AI SDK stream lifecycle prevents brokering the question tool.
   });
 
-  test.skip("compaction shrinks context without losing coherence (not yet supported)", () => {
-    // 1. Have a long conversation (20+ turns)
-    // 2. Trigger compaction via /compact
-    // 3. Verify: Conversation is summarized, Claude still remembers key facts
-    // ISSUE: OC compaction and CC context management may conflict.
-  });
-
-  test.skip("snapshot revert restores MCP-edited files (not yet supported)", () => {
-    // 1. Ask Claude to edit a file
-    // 2. Use OC revert to undo
-    // 3. Verify: File is restored to pre-edit state
-    // ISSUE: MCP writes may not be tracked by OC snapshots.
-  });
-
-  test.skip("file attachments are visible to Claude (not yet supported)", () => {
-    // 1. Attach an image or file via OC
+  test.skip("file attachments are visible to Claude", () => {
+    // 1. Attach an image or file via OC TUI
     // 2. Ask Claude to describe it
     // 3. Verify: Claude sees and describes the attachment
-    // ISSUE: extractText() drops non-text message parts.
-  });
-
-  test.skip("cost display reflects subscription usage (not yet supported — partial)", () => {
-    // 1. Send several messages
-    // 2. Check OC stats
-    // 3. Verify: Cost shows meaningful values, not $0.00
-    // ISSUE: Subscription has no per-token pricing; cost is always 0.
+    // NOTE: Can't attach files via serve API — requires TUI drag/drop or paste.
   });
 });

@@ -160,25 +160,18 @@ for (const MODEL of MODELS) {
   });
 }
 
-// ─── Not Yet Supported ──────────────────────────────────────────────────────
+// ─── Optimistic Feature Tests ────────────────────────────────────────────────
+// These test features we haven't explicitly handled. If they pass, great —
+// OC handles them without us needing to do anything. If they fail, that's
+// the signal we need to act.
 
-describe("e2e: model variants", () => {
-  test.skip("reasoning effort variant changes Claude behavior (not yet supported)", () => {
-    // OC passes variant (high/low effort) per message. Not forwarded to
-    // Claude CLI — always uses default. Would need --effort flag or similar.
-  });
-});
-
-describe("e2e: file attachments", () => {
-  test.skip("image attachment is forwarded and described by Claude (not yet supported)", () => {
-    // OC supports image/file attachments. extractText() drops non-text parts.
-    // Would need to base64-encode and include in the stream-json input.
-  });
-});
-
-describe("e2e: session forking", () => {
-  test.skip("forked session retains parent context (not yet supported)", () => {
-    // opencode run -s <parent> --fork should branch. Daemon session map
-    // doesn't track fork relationships.
-  });
+describe("e2e: token reporting", () => {
+  test("response events include token counts", async () => {
+    const events = await ocRun(["-m", MODELS[0], "--format", "json", "Say hi"]);
+    const sid = extractSessionId(events);
+    if (sid) createdSessionIds.push(sid);
+    const finish = events.find(e => e.type === "step_finish");
+    expect(finish?.part?.tokens).toBeDefined();
+    expect(finish!.part!.tokens!.input + finish!.part!.tokens!.output).toBeGreaterThan(0);
+  }, TIMEOUT);
 });

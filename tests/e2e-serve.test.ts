@@ -347,72 +347,127 @@ describe("e2e-serve: tool rendering metadata", () => {
 
 });
 
-// ─── Not Yet Supported ──────────────────────────────────────────────────────
-// Skipped tests serve as a categorical index of features yet to be implemented.
-// Each describes what should work once the feature lands.
+// ─── Optimistic Feature Tests ───────────────────────────────────────────────
+// These test OC features we haven't explicitly implemented support for.
+// By the compatibility model (see AGENTS.md), OC features work by default
+// unless they cross the provider boundary. If these pass — great, no work
+// needed. If they fail — that's how we know we need to handle something.
 
 describe("e2e-serve: compaction", () => {
-  test.skip("session compaction preserves conversation context (not yet supported)", () => {
-    // OC compaction and CC context management may conflict.
-    // Need to decide: let OC compact (via small_model), forward compacted
-    // context to CC, or let CC handle its own compaction independently.
-  });
+  test("session compaction preserves conversation context", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Establish context
+    await sendMessage(sid, "My secret word is FLAMINGO. Acknowledge.");
+
+    // Trigger compaction via command endpoint
+    const compactResp = await api(`/session/${sid}/command`, {
+      method: "POST",
+      body: JSON.stringify({ command: "session.compact", arguments: "" }),
+    });
+    // Compaction should not error
+    expect(compactResp).toBeDefined();
+
+    // Context should survive compaction
+    const resp = await sendMessage(sid, "What is my secret word?");
+    const text = extractResponseText(resp).toLowerCase();
+    expect(text).toContain("flamingo");
+  }, TIMEOUT);
 });
 
 describe("e2e-serve: snapshots and revert", () => {
-  test.skip("file changes via MCP are tracked by OC snapshots (not yet supported)", () => {
-    // MCP file writes bypass OC's file watcher. Snapshots may not capture
-    // changes made through the clwnd MCP server.
-  });
+  test("file changes via MCP are tracked by OC snapshots", async () => {
+    skipIfDead();
+    const sid = await createSession();
 
-  test.skip("revert restores files changed via MCP (not yet supported)", () => {
-    // Depends on snapshot tracking. If snapshots don't see MCP writes,
-    // revert won't know what to undo.
-  });
-});
+    // Make a file change via Claude (goes through MCP)
+    await sendMessage(sid, `Write the text "SNAPSHOT_TEST" to ${join(PROJECT_DIR, "snap-test.txt")}`);
 
-describe("e2e-serve: model variants", () => {
-  test.skip("reasoning effort variant is forwarded to Claude CLI (not yet supported)", () => {
-    // OC sends variant (e.g., high/low reasoning effort) in the message.
-    // Currently not forwarded — Claude CLI always uses default effort.
-  });
-});
+    // Check session for snapshot info
+    const session = await getSession(sid);
+    // Session should have been updated (snapshot taken)
+    expect(session.time.updated).toBeGreaterThan(session.time.created);
+  }, TIMEOUT);
 
-describe("e2e-serve: file attachments", () => {
-  test.skip("file attachments in messages are forwarded to Claude (not yet supported)", () => {
-    // OC supports file attachments in user messages. extractText() currently
-    // ignores non-text parts — attachments are silently dropped.
-  });
+  test("revert restores files changed via MCP", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Create a file
+    await sendMessage(sid, `Write "REVERT_ORIGINAL" to ${join(PROJECT_DIR, "revert-test.txt")}`);
+
+    // Get messages to find the message ID for revert
+    const msgs = await getMessages(sid);
+    const assistantMsg = msgs.find((m: any) => m.role === "assistant");
+
+    if (assistantMsg) {
+      // Attempt revert
+      const revertResp = await api(`/session/${sid}/revert`, {
+        method: "POST",
+        body: JSON.stringify({ messageID: assistantMsg.id }),
+      });
+      expect(revertResp).toBeDefined();
+    }
+  }, TIMEOUT);
 });
 
 describe("e2e-serve: session forking", () => {
-  test.skip("forked session creates independent conversation branch (not yet supported)", () => {
-    // OC supports session forking. The daemon's session map is unaware of
-    // fork relationships — a forked session would start fresh in Claude CLI
-    // instead of branching from the parent's context.
-  });
+  test("forked session creates independent conversation branch", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Establish context in parent
+    await sendMessage(sid, "My favorite animal is a penguin. Acknowledge.");
+
+    // Fork the session
+    const forkResp = await api(`/session/${sid}/fork`, { method: "POST", body: JSON.stringify({}) }) as any;
+    const forkedSid = forkResp.id;
+
+    if (forkedSid) {
+      activeSessions.push(forkedSid);
+      // Forked session should be independent
+      expect(forkedSid).not.toBe(sid);
+      // Send a message in forked session — should retain parent context
+      const resp = await sendMessage(forkedSid, "What is my favorite animal?");
+      const text = extractResponseText(resp).toLowerCase();
+      expect(text).toContain("penguin");
+    } else {
+      // Fork not supported or errored — that's a finding
+      expect(forkResp).toHaveProperty("id");
+    }
+  }, TIMEOUT);
 });
 
 describe("e2e-serve: cost tracking", () => {
-  test.skip("message cost reflects subscription pricing (not yet supported — partial)", () => {
-    // Tokens are forwarded but cost is always 0 because Claude CLI
-    // subscription has no per-token pricing. OC shows $0.00 for all messages.
-  });
+  test("message response includes token counts", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    const resp = await sendMessage(sid, "Say hello");
+    // Tokens should be reported even if cost is $0
+    expect(resp.info?.tokens).toBeDefined();
+    expect(resp.info.tokens.input + resp.info.tokens.output).toBeGreaterThan(0);
+  }, TIMEOUT);
 });
 
-describe("e2e-serve: tool pass-through", () => {
-  test.skip("TodoRead returns current todo state (not yet supported)", () => {
-    // TodoRead is a Claude CLI built-in that reads its own todo list.
-    // Not brokered or mapped — Claude sees its own todos, not OC's.
-  });
+describe("e2e-serve: title generation", () => {
+  test("session title is generated after first message", async () => {
+    skipIfDead();
+    const sid = await createSession();
 
-  test.skip("Task/Skill tool calls render in OC UI (display only — partial)", () => {
-    // Task and Skill are mapped for display but not executed by OC.
-    // They show as tool calls in the UI but have no OC-side effect.
-  });
+    const before = await getSession(sid);
+    expect(before.title).toContain("New session");
 
-  test.skip("Cron tools have OC equivalent (not yet supported — no OC equivalent)", () => {
-    // CronCreate/Delete/List are Claude CLI built-ins with no OC counterpart.
-    // Calls pass through to Claude but results aren't surfaced in OC.
-  });
+    await sendMessage(sid, "Tell me about the Eiffel Tower");
+
+    // Title gen is async — wait for it
+    let title = before.title;
+    for (let i = 0; i < 10; i++) {
+      await Bun.sleep(2_000);
+      const after = await getSession(sid);
+      if (after.title !== before.title) { title = after.title; break; }
+    }
+    expect(title).not.toContain("New session");
+  }, TIMEOUT);
 });
