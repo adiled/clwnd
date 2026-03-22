@@ -23,7 +23,10 @@ run_as_clwnd() {
 
 CLAUDE_HELP=$(run_as_clwnd "claude --help 2>&1")
 OPENCODE_HELP=$(run_as_clwnd "opencode --help 2>&1 | cat")
-OC_CONFIG_SCHEMA=$(curl -s https://opencode.ai/config.json 2>/dev/null || echo "{}")
+
+# Extract built-in TUI commands from the SDK types
+OC_SDK_TYPES="$CLWND_SRC/node_modules/@opencode-ai/sdk/dist/gen/types.gen.d.ts"
+OC_TUI_COMMANDS=$(grep 'session\.list.*session\.new' "$OC_SDK_TYPES" 2>/dev/null | grep -oP '"[a-z]+\.[a-z._]+"' | tr -d '"' | sort -u | paste -sd, - || echo "unavailable")
 
 # ─── Capture versions ────────────────────────────────────────────────────────
 
@@ -85,11 +88,9 @@ ${OPENCODE_HELP}
 ${CLAUDE_HELP}
 \`\`\`
 
-## OpenCode config schema (live from https://opencode.ai/config.json)
+## OpenCode built-in TUI commands (live from SDK types)
 
-\`\`\`json
-${OC_CONFIG_SCHEMA}
-\`\`\`
+${OC_TUI_COMMANDS}
 
 ## Your task
 
@@ -121,7 +122,7 @@ Extract the duration from each test suite output (bun test prints it at the end,
 Then a "## Environment" section with a table: Component | Version — using the versions provided in the input.
 
 ### Section 4: "## Potentially Uncovered"
-Compare the OpenCode config schema fields, CLI commands/flags, and Claude Code CLI flags against what the test suites actually exercise. List any OpenCode or Claude Code features that exist in the references but have NO corresponding test coverage. Only list features that are user-facing and relevant to the provider bridge (skip purely cosmetic/UI config like themes, layout, keybindings). Format as a bullet list, one line per feature, with the source (e.g., "OC config: \`field_name\`" or "CC flag: \`--flag\`").
+Compare the OpenCode built-in TUI commands, OpenCode CLI flags, and Claude Code CLI flags against what the test suites actually exercise. List any commands or flags that exist in the references but have NO corresponding test coverage. Only list items relevant to the provider bridge — skip navigation (page up/down, first/last), UI (prompt.clear, prompt.submit), and purely cosmetic flags. Format as a bullet list, one line per item, with the source (e.g., "OC TUI: \`session.compact\`" or "CC flag: \`--effort\`").
 
 Then a line: \`Last updated: YYYY-MM-DD HH:MM UTC\` using the timestamp provided in the input.
 
