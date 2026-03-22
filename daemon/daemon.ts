@@ -369,9 +369,27 @@ class SubprocessPool {
   }
 }
 
-// ─── Plugin Callback (daemon → plugin reverse channel) ──────────────────────
+// ─── Daemon ↔ Plugin Channel ────────────────────────────────────────────────
+// Generic bidirectional communication. Plugin registers a callback URL.
+// Daemon sends typed messages and awaits responses.
 
 let pluginCallbackUrl: string | null = null;
+
+async function askPlugin<T = any>(type: string, payload: any, timeoutMs = 120_000): Promise<T> {
+  if (!pluginCallbackUrl) throw new Error("No plugin callback registered");
+  const id = randomUUID();
+  trace("channel.send", { type, id });
+  const resp = await fetch(pluginCallbackUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type, id, payload }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const body = await resp.json() as { id: string; result: T };
+  return body.result;
+}
+
+// ─── Permission State ───────────────────────────────────────────────────────
 
 // Permission rules stored per-session, forwarded from OC via the provider
 const sessionPermissions = new Map<string, Array<{ permission: string; pattern: string; action: string }>>();
@@ -913,25 +931,19 @@ const mcpServer = Bun.serve({
         if (action === "allow") return hookAllow();
         if (action === "deny") return hookDeny("Denied by session permission rules");
 
-        // "ask" — relay to plugin via callback, hold response until user answers
-        if (!pluginCallbackUrl) {
-          return hookDeny("Permission required but no plugin callback registered");
-        }
-
-        const resp = await fetch(pluginCallbackUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
+        // "ask" — relay to plugin, which triggers OC's permission UI
+        try {
+          const result = await askPlugin<{ decision: "allow" | "deny" }>("permission-ask", {
             id: randomUUID(),
             sessionId: ocSessionId ?? sessionId,
             tool: toolName,
             path,
             input: body.tool_input ?? {},
-          }),
-          signal: AbortSignal.timeout(120_000),
-        });
-        const result = await resp.json() as { decision: "allow" | "deny" };
-        return result.decision === "allow" ? hookAllow() : hookDeny("Denied by user");
+          });
+          return result.decision === "allow" ? hookAllow() : hookDeny("Denied by user");
+        } catch {
+          return hookDeny("Permission check unavailable");
+        }
       } catch (e) {
         trace("permission.hook.error", { err: String(e) });
         return Response.json({

@@ -4,68 +4,60 @@ import { createClwnd, trace } from "./provider.ts";
 const SOCK_PATH = (process.env.CLWND_SOCKET ??
   (process.env.XDG_RUNTIME_DIR ? `${process.env.XDG_RUNTIME_DIR}/clwnd/clwnd.sock` : "/tmp/clwnd/clwnd.sock")) + ".http";
 
-/**
- * Start a callback server so the daemon can reach us for permission asks.
- * Returns the callback URL. The daemon will POST permission requests here.
- */
-async function startCallbackServer(client: any): Promise<string> {
+// ─── Daemon ↔ Plugin Channel ───────────────────────────────────────────────
+// Generic bidirectional communication. The daemon POSTs typed messages to the
+// plugin's callback server. Handlers are registered per message type.
+// Used for: permission asks, question tool, and any future interactive flow.
+
+type ChannelHandler = (payload: any) => Promise<any>;
+const channelHandlers = new Map<string, ChannelHandler>();
+
+function onDaemonMessage(type: string, handler: ChannelHandler): void {
+  channelHandlers.set(type, handler);
+}
+
+// Pending requests waiting for async resolution (e.g., user interaction)
+const pendingRequests = new Map<string, {
+  resolve: (result: any) => void;
+  type: string;
+  payload: any;
+}>();
+
+function resolvePending(id: string, result: any): boolean {
+  const entry = pendingRequests.get(id);
+  if (!entry) return false;
+  pendingRequests.delete(id);
+  entry.resolve(result);
+  return true;
+}
+
+async function startCallbackServer(): Promise<string> {
   const server = Bun.serve({
-    port: 0, // random available port
+    port: 0,
     hostname: "127.0.0.1",
     async fetch(req) {
       if (req.method !== "POST") return new Response("", { status: 405 });
       try {
-        const body = await req.json() as {
-          id: string;
-          sessionId: string;
-          tool: string;
-          path?: string;
-          input: Record<string, unknown>;
-        };
-        trace("permission.ask.received", { id: body.id, tool: body.tool, path: body.path });
+        const body = await req.json() as { type: string; id: string; payload: any };
+        trace("channel.recv", { type: body.type, id: body.id });
 
-        // Use OC's permission.ask mechanism — we emit a permission event
-        // and wait for the user's response via the session permissions API
-        let decision: "allow" | "deny" = "deny";
-        try {
-          // Create a permission request in OC by calling the session API
-          // OC's TUI will show the permission prompt
-          const permId = body.id;
-          // We need to trigger OC's permission flow. The client doesn't have
-          // a "create permission" API — permissions are created internally.
-          // Instead, we use the permission.ask hook output to control decisions.
-          // For now, store the pending request and let the permission.ask hook handle it.
-          pendingPermissions.set(permId, {
-            resolve: null as any,
-            body,
-          });
-
-          decision = await new Promise<"allow" | "deny">((resolve) => {
-            const entry = pendingPermissions.get(permId)!;
-            entry.resolve = resolve;
-
-            // Timeout after 120s — default to deny
-            setTimeout(() => {
-              if (pendingPermissions.has(permId)) {
-                pendingPermissions.delete(permId);
-                resolve("deny");
-              }
-            }, 120_000);
-          });
-        } catch (e) {
-          trace("permission.ask.error", { id: body.id, err: String(e) });
+        const handler = channelHandlers.get(body.type);
+        if (!handler) {
+          trace("channel.no-handler", { type: body.type });
+          return Response.json({ error: `no handler for ${body.type}` }, { status: 404 });
         }
 
-        trace("permission.ask.decided", { id: body.id, decision });
-        return Response.json({ id: body.id, decision });
+        const result = await handler(body.payload);
+        return Response.json({ id: body.id, result });
       } catch (e) {
-        return Response.json({ decision: "deny" }, { status: 500 });
+        trace("channel.error", { err: String(e) });
+        return Response.json({ error: String(e) }, { status: 500 });
       }
     },
   });
 
   const url = `http://127.0.0.1:${server.port}`;
-  trace("callback.started", { url });
+  trace("channel.started", { url });
 
   // Register with daemon
   try {
@@ -75,66 +67,92 @@ async function startCallbackServer(client: any): Promise<string> {
       body: JSON.stringify({ url }),
       unix: SOCK_PATH,
     } as RequestInit);
-    trace("callback.registered", { url });
+    trace("channel.registered", { url });
   } catch (e) {
-    trace("callback.register.failed", { err: String(e) });
+    trace("channel.register.failed", { err: String(e) });
   }
 
   return url;
 }
 
-// Pending permission requests waiting for user response
-const pendingPermissions = new Map<string, {
-  resolve: (decision: "allow" | "deny") => void;
-  body: { id: string; sessionId: string; tool: string; path?: string; input: Record<string, unknown> };
-}>();
+// ─── Permission Ask Handler ────────────────────────────────────────────────
+
+function registerPermissionHandler(): void {
+  onDaemonMessage("permission-ask", async (payload: {
+    id: string;
+    sessionId: string;
+    tool: string;
+    path?: string;
+    input: Record<string, unknown>;
+  }) => {
+    trace("permission.ask", { id: payload.id, tool: payload.tool, path: payload.path });
+
+    // Store as pending — resolved when OC's permission.ask hook or event fires
+    const decision = await new Promise<"allow" | "deny">((resolve) => {
+      pendingRequests.set(payload.id, {
+        resolve,
+        type: "permission-ask",
+        payload,
+      });
+
+      // Timeout: default to deny after 120s
+      setTimeout(() => {
+        if (pendingRequests.has(payload.id)) {
+          pendingRequests.delete(payload.id);
+          trace("permission.timeout", { id: payload.id });
+          resolve("deny");
+        }
+      }, 120_000);
+    });
+
+    return { decision };
+  });
+}
+
+// ─── Plugin ────────────────────────────────────────────────────────────────
 
 export const clwndPlugin: Plugin = async (input) => {
   const provider = createClwnd({ client: input.client, pluginInput: input });
 
-  // Start callback server for daemon → plugin communication
-  startCallbackServer(input.client).catch(() => {});
+  // Start the daemon ↔ plugin channel
+  registerPermissionHandler();
+  startCallbackServer().catch(() => {});
 
   return {
     models: {
       clwnd: provider,
     },
     "chat.headers": async (ctx, output) => {
-      output.headers["x-clwnd-agent"] = typeof ctx.agent === "string" ? ctx.agent : (ctx.agent as any)?.name ?? JSON.stringify(ctx.agent);
+      output.headers["x-clwnd-agent"] = typeof ctx.agent === "string"
+        ? ctx.agent
+        : (ctx.agent as any)?.name ?? JSON.stringify(ctx.agent);
     },
-    // Intercept OC permission checks — resolve pending permission requests
+    // OC asks us about a permission — match against pending requests
     "permission.ask": async (permission, output) => {
-      // Check if this permission matches a pending request from our daemon
-      // The permission.id or metadata might help match
-      for (const [id, entry] of pendingPermissions) {
-        // Match by tool name and path
-        const toolMatch = permission.type === entry.body.tool ||
-          permission.type === `mcp__clwnd__${entry.body.tool}`;
+      for (const [id, entry] of pendingRequests) {
+        if (entry.type !== "permission-ask") continue;
+        const toolMatch = permission.type === entry.payload.tool ||
+          permission.type === `mcp__clwnd__${entry.payload.tool}`;
         if (toolMatch) {
           trace("permission.ask.matched", { permId: permission.id, reqId: id });
-          // Let OC handle it normally — set status to "ask" so the TUI shows the prompt
           output.status = "ask";
-          // When the user responds, OC will emit permission.replied
-          // We'll catch that in the event hook
-          pendingPermissions.get(id)!.body.input._permissionId = permission.id;
+          entry.payload._permissionId = permission.id;
           return;
         }
       }
     },
-    // Watch for permission replies to resolve pending requests
+    // Watch for permission replies and resolve pending requests
     event: async ({ event }) => {
       if (event.type === "permission.replied") {
         const props = (event as any).properties;
         const permId = props?.permissionID;
         const response = props?.response; // "once" | "always" | "reject"
 
-        // Find matching pending request
-        for (const [id, entry] of pendingPermissions) {
-          if ((entry.body.input._permissionId as string) === permId) {
+        for (const [id, entry] of pendingRequests) {
+          if (entry.type === "permission-ask" && entry.payload._permissionId === permId) {
             const decision = response === "reject" ? "deny" : "allow";
-            trace("permission.replied", { reqId: id, permId, response, decision });
-            pendingPermissions.delete(id);
-            entry.resolve(decision);
+            trace("permission.replied", { reqId: id, response, decision });
+            resolvePending(id, decision);
             return;
           }
         }
@@ -144,6 +162,4 @@ export const clwndPlugin: Plugin = async (input) => {
 };
 
 // Provider loader looks for exports starting with "create".
-// This is NOT a Plugin function — the plugin loader will call it
-// but it returns a provider factory (not hooks), which is safely ignored.
 export { createClwnd };
