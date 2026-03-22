@@ -12,6 +12,8 @@ const PROJECT_DIR = join(SUITE_DIR, "project");
 const TIMEOUT = 240_000;
 const activeSessions: string[] = [];
 
+const DAEMON_SOCK = (process.env.CLWND_SOCKET ?? `${process.env.XDG_RUNTIME_DIR ?? "/tmp"}/clwnd/clwnd.sock`) + ".http";
+
 async function api(path: string, opts?: RequestInit) {
   return (await fetch(`${BASE}${path}`, {
     headers: { "Content-Type": "application/json", ...opts?.headers },
@@ -25,8 +27,6 @@ async function createSession(): Promise<string> {
   if (sid) activeSessions.push(sid);
   return sid;
 }
-
-const DAEMON_SOCK = (process.env.CLWND_SOCKET ?? `${process.env.XDG_RUNTIME_DIR ?? "/tmp"}/clwnd/clwnd.sock`) + ".http";
 
 async function deleteSession(sid: string): Promise<void> {
   try { await fetch("http://localhost/", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }), unix: DAEMON_SOCK } as RequestInit); } catch {}
@@ -42,6 +42,14 @@ async function nuke(pid?: number): Promise<void> {
   if (pid) { await sh(`pkill -TERM -P ${pid} 2>/dev/null; kill -TERM ${pid} 2>/dev/null`); await Bun.sleep(1_000); await sh(`pkill -KILL -P ${pid} 2>/dev/null; kill -KILL ${pid} 2>/dev/null`); await Bun.sleep(500); }
   await sh(`pkill -KILL -f "opencode serve.*--port ${PORT}" 2>/dev/null`); await Bun.sleep(500);
   await sh(`lsof -ti :${PORT} | xargs -r kill -9 2>/dev/null`); await Bun.sleep(500);
+}
+
+async function getMcpPort(): Promise<number> {
+  const out = await new Response(
+    spawn({ cmd: ["journalctl", "--user", "-u", "clwnd", "-n", "10", "--no-pager", "-o", "cat"], stdout: "pipe", stderr: "pipe" }).stdout
+  ).text();
+  const match = out.match(/mcp=http:\/\/127\.0\.0\.1:(\d+)/);
+  return match ? parseInt(match[1]) : 0;
 }
 
 let server: Subprocess;
@@ -105,12 +113,49 @@ function skipIfDead() {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-describe("e2e-serve-asks: permission ask via /allow command", () => {
-  // Skipped: infrastructure works (daemon hold + respond endpoints proven) but
-  // OC session lock prevents in-band user interaction during a turn.
-  // Awaiting viable UX solution before re-enabling.
-  test.skip("edit with ask permission: /allow approves and edit proceeds", () => {
-    // Infrastructure proven: daemon hold + /permission-pending + /permission-respond
-    // Blocked: OC session lock prevents in-band user interaction during a turn
-  });
+describe("e2e-serve-asks: permission ask via MCP permission_prompt tool", () => {
+  test("edit with ask permission: approve via daemon endpoint", async () => {
+    skipIfDead();
+    const sid = await createSession();
+    const mcpPort = await getMcpPort();
+    expect(mcpPort).toBeGreaterThan(0);
+    const DAEMON_MCP = `http://127.0.0.1:${mcpPort}`;
+
+    // Fire edit request — the permission_prompt MCP tool will hold
+    // because OC's agent has edit=ask, so the daemon waits for /permission-respond
+    const editPromise = fetch(`${BASE}/session/${sid}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: MODEL,
+        parts: [{ type: "text", text: `Edit ${join(PROJECT_DIR, "hello.txt")} — change "hello" to "hi"` }],
+      }),
+      signal: AbortSignal.timeout(180_000),
+    }).then(r => r.json()).catch(() => null);
+
+    // Poll daemon for pending permission, then approve
+    const approver = (async () => {
+      for (let i = 0; i < 60; i++) {
+        await Bun.sleep(2_000);
+        try {
+          const pending = await fetch(`${DAEMON_MCP}/permission-pending`).then(r => r.json()) as any[];
+          if (pending && pending.length > 0) {
+            await fetch(`${DAEMON_MCP}/permission-respond`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ id: pending[0].id, decision: "allow" }),
+            });
+            return;
+          }
+        } catch {}
+      }
+    })();
+
+    await editPromise;
+    await approver;
+
+    // Verify the edit happened
+    const content = await Bun.file(join(PROJECT_DIR, "hello.txt")).text();
+    expect(content).toContain("hi");
+  }, TIMEOUT);
 });
