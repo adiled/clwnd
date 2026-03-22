@@ -311,9 +311,9 @@ describe("e2e-serve: permission ask", () => {
     skipIfDead();
 
     // Set up isolated directory with edit=ask permission
-    mkdirSync(join(PERM_DIR, ".opencode"), { recursive: true });
+    mkdirSync(PERM_DIR, { recursive: true });
     mkdirSync(join(PERM_DIR, ".claude"), { recursive: true });
-    await Bun.write(join(PERM_DIR, ".opencode", "opencode.json"), JSON.stringify({
+    await Bun.write(join(PERM_DIR, "opencode.json"), JSON.stringify({
       permission: { edit: "ask" },
     }, null, 2));
     await Bun.write(join(PERM_DIR, ".claude", "settings.json"), JSON.stringify({
