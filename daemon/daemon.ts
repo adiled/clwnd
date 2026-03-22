@@ -92,10 +92,10 @@ class SubprocessPool {
 
   constructor(private cliPath = "claude") {}
 
-  sendSpawn(poolKey: string, modelId: string, handler: StreamHandler, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[]): void {
+  sendSpawn(poolKey: string, modelId: string, handler: StreamHandler, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[], sessionCwd?: string): void {
     let entry = this.procs.get(poolKey);
     if (!entry) {
-      entry = this.spawnProc(poolKey, modelId, claudeSessionId, permissions, systemPrompt, allowedTools);
+      entry = this.spawnProc(poolKey, modelId, claudeSessionId, permissions, systemPrompt, allowedTools, sessionCwd);
     } else {
       // Persistent process: update per-turn state
       mcpSetPerms((permissions ?? []) as any);
@@ -152,10 +152,11 @@ class SubprocessPool {
     this.procs.clear();
   }
 
-  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[]): ProcEntry {
-    // Update MCP server permissions and allowed tools for this request
+  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[], sessionCwd?: string): ProcEntry {
+    // Update MCP server state for this request
     mcpSetPerms((permissions ?? []) as any);
     mcpSetAllowed(allowedTools);
+    if (sessionCwd) mcpSetCwd(sessionCwd);
 
     // MCP config — point Claude CLI to our persistent HTTP MCP server
     const mcpConfig = JSON.stringify({
@@ -184,9 +185,10 @@ class SubprocessPool {
     if (systemPrompt) {
       cmd.push("--system-prompt", systemPrompt);
     }
+    const spawnCwd = sessionCwd ?? process.env.CLWND_CWD ?? process.env.HOME ?? "/";
     const proc = spawn({
       cmd,
-      cwd: process.env.CLWND_CWD ?? process.env.HOME ?? "/",
+      cwd: spawnCwd,
       env: { ...process.env, TERM: "xterm-256color" },
       stdout: "pipe",
       stdin: "pipe",
@@ -739,7 +741,7 @@ Bun.serve({
             };
 
             // First turn: spawn process. Subsequent turns: reuse existing.
-            pool.sendSpawn(poolKey, session.modelId, h, undefined, permissions, systemPrompt, allowedTools);
+            pool.sendSpawn(poolKey, session.modelId, h, undefined, permissions, systemPrompt, allowedTools, cwd as string);
             pool.sendPrompt(opencodeSessionId, poolKey, text ?? "");
           },
           cancel() {
