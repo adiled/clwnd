@@ -1,62 +1,19 @@
 import { spawn, type Subprocess } from "bun";
-import { EventEmitter } from "events";
 import { existsSync, unlinkSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from "fs";
 import { randomUUID } from "crypto";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
-// ─── Logging ────────────────────────────────────────────────────────────────
+import { trace, info } from "../log.ts";
 
-const LOG_LEVEL = process.env.CLWND_LOG_LEVEL ?? "info";
-const TRACE = LOG_LEVEL === "trace" || LOG_LEVEL === "debug";
+// ─── Shapes ─────────────────────────────────────────────────────────────────
 
-function trace(event: string, data?: Record<string, unknown>): void {
-  if (!TRACE) return;
-  const parts = [event];
-  if (data) for (const [k, v] of Object.entries(data)) parts.push(`${k}=${v}`);
-  console.log(`[trace] ${parts.join(" ")}`);
-}
-
-function info(event: string, data?: Record<string, unknown>): void {
-  const parts = [event];
-  if (data) for (const [k, v] of Object.entries(data)) parts.push(`${k}=${v}`);
-  console.log(parts.join(" "));
-}
-
-// ─── Types ───────────────────────────────────────────────────────────────────
-
-interface StreamHandler {
-  opencodeSessionId: string;
-  onSystemInit(sessionId: string, model: string, tools: string[]): void;
-  onChunk(type: string, data: Record<string, unknown>): void;
-  onFinish(info: { finishReason: string; usage: Record<string, number> | undefined; providerMetadata: Record<string, unknown> }): void;
-  onError(msg: string): void;
-}
-
-interface IpcToDaemon {
-  action: string;
-  opencodeSessionId: string;
-  cwd?: string;
-  modelId?: string;
-  text?: string;
-  historyContext?: string;
-  toolUseId?: string;
-  result?: string;
-  [key: string]: unknown;
-}
-
-interface IpcToPlugin {
-  action: string;
-  opencodeSessionId?: string;
-  chunkType?: string;
-  finishReason?: string;
-  usage?: Record<string, number>;
-  providerMetadata?: Record<string, unknown>;
-  message?: string;
-  claudeSessionId?: string;
-  model?: string;
-  tools?: string[];
-  [key: string]: unknown;
+interface BloomListener {
+  sessionId: string;
+  onRoost(claudeId: string, model: string, tools: string[]): void;
+  onPetal(type: string, payload: Record<string, unknown>): void;
+  onWilt(harvest: { finishReason: string; usage: Record<string, number> | undefined; providerMetadata: Record<string, unknown> }): void;
+  onThorn(wound: string): void;
 }
 
 // ─── Protocol ────────────────────────────────────────────────────────────────
@@ -81,82 +38,85 @@ function parseLine(line: string): unknown {
 
 // ─── ClaudeNest ──────────────────────────────────────────────────────────
 
-interface ProcEntry {
+interface Roost {
   proc: Subprocess;
-  handlers: Map<string, StreamHandler>;
-  activeSession: string | null;
+  listeners: Map<string, BloomListener>;
+  activeSid: string | null;
 }
 
 class ClaudeNest {
-  private procs = new Map<string, ProcEntry>();
+  private roosts = new Map<string, Roost>();
 
   constructor(private cliPath = "claude") {}
 
-  sendSpawn(poolKey: string, modelId: string, handler: StreamHandler, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[], sessionCwd?: string): void {
-    let entry = this.procs.get(poolKey);
-    if (!entry) {
-      entry = this.spawnProc(poolKey, modelId, claudeSessionId, permissions, systemPrompt, allowedTools, sessionCwd);
+  awaken(poolKey: string, modelId: string, listener: BloomListener, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[], sessionCwd?: string): void {
+    let roost = this.roosts.get(poolKey);
+    if (!roost) {
+      roost = this.spawnProc(poolKey, modelId, claudeSessionId, permissions, systemPrompt, allowedTools, sessionCwd);
     } else {
-      // Persistent process: update per-turn state
       mcpSetPerms((permissions ?? []) as any);
       mcpSetAllowed(allowedTools);
     }
-    handler.onChunk("stream_start", {});
-    entry.handlers.set(handler.opencodeSessionId, handler);
+    listener.onPetal("stream_start", {});
+    roost.listeners.set(listener.sessionId, listener);
   }
 
-  sendPrompt(sessionId: string, poolKey: string, text: string): void {
-    const entry = this.procs.get(poolKey);
-    if (!entry?.proc.stdin) return;
-    entry.activeSession = sessionId;
-    entry.proc.stdin.write(encodePrompt(text) + "\n");
+  murmur(sessionId: string, poolKey: string, text: string): void {
+    const roost = this.roosts.get(poolKey);
+    if (!roost?.proc.stdin) return;
+    roost.activeSid = sessionId;
+    trace("nest.murmured", { sid: sessionId, poolKey, len: text.length });
+    roost.proc.stdin.write(encodePrompt(text) + "\n");
   }
 
-  sendToolResult(sessionId: string, poolKey: string, toolUseId: string, result: string): void {
-    const entry = this.procs.get(poolKey);
-    if (!entry?.proc.stdin) return;
-    entry.activeSession = sessionId;
-    entry.proc.stdin.write(encodeToolResult(toolUseId, result) + "\n");
+  reply(sessionId: string, poolKey: string, toolUseId: string, result: string): void {
+    const roost = this.roosts.get(poolKey);
+    if (!roost?.proc.stdin) return;
+    roost.activeSid = sessionId;
+    trace("nest.replied", { sid: sessionId, toolUseId, len: result.length });
+    roost.proc.stdin.write(encodeToolResult(toolUseId, result) + "\n");
   }
 
-  abort(sessionId: string, poolKey: string): void {
-    const e = this.procs.get(poolKey);
-    if (e) {
-      e.handlers.delete(sessionId);
-      if (e.activeSession === sessionId) e.activeSession = null;
+  hush(sessionId: string, poolKey: string): void {
+    const roost = this.roosts.get(poolKey);
+    if (roost) {
+      roost.listeners.delete(sessionId);
+      if (roost.activeSid === sessionId) roost.activeSid = null;
+      trace("nest.hushed", { sid: sessionId, poolKey });
     }
   }
 
-  destroy(sessionId: string, poolKey: string): void {
-    const e = this.procs.get(poolKey);
-    if (e) {
-      e.handlers.delete(sessionId);
-      if (e.activeSession === sessionId) e.activeSession = null;
-      if (e.handlers.size === 0) {
-        try { e.proc.kill(); } catch {}
-        this.procs.delete(poolKey);
+  fell(sessionId: string, poolKey: string): void {
+    const roost = this.roosts.get(poolKey);
+    if (roost) {
+      roost.listeners.delete(sessionId);
+      if (roost.activeSid === sessionId) roost.activeSid = null;
+      if (roost.listeners.size === 0) {
+        trace("nest.felled", { poolKey, pid: roost.proc.pid });
+        try { roost.proc.kill(); } catch {}
+        this.roosts.delete(poolKey);
       }
     }
   }
 
-  getEntry(poolKey: string): ProcEntry | undefined {
-    return this.procs.get(poolKey);
+  roost(poolKey: string): Roost | undefined {
+    return this.roosts.get(poolKey);
   }
 
-  status(): Array<{ model: string; pid?: number; sessions: string[] }> {
+  survey(): Array<{ model: string; pid?: number; sessions: string[] }> {
     const out: Array<{ model: string; pid?: number; sessions: string[] }> = [];
-    for (const [id, e] of this.procs) {
-      out.push({ model: id, pid: e.proc.pid, sessions: Array.from(e.handlers.keys()) });
+    for (const [id, roost] of this.roosts) {
+      out.push({ model: id, pid: roost.proc.pid, sessions: Array.from(roost.listeners.keys()) });
     }
     return out;
   }
 
-  killAll(): void {
-    for (const [, e] of this.procs) { try { e.proc.kill(); } catch {} }
-    this.procs.clear();
+  silence(): void {
+    for (const [, roost] of this.roosts) { try { roost.proc.kill(); } catch {} }
+    this.roosts.clear();
   }
 
-  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[], sessionCwd?: string): ProcEntry {
+  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[], sessionCwd?: string): Roost {
     // Update MCP server state for this request
     mcpSetPerms((permissions ?? []) as any);
     mcpSetAllowed(allowedTools);
@@ -200,24 +160,24 @@ class ClaudeNest {
       stderr: "pipe",
     });
 
-    const entry: ProcEntry = { proc, handlers: new Map(), activeSession: null };
-    this.procs.set(poolKey, entry);
-    info("spawn", { poolKey, model: modelId, pid: proc.pid, resume: claudeSessionId ?? "none" });
+    const roost: Roost = { proc, listeners: new Map(), activeSid: null };
+    this.roosts.set(poolKey, roost);
+    info("nest.awakened", { poolKey, model: modelId, pid: proc.pid, resume: claudeSessionId ?? "none" });
 
     this.readStderr(proc, poolKey);
 
     proc.exited.then(exit => {
-      trace("proc.exited", { poolKey, code: exit.exitCode });
-      for (const h of entry.handlers.values()) {
-        try { h.onError(`subprocess exited: code=${exit.exitCode}`); } catch {}
+      trace("nest.exited", { poolKey, code: exit.exitCode });
+      for (const listener of roost.listeners.values()) {
+        try { listener.onThorn(`subprocess exited: code=${exit.exitCode}`); } catch {}
       }
-      entry.handlers.clear();
-      entry.activeSession = null;
-      this.procs.delete(poolKey);
+      roost.listeners.clear();
+      roost.activeSid = null;
+      this.roosts.delete(poolKey);
     });
 
-    this.readLoop(proc, poolKey, entry);
-    return entry;
+    this.readLoop(proc, poolKey, roost);
+    return roost;
   }
 
   private readStderr(proc: Subprocess, modelId: string): void {
@@ -230,35 +190,35 @@ class ClaudeNest {
           const { done, value } = await reader.read();
           if (done) break;
           const text = dec.decode(value!, { stream: true });
-          if (text.trim()) console.error("stderr[" + modelId + "]:", text.trim());
+          if (text.trim()) trace("nest.stderr", { poolKey: modelId, text: text.trim() });
         }
       } catch {}
     })();
   }
 
-  private readLoop(proc: Subprocess, modelId: string, entry: ProcEntry): void {
+  private readLoop(proc: Subprocess, poolKey: string, roost: Roost): void {
     const reader = proc.stdout!.getReader();
     const dec = new TextDecoder();
-    let buf = "";
+    let nectar = "";
 
     (async () => {
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          buf += dec.decode(value!, { stream: true });
-          const lines = buf.split("\n");
-          buf = lines.pop() ?? "";
+          nectar += dec.decode(value!, { stream: true });
+          const lines = nectar.split("\n");
+          nectar = lines.pop() ?? "";
           for (const line of lines) {
-            if (line.trim()) this.dispatchLine(modelId, entry, parseLine(line));
+            if (line.trim()) this.dispatchLine(poolKey, roost, parseLine(line));
           }
         }
-      } catch (e) {
-        console.error("readLoop:", e);
-        for (const h of entry.handlers.values()) {
-          try { h.onError(`readLoop error: ${e}`); } catch {}
+      } catch (err) {
+        trace("nest.readloop.failed", { err: String(err) });
+        for (const listener of roost.listeners.values()) {
+          try { listener.onThorn(`readLoop error: ${err}`); } catch {}
         }
-        entry.handlers.clear();
+        roost.listeners.clear();
       }
     })();
   }
@@ -267,75 +227,69 @@ class ClaudeNest {
   // to avoid duplicating text from the final assistant message
   private streamedTurn = false;
 
-  private dispatchLine(modelId: string, entry: ProcEntry, msg: unknown): void {
-    if (!msg || typeof msg !== "object") return;
-    let m = msg as Record<string, unknown>;
+  private dispatchLine(poolKey: string, roost: Roost, raw: unknown): void {
+    if (!raw || typeof raw !== "object") return;
+    let msg = raw as Record<string, unknown>;
 
     // Unwrap stream_event wrapper from --include-partial-messages
-    if (m.type === "stream_event" && m.event && typeof m.event === "object") {
-      m = m.event as Record<string, unknown>;
+    if (msg.type === "stream_event" && msg.event && typeof msg.event === "object") {
+      msg = msg.event as Record<string, unknown>;
     }
 
-    if (m.type === "system" && m.subtype === "init") {
-      const sid = (m.session_id as string) ?? "";
-      const model = (m.model as string) ?? modelId;
-      const tools = ((m.tools as unknown[]) ?? []).map(String);
-      for (const h of entry.handlers.values()) h.onSystemInit(sid, model, tools);
+    if (msg.type === "system" && msg.subtype === "init") {
+      const sid = (msg.session_id as string) ?? "";
+      const model = (msg.model as string) ?? poolKey;
+      const tools = ((msg.tools as unknown[]) ?? []).map(String);
+      for (const listener of roost.listeners.values()) listener.onRoost(sid, model, tools);
       return;
     }
 
-    let handler: StreamHandler | undefined;
-    if (entry.activeSession) {
-      handler = entry.handlers.get(entry.activeSession);
+    let listener: BloomListener | undefined;
+    if (roost.activeSid) {
+      listener = roost.listeners.get(roost.activeSid);
     }
-    if (!handler) {
-      handler = entry.handlers.values().next().value;
+    if (!listener) {
+      listener = roost.listeners.values().next().value;
     }
-    if (!handler) return;
+    if (!listener) return;
 
-    const emit = (type: string, data: Record<string, unknown>) => handler!.onChunk(type, data);
+    const petal = (type: string, payload: Record<string, unknown>) => listener!.onPetal(type, payload);
 
-    // Log every message type for debugging
-    trace("stdout.msg", { type: m.type as string, subtype: (m.subtype as string) ?? "" });
+    trace("stream.msg.received", { type: msg.type as string, subtype: (msg.subtype as string) ?? "" });
 
-    // Handle permission requests from Claude CLI's native permission protocol
-    if (m.type === "permission_request") {
-      const requestId = m.request_id as string;
-      const toolName = ((m.tool_name ?? "") as string).replace("mcp__clwnd__", "");
-      const path = ((m.input as Record<string, unknown>)?.file_path ?? (m.input as Record<string, unknown>)?.path) as string | undefined;
+    // Permission requests from Claude CLI's native protocol
+    if (msg.type === "permission_request") {
+      const requestId = msg.request_id as string;
+      const toolName = ((msg.tool_name ?? "") as string).replace("mcp__clwnd__", "");
+      const path = ((msg.input as Record<string, unknown>)?.file_path ?? (msg.input as Record<string, unknown>)?.path) as string | undefined;
       const action = getPermissionAction(toolName, path);
-      trace("permission.stdin", { requestId, tool: toolName, path, action });
+      trace("permission.request.received", { requestId, tool: toolName, path, action });
 
       if (action === "deny") {
-        // Deny immediately
-        entry.proc.stdin?.write(JSON.stringify({
+        trace("permission.denied", { requestId, tool: toolName, path });
+        roost.proc.stdin?.write(JSON.stringify({
           type: "permission_response",
           request_id: requestId,
           subtype: "error",
           error: "Denied by session permission rules",
         }) + "\n");
       } else if (action === "ask") {
-        // Store in CLWND_PERMIT_HOLD — resolved via /release-permit-hold
         const askId = requestId;
-        trace("permission.ask.hold", { id: askId, tool: toolName, path });
+        trace("permission.hold.created", { id: askId, tool: toolName, path });
 
-        // Notify plugin to show toast
-        ClwndWhisper.whisper("permission-ask", {
-          id: askId, sessionId: entry.activeSession ?? "",
-          tool: toolName, path, input: m.input ?? {},
-        }).catch(() => {});
+        hum(roost.activeSid ?? "", { chi: "permission-ask", askId, tool: toolName, path, input: msg.input ?? {} });
 
         CLWND_PERMIT_HOLD.set(askId, {
           resolve: (decision) => {
             if (decision === "allow") {
-              entry.proc.stdin?.write(JSON.stringify({
+              roost.proc.stdin?.write(JSON.stringify({
                 type: "permission_response",
                 request_id: requestId,
                 subtype: "success",
                 response: { updated_input: {}, permission_updates: [] },
               }) + "\n");
             } else {
-              entry.proc.stdin?.write(JSON.stringify({
+              roost.proc.stdin?.write(JSON.stringify({
                 type: "permission_response",
                 request_id: requestId,
                 subtype: "error",
@@ -345,21 +299,20 @@ class ClaudeNest {
           },
           tool: toolName,
           path,
-          sessionId: entry.activeSession ?? "",
+          sessionId: roost.activeSid ?? "",
         });
 
-        // Timeout after 5 min
         setTimeout(() => {
           if (CLWND_PERMIT_HOLD.has(askId)) {
-            const p = CLWND_PERMIT_HOLD.get(askId)!;
+            const hold = CLWND_PERMIT_HOLD.get(askId)!;
             CLWND_PERMIT_HOLD.delete(askId);
-            p.resolve("deny");
-            trace("permission.ask.timeout", { id: askId });
+            hold.resolve("deny");
+            trace("permission.hold.timeout", { id: askId });
           }
         }, 300_000);
       } else {
-        // Allow
-        entry.proc.stdin?.write(JSON.stringify({
+        trace("permission.allowed", { requestId, tool: toolName, path });
+        roost.proc.stdin?.write(JSON.stringify({
           type: "permission_response",
           request_id: requestId,
           subtype: "success",
@@ -369,90 +322,66 @@ class ClaudeNest {
       return;
     }
 
-    if (m.type === "content_block_start") {
-      const block = (m.content_block ?? {}) as Record<string, unknown>;
-      if (block.type === "thinking") emit("reasoning_start", { id: m.index });
-      if (block.type === "text") emit("text_start", { id: m.index });
-      if (block.type === "tool_use") emit("tool_input_start", { toolCallId: block.id as string, toolName: block.name as string });
+    if (msg.type === "content_block_start") {
+      const block = (msg.content_block ?? {}) as Record<string, unknown>;
+      if (block.type === "thinking") petal("reasoning_start", { id: msg.index });
+      if (block.type === "text") petal("text_start", { id: msg.index });
+      if (block.type === "tool_use") petal("tool_input_start", { toolCallId: block.id as string, toolName: block.name as string });
       return;
     }
 
-    if (m.type === "content_block_delta") {
+    if (msg.type === "content_block_delta") {
       this.streamedTurn = true;
-      const delta = (m.delta ?? {}) as Record<string, unknown>;
-      if (delta.type === "thinking_delta") emit("reasoning_delta", { delta: delta.thinking as string });
-      if (delta.type === "text_delta") emit("text_delta", { delta: delta.text as string });
-      if (delta.type === "input_json_delta") emit("tool_input_delta", { partialJson: delta.partial_json as string });
+      const delta = (msg.delta ?? {}) as Record<string, unknown>;
+      if (delta.type === "thinking_delta") petal("reasoning_delta", { delta: delta.thinking as string });
+      if (delta.type === "text_delta") petal("text_delta", { delta: delta.text as string });
+      if (delta.type === "input_json_delta") petal("tool_input_delta", { partialJson: delta.partial_json as string });
       return;
     }
 
-    if (m.type === "content_block_stop") {
-      emit("content_block_stop", { blockIdx: m.index });
+    if (msg.type === "content_block_stop") {
+      petal("content_block_stop", { blockIdx: msg.index });
       return;
     }
 
-    if (m.type === "assistant" && m.message) {
-      const content = ((m.message as Record<string, unknown>).content ?? []) as Array<Record<string, unknown>>;
+    if (msg.type === "assistant" && msg.message) {
+      const content = ((msg.message as Record<string, unknown>).content ?? []) as Array<Record<string, unknown>>;
       for (const block of content) {
-        // Skip text if already streamed via content_block_delta
-        if (block.type === "text" && typeof block.text === "string" && !this.streamedTurn) emit("text_delta", { delta: block.text });
-        // Always emit tool_use — MCP tool calls only appear in assistant messages
-        if (block.type === "tool_use") emit("tool_call", { toolCallId: block.id as string, toolName: block.name as string, input: block.input });
+        if (block.type === "text" && typeof block.text === "string" && !this.streamedTurn) petal("text_delta", { delta: block.text });
+        if (block.type === "tool_use") petal("tool_call", { toolCallId: block.id as string, toolName: block.name as string, input: block.input });
       }
       return;
     }
 
-    if (m.type === "user" && m.message) {
-      const content = ((m.message as Record<string, unknown>).content ?? []) as Array<Record<string, unknown>>;
+    if (msg.type === "user" && msg.message) {
+      const content = ((msg.message as Record<string, unknown>).content ?? []) as Array<Record<string, unknown>>;
       for (const block of content) {
         if (block.type === "tool_result") {
           const toolUseId = (block.tool_use_id as string) ?? "";
           let resultText = "";
-          const raw = block.content;
-          if (typeof raw === "string") resultText = raw;
-          else if (Array.isArray(raw)) resultText = (raw as Array<Record<string, unknown>>).filter(c => typeof c.text === "string").map(c => c.text as string).join("\n");
-          emit("tool_result", { toolUseId, result: resultText });
+          const body = block.content;
+          if (typeof body === "string") resultText = body;
+          else if (Array.isArray(body)) resultText = (body as Array<Record<string, unknown>>).filter(c => typeof c.text === "string").map(c => c.text as string).join("\n");
+          petal("tool_result", { toolUseId, result: resultText });
         }
       }
       return;
     }
 
-    if (m.type === "result") {
+    if (msg.type === "result") {
       this.streamedTurn = false;
-      handler.onFinish({
-        finishReason: (m.stop_reason as string) ?? "stop",
-        usage: m.usage as Record<string, number> | undefined,
-        providerMetadata: { sessionId: m.session_id, cost: m.total_cost_usd },
+      listener.onWilt({
+        finishReason: (msg.stop_reason as string) ?? "stop",
+        usage: msg.usage as Record<string, number> | undefined,
+        providerMetadata: { sessionId: msg.session_id, cost: msg.total_cost_usd },
       });
-      if (entry.activeSession) {
-        entry.handlers.delete(entry.activeSession);
-        entry.activeSession = null;
+      if (roost.activeSid) {
+        roost.listeners.delete(roost.activeSid);
+        roost.activeSid = null;
       }
     }
   }
 }
-
-// ─── Daemon ↔ Plugin Channel ────────────────────────────────────────────────
-// Generic bidirectional communication. Plugin registers a callback URL.
-// Daemon sends typed messages and awaits responses.
-
-let pluginCallbackUrl: string | null = null;
-
-const ClwndWhisper = {
-  async whisper<T = any>(type: string, payload: any, timeoutMs = 120_000): Promise<T> {
-    if (!pluginCallbackUrl) throw new Error("No plugin callback registered");
-    const id = randomUUID();
-    trace("channel.send", { type, id });
-    const resp = await fetch(pluginCallbackUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type, id, payload }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    const body = await resp.json() as { id: string; result: T };
-    return body.result;
-  },
-};
 
 // ─── Permission State ───────────────────────────────────────────────────────
 
@@ -586,138 +515,6 @@ function injectUserMessage(sessionPath: string, content: string | Record<string,
   });
 }
 
-// ─── IPC ─────────────────────────────────────────────────────────────────────
-
-const emitter = new EventEmitter();
-
-function onBroadcast(cb: (msg: IpcToPlugin) => void): void {
-  emitter.on("broadcast", cb);
-}
-
-function emitBroadcast(msg: IpcToPlugin): void {
-  emitter.emit("broadcast", msg);
-}
-
-function handleAction(msg: IpcToDaemon, pool: ClaudeNest): void {
-  switch (msg.action) {
-    case "spawn": {
-      const { opencodeSessionId, cwd, modelId } = msg;
-      const session: Session = {
-        opencodeSessionId,
-        claudeSessionId: null,
-        claudeSessionPath: null,
-        cwd: cwd ?? "/root",
-        modelId: modelId ?? "sonnet",
-      };
-      sessions.set(opencodeSessionId, session);
-      saveSessions();
-
-      const h: StreamHandler = {
-        opencodeSessionId,
-        onSystemInit(claudeSessionId, model, tools) {
-          const path = createClaudeSession(session.cwd, claudeSessionId);
-          session.claudeSessionId = claudeSessionId;
-          session.claudeSessionPath = path;
-          saveSessions();
-          emitBroadcast({ action: "session_ready", opencodeSessionId, claudeSessionId, model, tools });
-        },
-        onChunk(type, data) {
-          emitBroadcast({ action: "chunk", opencodeSessionId, chunkType: type, ...data } as unknown as IpcToPlugin);
-        },
-        onFinish(finish) {
-          emitBroadcast({
-            action: "finish",
-            opencodeSessionId,
-            finishReason: finish.finishReason,
-            usage: finish.usage,
-            providerMetadata: finish.providerMetadata,
-          });
-        },
-        onError(err) {
-          emitBroadcast({ action: "error", opencodeSessionId, message: err });
-        },
-      };
-
-      pool.sendSpawn(opencodeSessionId, session.modelId, h);
-      break;
-    }
-
-    case "prompt": {
-      const { opencodeSessionId, text } = msg;
-      const session = sessions.get(opencodeSessionId);
-      if (!session) {
-        emitBroadcast({ action: "error", opencodeSessionId, message: "session not found" });
-        return;
-      }
-
-      if (session.claudeSessionId && session.claudeSessionPath) {
-        const parentUuid = getLastEntryUuid(session.claudeSessionPath);
-        injectUserMessage(session.claudeSessionPath, text ?? "", parentUuid, session.claudeSessionId);
-      }
-
-      const fullText = (msg.historyContext as string)
-        ? `Previous context:\n${msg.historyContext}\n\nNew message:\n${text}`
-        : (text ?? "");
-      pool.sendPrompt(opencodeSessionId, session.modelId, fullText);
-      break;
-    }
-
-    case "tool_result": {
-      const { opencodeSessionId, toolUseId, result } = msg;
-      const session = sessions.get(opencodeSessionId);
-      if (!session) return;
-
-      if (session.claudeSessionPath && session.claudeSessionId) {
-        const parentUuid = getLastEntryUuid(session.claudeSessionPath);
-        injectUserMessage(session.claudeSessionPath, [
-          { type: "tool_result", tool_use_id: toolUseId, content: result, is_error: false }
-        ], parentUuid, session.claudeSessionId);
-      }
-
-      pool.sendToolResult(opencodeSessionId, session.modelId, toolUseId ?? "", result ?? "");
-      break;
-    }
-
-    case "abort": {
-      const session = sessions.get(msg.opencodeSessionId);
-      if (session) pool.abort(msg.opencodeSessionId, session.modelId);
-      break;
-    }
-
-    case "destroy": {
-      // Only destroy the subprocess, NOT the session state.
-      // The plugin sends destroy on abort/cancel, but we need the session
-      // to persist for --resume on the next turn.
-      trace("destroy", { sid: msg.opencodeSessionId, hadSession: sessions.has(msg.opencodeSessionId) });
-      // Pool cleanup is handled per-request via poolKey, not via this action.
-      break;
-    }
-
-    case "cleanup": {
-      // Kill subprocess AND remove session state. Used by tests.
-      const session = sessions.get(msg.opencodeSessionId);
-      if (session) {
-        pool.destroy(msg.opencodeSessionId, session.modelId);
-        sessions.delete(msg.opencodeSessionId);
-        saveSessions();
-        trace("cleanup", { sid: msg.opencodeSessionId });
-      }
-      break;
-    }
-
-    case "status": {
-      emitBroadcast({ action: "status_reply", opencodeSessionId: msg.opencodeSessionId, procs: pool.status() });
-      break;
-    }
-
-    case "ping": {
-      emitBroadcast({ action: "pong" });
-      break;
-    }
-
-  }
-}
-
 // ─── HTTP Server ─────────────────────────────────────────────────────────────
 
 function defaultSocketPath(): string {
@@ -734,39 +531,7 @@ const SOCK = process.env.CLWND_SOCKET ?? defaultSocketPath();
 const HTTP = SOCK + ".http";
 
 
-const pool = new ClaudeNest(process.env.CLAUDE_CLI_PATH ?? "claude");
-
-const sessionLocks = new Map<string, Promise<void>>();
-// Active stream senders per session — for injecting messages into the provider's stream
-const activeStreamSenders = new Map<string, (msg: IpcToPlugin) => void>();
-const pendingEvents = new Map<string, IpcToPlugin[]>();
-const sseClients = new Map<string, (msg: IpcToPlugin) => void>();
-
-function flushToSse(sessionId: string, send: (msg: IpcToPlugin) => void) {
-  const buf = pendingEvents.get(sessionId) ?? [];
-  pendingEvents.delete(sessionId);
-  for (const m of buf) { try { send(m); } catch { break; } }
-}
-
-function broadcastToSession(sessionId: string, msg: IpcToPlugin) {
-  const send = sseClients.get(sessionId);
-  if (send) {
-    try { send(msg); } catch { sseClients.delete(sessionId); }
-  } else {
-    if (!pendingEvents.has(sessionId)) pendingEvents.set(sessionId, []);
-    pendingEvents.get(sessionId)!.push(msg);
-  }
-}
-
-onBroadcast((msg) => {
-  const sid = (msg as Record<string, unknown>).opencodeSessionId as string | undefined;
-  if (sid) broadcastToSession(sid, msg);
-  else {
-    for (const [id, send] of sseClients) {
-      try { send(msg); } catch { sseClients.delete(id); }
-    }
-  }
-});
+const nest = new ClaudeNest(process.env.CLAUDE_CLI_PATH ?? "claude");
 
 const HUM = SOCK + ".hum";
 
@@ -783,13 +548,15 @@ type HumSocket = ReturnType<typeof Bun.connect> extends Promise<infer T> ? T : n
 const humRoots = new Map<string, { socket: any; sessionId: string | null }>();
 
 function humChorus(msg: Record<string, unknown>): void {
+  trace("hum.chorus.sent", { chi: msg.chi as string, clients: humRoots.size });
   const line = JSON.stringify(msg) + "\n";
   for (const [, client] of humRoots) {
     try { client.socket.write(line); } catch {}
   }
 }
 
-function humWhisperTo(sessionId: string, msg: Record<string, unknown>): void {
+function hum(sessionId: string, msg: Record<string, unknown>): void {
+  trace("hum.whisper.sent", { chi: msg.chi as string, sid: sessionId });
   const line = JSON.stringify(msg) + "\n";
   for (const [, client] of humRoots) {
     if (client.sessionId === sessionId || client.sessionId === null) {
@@ -800,7 +567,7 @@ function humWhisperTo(sessionId: string, msg: Record<string, unknown>): void {
 
 function humReceive(clientId: string, msg: Record<string, unknown>): void {
   const chi = msg.chi as string;
-  trace("hum.recv", { chi, clientId: clientId.slice(0, 8) });
+  trace("hum.msg.received", { chi, clientId: clientId.slice(0, 8) });
 
   switch (chi) {
     case "prompt": {
@@ -820,6 +587,7 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
         };
         sessions.set(sid, session);
         saveSessions();
+        trace("session.created", { sid, model: session.modelId });
       }
 
       const permissions = (msg.permissions ?? []) as unknown[];
@@ -834,10 +602,9 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
 
       const poolKey = sid;
 
-      // Set up handler that writes to hum
-      const h: StreamHandler = {
-        opencodeSessionId: sid,
-        onSystemInit(claudeSessionId, model, tools) {
+      const listener: BloomListener = {
+        sessionId: sid,
+        onRoost(claudeSessionId, model, tools) {
           session.claudeSessionId = claudeSessionId;
           if (!session.claudeSessionPath) {
             const dir = getSessionDir(session.cwd);
@@ -845,27 +612,27 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
             session.claudeSessionPath = getSessionPath(session.cwd, claudeSessionId);
           }
           saveSessions();
-          humWhisperTo(sid, { chi: "session-ready", sid, claudeSessionId, model, tools });
+          hum(sid, { chi: "session-ready", sid, claudeSessionId, model, tools });
         },
-        onChunk(type, data) {
-          humWhisperTo(sid, { chi: "chunk", sid, chunkType: type, ...data });
+        onPetal(type, payload) {
+          hum(sid, { chi: "chunk", sid, chunkType: type, ...payload });
         },
-        onFinish(finish) {
-          humWhisperTo(sid, {
+        onWilt(harvest) {
+          hum(sid, {
             chi: "finish", sid,
-            finishReason: finish.finishReason,
-            usage: finish.usage,
-            providerMetadata: finish.providerMetadata,
+            finishReason: harvest.finishReason,
+            usage: harvest.usage,
+            providerMetadata: harvest.providerMetadata,
           });
-          pool.abort(sid, poolKey);
+          nest.hush(sid, poolKey);
         },
-        onError(err) {
-          humWhisperTo(sid, { chi: "error", sid, message: err });
-          pool.destroy(sid, poolKey);
+        onThorn(wound) {
+          hum(sid, { chi: "error", sid, message: wound });
+          nest.fell(sid, poolKey);
         },
       };
 
-      pool.sendSpawn(poolKey, session.modelId, h, undefined, permissions, systemPrompt, allowedTools, cwd);
+      nest.awaken(poolKey, session.modelId, listener, undefined, permissions, systemPrompt, allowedTools, cwd);
 
       if (!msg.listenOnly) {
         const historyContext = msg.historyContext as string | undefined;
@@ -873,7 +640,7 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
         const fullText = historyContext
           ? `Here is the conversation history from this session:\n\n${historyContext}\n\nContinue from here. The user's new message:\n\n${text}`
           : text;
-        pool.sendPrompt(sid, poolKey, fullText);
+        nest.murmur(sid, poolKey, fullText);
       }
 
       // Inject user message into JSONL
@@ -887,10 +654,10 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
     case "release-permit": {
       const askId = msg.askId as string;
       const decision = msg.decision as "allow" | "deny";
-      const entry = CLWND_PERMIT_HOLD.get(askId);
-      if (entry) {
+      const hold = CLWND_PERMIT_HOLD.get(askId);
+      if (hold) {
         CLWND_PERMIT_HOLD.delete(askId);
-        entry.resolve(decision);
+        hold.resolve(decision);
         trace("hum.permit.released", { askId, decision });
       }
       break;
@@ -900,16 +667,16 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
       const sid = msg.sid as string;
       const session = sessions.get(sid);
       if (session) {
-        pool.destroy(sid, session.modelId);
+        nest.fell(sid, session.modelId);
         sessions.delete(sid);
         saveSessions();
-        trace("hum.cleanup", { sid });
+        trace("hum.session.cleaned", { sid });
       }
       break;
     }
 
     default:
-      trace("hum.unknown", { chi });
+      trace("hum.msg.unknown", { chi });
   }
 }
 
@@ -932,7 +699,7 @@ const humServer = Bun.listen({
           const msg = JSON.parse(line) as Record<string, unknown>;
           humReceive(clientId, msg);
         } catch (e) {
-          trace("hum.parse.error", { err: String(e) });
+          trace("hum.parse.failed", { err: String(e) });
         }
       }
     },
@@ -942,7 +709,7 @@ const humServer = Bun.listen({
       info("hum.disconnected", { clientId: clientId.slice(0, 8), total: humRoots.size });
     },
     error(socket, err) {
-      trace("hum.error", { err: String(err) });
+      trace("hum.socket.failed", { err: String(err) });
     },
   },
 });
@@ -955,234 +722,26 @@ Bun.serve({
   fetch(req) {
     const url = new URL(req.url);
 
-    if (req.method === "POST" && url.pathname === "/") {
-      return req.text().then(body => {
-        try {
-          handleAction(JSON.parse(body) as IpcToDaemon, pool);
-        } catch (e) {
-          console.error("parse:", e);
-        }
-        return new Response("ok");
-      }).catch(() => new Response("error", { status: 500 }));
-    }
-
     if (req.method === "GET" && url.pathname === "/status") {
-      return new Response(JSON.stringify({ pid: process.pid, procs: pool.status(), sessions: sessions.size }), {
+      return new Response(JSON.stringify({ pid: process.pid, procs: nest.survey(), sessions: sessions.size }), {
         headers: { "Content-Type": "application/json" },
       });
     }
 
-    // Phantom permission result — provider tells daemon the ctx.ask() outcome
-    if (req.method === "POST" && url.pathname === "/release-permit-hold") {
-      return req.json().then((body: { askId: string; decision: "allow" | "deny" }) => {
-        const entry = CLWND_PERMIT_HOLD.get(body.askId);
-        if (entry) {
-          CLWND_PERMIT_HOLD.delete(body.askId);
-          entry.resolve(body.decision);
-          trace("permission.resolved", { askId: body.askId, decision: body.decision });
-        } else {
-          trace("permission.notfound", { askId: body.askId, pending: Array.from(CLWND_PERMIT_HOLD.keys()).join(",") });
+    // Cleanup — tests use this to tear down sessions
+    if (req.method === "POST" && url.pathname === "/") {
+      return req.json().then((body: { action: string; opencodeSessionId: string }) => {
+        if (body.action === "cleanup") {
+          const session = sessions.get(body.opencodeSessionId);
+          if (session) {
+            nest.fell(body.opencodeSessionId, session.modelId);
+            sessions.delete(body.opencodeSessionId);
+            saveSessions();
+            trace("session.cleaned", { sid: body.opencodeSessionId });
+          }
         }
         return new Response("ok");
       }).catch(() => new Response("error", { status: 400 }));
-    }
-
-    // Plugin registers its callback URL for daemon → plugin communication
-    if (req.method === "POST" && url.pathname === "/callback") {
-      return req.json().then((body: { url: string }) => {
-        pluginCallbackUrl = body.url;
-        info("callback.registered", { url: body.url });
-        return new Response("ok");
-      }).catch(() => new Response("error", { status: 400 }));
-    }
-
-    // Streaming endpoint: POST /stream — spawn + prompt, stream NDJSON response
-    // Serialized per session: OpenCode may fire concurrent calls for the same
-    // session (small model + main). We serialize to avoid racing --resume.
-    if (req.method === "POST" && url.pathname === "/stream") {
-      return req.json().then(async (body: IpcToDaemon) => {
-        const { opencodeSessionId, cwd, modelId, text } = body;
-        const permissions = (body.permissions ?? []) as unknown[];
-        const systemPrompt = (body.systemPrompt as string) || undefined;
-        const allowedTools = (body.allowedTools as string[]) || undefined;
-
-        // Update MCP server CWD per-turn (may change via opencode-dir /cd)
-        if (cwd) mcpSetCwd(cwd as string);
-
-        // Store permissions for the PreToolUse hook's permission-check endpoint
-        if (permissions.length > 0) {
-          setSessionPermissions(opencodeSessionId, permissions as any);
-        }
-
-        // Wait for any in-flight request on this session to finish
-        const prev = sessionLocks.get(opencodeSessionId);
-        if (prev) {
-          trace("stream.wait", { sid: opencodeSessionId });
-          await prev;
-        }
-
-        const encoder = new TextEncoder();
-        let closed = false;
-        let releaseLock: () => void;
-        const lock = new Promise<void>(r => { releaseLock = r; });
-        sessionLocks.set(opencodeSessionId, lock);
-
-        // Persistent process: poolKey = opencodeSessionId (one process per OC session)
-        const poolKey = opencodeSessionId;
-
-        const clwndHum = new ReadableStream({
-          start(controller) {
-            const send = (msg: IpcToPlugin) => {
-              if (closed) return;
-              try {
-                controller.enqueue(encoder.encode(JSON.stringify(msg) + "\n"));
-              } catch { closed = true; }
-            };
-
-            // Register stream sender so MCP handlers can inject messages
-            activeStreamSenders.set(opencodeSessionId, send);
-
-            // Get or create persistent session
-            let session = sessions.get(opencodeSessionId);
-            const isNewSession = !session;
-
-            if (!session) {
-              session = {
-                opencodeSessionId,
-                claudeSessionId: null,
-                claudeSessionPath: null,
-                cwd: cwd ?? "/root",
-                modelId: modelId ?? "sonnet",
-              };
-              sessions.set(opencodeSessionId, session);
-              saveSessions();
-            }
-
-
-            trace("stream.start", { sid: opencodeSessionId, isNew: isNewSession, sessions: sessions.size });
-
-            const h: StreamHandler = {
-              opencodeSessionId,
-              onSystemInit(claudeSessionId, model, tools) {
-                session.claudeSessionId = claudeSessionId;
-                if (!session.claudeSessionPath) {
-                  const dir = getSessionDir(session.cwd);
-                  try { mkdirSync(dir, { recursive: true }); } catch {}
-                  session.claudeSessionPath = getSessionPath(session.cwd, claudeSessionId);
-                }
-                saveSessions();
-                trace("stream.init", { sid: opencodeSessionId, claude: claudeSessionId });
-                send({ action: "session_ready", opencodeSessionId, claudeSessionId, model, tools });
-              },
-              onChunk(type, data) {
-                send({ action: "chunk", opencodeSessionId, chunkType: type, ...data } as unknown as IpcToPlugin);
-              },
-              onFinish(finish) {
-                trace("stream.finish", { sid: opencodeSessionId, claude: session.claudeSessionId });
-                send({
-                  action: "finish",
-                  opencodeSessionId,
-                  finishReason: finish.finishReason,
-                  usage: finish.usage,
-                  providerMetadata: finish.providerMetadata,
-                });
-                // Remove handler but DON'T destroy process — it stays alive for next turn
-                pool.abort(opencodeSessionId, poolKey);
-                activeStreamSenders.delete(opencodeSessionId);
-                releaseLock!();
-                if (!closed) { closed = true; try { controller.close(); } catch {} }
-              },
-              onError(err) {
-                trace("stream.error", { sid: opencodeSessionId, err });
-                send({ action: "error", opencodeSessionId, message: err });
-                // On error, kill the process — next turn will spawn fresh
-                pool.destroy(opencodeSessionId, poolKey);
-                releaseLock!();
-                if (!closed) { closed = true; try { controller.close(); } catch {} }
-              },
-            };
-
-            // First turn: spawn process. Subsequent turns: reuse existing.
-            pool.sendSpawn(poolKey, session.modelId, h, undefined, permissions, systemPrompt, allowedTools, cwd as string);
-            // listenOnly: don't send a prompt, just read stdout (for permission return)
-            if (!body.listenOnly) {
-              const historyContext = body.historyContext as string | undefined;
-              const fullText = historyContext
-                ? `Here is the conversation history from this session:\n\n${historyContext}\n\nContinue from here. The user's new message:\n\n${text}`
-                : (text ?? "");
-              pool.sendPrompt(opencodeSessionId, poolKey, fullText);
-            }
-          },
-          cancel() {
-            closed = true;
-            activeStreamSenders.delete(opencodeSessionId);
-            // If there's a permit hold, the consumerEgress was closed
-            // for a permission tool call — DON'T destroy the process, it needs
-            // to stay alive for the permission_prompt MCP response.
-            if (CLWND_PERMIT_HOLD.size > 0) {
-              pool.abort(opencodeSessionId, poolKey);
-              releaseLock!();
-              return;
-            }
-            // Otherwise, graceful shutdown — process is stuck or user cancelled.
-            const entry = pool.getEntry(poolKey);
-            if (entry?.proc.stdin) {
-              try {
-                entry.proc.stdin.write(JSON.stringify({
-                  type: "shutdown_request",
-                  requestId: randomUUID(),
-                  from: "clwnd",
-                  reason: "user cancelled",
-                  timestamp: new Date().toISOString(),
-                }) + "\n");
-              } catch {}
-              setTimeout(() => {
-                if (pool.getEntry(poolKey)) {
-                  pool.destroy(opencodeSessionId, poolKey);
-                }
-              }, 3_000);
-            } else {
-              pool.destroy(opencodeSessionId, poolKey);
-            }
-            releaseLock!();
-          },
-        });
-
-        return new Response(clwndHum, {
-          headers: { "Content-Type": "application/x-ndjson" },
-        });
-      }).catch(() => new Response("error", { status: 500 }));
-    }
-
-    if (req.method === "GET" && url.pathname === "/sse") {
-      const sessionId = url.searchParams.get("session") ?? "_all_";
-      const encoder = new TextEncoder();
-      let closed = false;
-
-      const stream = new ReadableStream({
-        start(controller) {
-          const send = (msg: IpcToPlugin) => {
-            if (closed) return;
-            try {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(msg)}\n\n`));
-            } catch { closed = true; }
-          };
-          sseClients.set(sessionId, send);
-          flushToSse(sessionId, send);
-        },
-        cancel() {
-          closed = true;
-          sseClients.delete(sessionId);
-        },
-      });
-
-      return new Response(stream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "X-Accel-Buffering": "no",
-        },
-      });
     }
 
     return new Response("clwnd", { status: 200 });
@@ -1221,7 +780,7 @@ const mcpServer = Bun.serve({
         }
 
         const action = getPermissionAction(toolName, path);
-        trace("permission.hook", { tool: toolName, path, action, ocSid: ocSessionId });
+        trace("permission.hook.checked", { tool: toolName, path, action, ocSid: ocSessionId });
 
         // Claude CLI hook response format
         const hookAllow = () => Response.json({
@@ -1243,13 +802,9 @@ const mcpServer = Bun.serve({
         // TODO: hold this response, expose via /permission-pending,
         // wait for /permission-respond to resolve it
         const askId = randomUUID();
-        trace("permission.ask.hold", { id: askId, tool: toolName, path });
+        trace("permission.hold.created", { id: askId, tool: toolName, path });
 
-        // Notify plugin to show toast (fire and forget)
-        ClwndWhisper.whisper("permission-ask", {
-          id: askId, sessionId: ocSessionId ?? sessionId,
-          tool: toolName, path, input: body.tool_input ?? {},
-        }).catch(() => {});
+        hum(ocSessionId ?? sessionId, { chi: "permission-ask", askId, tool: toolName, path, input: body.tool_input ?? {} });
 
         // Hold until /permission-respond resolves this, or timeout
         const decision = await new Promise<"allow" | "deny">((resolve) => {
@@ -1257,16 +812,16 @@ const mcpServer = Bun.serve({
           setTimeout(() => {
             if (CLWND_PERMIT_HOLD.has(askId)) {
               CLWND_PERMIT_HOLD.delete(askId);
-              trace("permission.ask.timeout", { id: askId });
+              trace("permission.hold.timeout", { id: askId });
               resolve("deny");
             }
           }, 300_000); // 5 min — PreToolUse hook timeout is 600s
         });
 
-        trace("permission.ask.resolved", { id: askId, decision });
+        trace("permission.hold.resolved", { id: askId, decision });
         return decision === "allow" ? hookAllow() : hookDeny("Denied by user");
       } catch (e) {
-        trace("permission.hook.error", { err: String(e) });
+        trace("permission.hook.failed", { err: String(e) });
         return Response.json({
           hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Permission check failed" },
         });
@@ -1290,10 +845,10 @@ const mcpServer = Bun.serve({
         if (!id || !CLWND_PERMIT_HOLD.has(id as string)) {
           return Response.json({ error: "no active permit hold" }, { status: 404 });
         }
-        const entry = CLWND_PERMIT_HOLD.get(id as string)!;
+        const hold = CLWND_PERMIT_HOLD.get(id as string)!;
         CLWND_PERMIT_HOLD.delete(id as string);
-        entry.resolve(body.decision);
-        trace("permission.respond", { id, decision: body.decision });
+        hold.resolve(body.decision);
+        trace("permission.responded", { id, decision: body.decision });
         return Response.json({ ok: true });
       } catch {
         return Response.json({ error: "bad request" }, { status: 400 });
@@ -1304,10 +859,12 @@ const mcpServer = Bun.serve({
     if (req.method !== "POST") return new Response("clwnd-mcp", { status: 200 });
     try {
       const body = await req.json();
+      trace("mcp.request.received", { method: body?.method });
       const result = await handleMcpRequest(body);
       if (!result) return new Response("", { status: 204 });
       return Response.json(result);
     } catch (e: any) {
+      trace("mcp.request.failed", { err: e.message });
       return Response.json({ jsonrpc: "2.0", error: { code: -32700, message: e.message } });
     }
   },
@@ -1321,7 +878,7 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>) =
   const tool = toolName.replace("mcp__clwnd__", "");
   const path = (input?.file_path ?? input?.path ?? input?.pattern) as string | undefined;
   const action = getPermissionAction(tool, path);
-  trace("permission.mcp", { tool, path, action });
+  trace("permission.mcp.checked", { tool, path, action });
 
   if (action === "allow") return { decision: "allow" as const };
   if (action === "deny") return { decision: "deny" as const };
@@ -1332,7 +889,7 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>) =
   trace("permission.ask.hold", { id: askId, tool, path });
 
   // Send via hum — if no hum clients, permit hold times out and defaults to allow
-  humWhisperTo("", { chi: "permission-ask", askId, tool, path, input });
+  hum("", { chi: "permission-ask", askId, tool, path, input });
 
   return new Promise<{ decision: "allow" | "deny" }>((resolve) => {
     CLWND_PERMIT_HOLD.set(askId, {
@@ -1346,7 +903,7 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>) =
     setTimeout(() => {
       if (CLWND_PERMIT_HOLD.has(askId)) {
         CLWND_PERMIT_HOLD.delete(askId);
-        trace("permission.ask.timeout.allow", { id: askId });
+        trace("permission.hold.timeout.ok", { id: askId });
         resolve({ decision: "allow" });
       }
     }, 10_000);
@@ -1396,10 +953,10 @@ const UPDATE_INTERVAL = 6 * 60 * 60 * 1000;
 setTimeout(checkForUpdate, 60_000); // first check 1 min after boot
 setInterval(checkForUpdate, UPDATE_INTERVAL);
 
-process.on("SIGINT",  () => { pool.killAll(); process.exit(0); });
-process.on("SIGTERM", () => { pool.killAll(); process.exit(0); });
-process.on("uncaughtException",  e => console.error("uncaught:", e));
-process.on("unhandledRejection", e => console.error("unhandled:", e));
+process.on("SIGINT",  () => { nest.silence(); process.exit(0); });
+process.on("SIGTERM", () => { nest.silence(); process.exit(0); });
+process.on("uncaughtException",  e => info("process.uncaught", { err: String(e) }));
+process.on("unhandledRejection", e => info("process.unhandled", { err: String(e) }));
 
 info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid, version: CURRENT_VERSION });
 

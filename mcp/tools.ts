@@ -7,6 +7,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "fs
 import { execSync } from "child_process";
 import { resolve, dirname, relative } from "path";
 
+import { trace } from "../log.ts";
+
 let CWD = process.env.CLWND_CWD ?? process.cwd();
 
 export function setCwd(cwd: string): void { CWD = cwd; }
@@ -331,7 +333,7 @@ function execGrep(args: { pattern: string; path?: string; include?: string }): T
 }
 
 async function execPermissionPrompt(args: { tool_name: string; input?: Record<string, unknown> }): Promise<ToolResult> {
-  console.log(`[MCP] permission_prompt called for ${args.tool_name} at ${Date.now()}`);
+  trace("mcp.permission.prompted", { tool: args.tool_name });
   if (!permissionCallback) {
     return { output: JSON.stringify({ behavior: "allow", updatedInput: args.input ?? {} }) };
   }
@@ -343,7 +345,7 @@ async function execPermissionPrompt(args: { tool_name: string; input?: Record<st
 }
 
 export async function executeTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
-  if (name !== "permission_prompt") console.log(`[MCP] executeTool ${name} at ${Date.now()}`);
+  if (name !== "permission_prompt") trace("mcp.tool.executed", { tool: name });
   switch (name) {
     case "read": return execRead(args as any);
     case "edit": return execEdit(args as any);

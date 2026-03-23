@@ -1,13 +1,28 @@
 import { generateId } from "@ai-sdk/provider-utils";
-import { appendFileSync, mkdirSync } from "fs";
 
-const LOG_DIR = `${process.env.XDG_DATA_HOME || process.env.HOME + "/.local/share"}/opencode`;
-const LOG_FILE = `${LOG_DIR}/clwnd-plugin.log`;
-try { mkdirSync(LOG_DIR, { recursive: true }); } catch {}
+// ─── Logging ────────────────────────────────────────────────────────────────
+// Sends to OC's log via client.app.log() — shows in `opencode debug`.
+// Falls back to file before client is available.
+
+let logClient: any = null;
+export function setLogClient(client: any): void { logClient = client; }
+
 export function trace(event: string, data?: Record<string, unknown>): void {
-  const parts = [new Date().toISOString(), event];
-  if (data) for (const [k, v] of Object.entries(data)) parts.push(`${k}=${v}`);
-  try { appendFileSync(LOG_FILE, parts.join(" ") + "\n"); } catch {}
+  const service = "clwnd";
+  if (logClient?.app?.log) {
+    logClient.app.log({
+      body: { service, level: "debug" as const, message: event, extra: data },
+    }).catch(() => {});
+  }
+}
+
+export function log(event: string, data?: Record<string, unknown>): void {
+  const service = "clwnd";
+  if (logClient?.app?.log) {
+    logClient.app.log({
+      body: { service, level: "info" as const, message: event, extra: data },
+    }).catch(() => {});
+  }
 }
 import type {
   LanguageModelV2,
@@ -105,25 +120,6 @@ function parseToolResult(resultText: string): { output: string; title: string; m
   return { output, title, metadata };
 }
 
-interface IpcToDaemon {
-  action: string;
-  opencodeSessionId: string;
-  [key: string]: unknown;
-}
-
-interface IpcToPlugin {
-  action: string;
-  opencodeSessionId?: string;
-  chunkType?: string;
-  finishReason?: string;
-  usage?: Record<string, number>;
-  providerMetadata?: Record<string, unknown>;
-  message?: string;
-  claudeSessionId?: string;
-  model?: string;
-  tools?: string[];
-  [key: string]: unknown;
-}
 
 function defaultSocketPath(): string {
   const runtime = process.env.XDG_RUNTIME_DIR;
@@ -131,7 +127,6 @@ function defaultSocketPath(): string {
   return "/tmp/clwnd/clwnd.sock";
 }
 
-const SOCK_PATH = (process.env.CLWND_SOCKET ?? defaultSocketPath()) + ".http";
 const HUM_PATH = (process.env.CLWND_SOCKET ?? defaultSocketPath()) + ".hum";
 
 // ─── clwndHum: Bidirectional NDJSON socket ─────────────────────────────────
@@ -185,7 +180,7 @@ async function awakenHum(): Promise<void> {
   }
 }
 
-function hum(msg: Record<string, unknown>): void {
+export function hum(msg: Record<string, unknown>): void {
   if (!humSocket || !humAlive) return;
   try {
     humSocket.write(JSON.stringify(msg) + "\n");
@@ -228,25 +223,6 @@ function humHear(onMessage: HumListener): Promise<void> {
   });
 }
 
-// Legacy HTTP fallback — kept until hum migration is complete
-function earToClwndHum(msg: IpcToDaemon): Promise<Response> {
-  return fetch("http://localhost/stream", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(msg),
-    unix: SOCK_PATH,
-  } as RequestInit);
-}
-
-async function ipcCall(msg: IpcToDaemon): Promise<void> {
-  const r = await fetch("http://localhost/", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(msg),
-    unix: SOCK_PATH,
-  } as RequestInit);
-  if (!r.ok) throw new Error(`clwnd IPC ${r.status}`);
-}
 
 /**
  * Detect auxiliary calls — provider calls with no tools attached.
@@ -460,22 +436,6 @@ async function getSessionPermissions(client: any, sessionId: string): Promise<Ar
 }
 
 // Parse NDJSON lines from buffer
-function parseNDJSON(buffer: string, sessionId: string): { messages: IpcToPlugin[]; remaining: string } {
-  const messages: IpcToPlugin[] = [];
-  const lines = buffer.split("\n");
-  const remaining = lines.pop() ?? "";
-
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    try {
-      const msg = JSON.parse(line) as IpcToPlugin;
-      messages.push(msg);
-    } catch {}
-  }
-
-  return { messages, remaining };
-}
-
 export class ClwndModel implements LanguageModelV2 {
   readonly specificationVersion = "v2";
   readonly modelId: string;
@@ -535,7 +495,9 @@ export class ClwndModel implements LanguageModelV2 {
     let responseText = "";
     const toolCalls: LanguageModelV2Content[] = [];
     const sap = new Map<string, string>();
-    let resolved = false;
+
+    await humAwaken;
+    if (!humAlive) throw new Error("clwndHum not connected");
 
     const result = await new Promise<{
       content: LanguageModelV2Content[];
@@ -543,97 +505,55 @@ export class ClwndModel implements LanguageModelV2 {
       usage: LanguageModelV2Usage;
       providerMetadata: Record<string, unknown>;
     }>((resolve, reject) => {
-      const abort = () => {
-        if (resolved) return;
-        resolved = true;
-        // Don't send destroy — daemon manages session lifecycle for --resume.
-        reject(new Error("aborted"));
-      };
-      opts.abortSignal?.addEventListener("abort", abort);
+      const timeout = setTimeout(() => reject(new Error("doGenerate timeout")), 120_000);
+      opts.abortSignal?.addEventListener("abort", () => { clearTimeout(timeout); reject(new Error("aborted")); });
 
-      earToClwndHum({
-        action: "stream",
-        opencodeSessionId: sid,
-        cwd,
-        modelId: this.modelId,
-        text,
-        systemPrompt,
-        permissions,
-        allowedTools,
-        historyContext,
-      }).then(async (clwndHum) => {
-        if (!clwndHum.body) { abort(); return; }
-        const reader = clwndHum.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
+      humSpeak({
+        sid, cwd, modelId: this.modelId, text,
+        systemPrompt, permissions, allowedTools, historyContext,
+      }, (msg) => {
+        const chi = msg.chi as string;
 
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value!, { stream: true });
-            const { messages, remaining } = parseNDJSON(buffer, sid);
-            buffer = remaining;
-
-            for (const msg of messages) {
-              if (msg.action === "chunk") {
-                const ct = msg.chunkType as string;
-                if (ct === "reasoning_delta" && typeof msg.delta === "string") reasoning += msg.delta;
-                if (ct === "text_delta" && typeof msg.delta === "string") responseText += msg.delta;
-                if (ct === "tool_input_start" && msg.toolCallId) sap.set(msg.toolCallId as string, "");
-                if (ct === "tool_input_delta" && msg.toolCallId && msg.partialJson) {
-                  const prev = sap.get(msg.toolCallId as string) ?? "";
-                  sap.set(msg.toolCallId as string, prev + msg.partialJson);
-                }
-                if (ct === "tool_call" && msg.toolCallId && msg.toolName) {
-                  const accumulated = sap.get(msg.toolCallId as string) ?? "{}";
-                  const mapped = mapToolInput(msg.toolName as string, accumulated);
-                  let input: unknown = {};
-                  try { input = JSON.parse(mapped); } catch { input = {}; }
-                  toolCalls.push({
-                    type: "tool-call",
-                    toolCallId: msg.toolCallId,
-                    toolName: mapToolName(msg.toolName as string),
-                    input,
-                  } as LanguageModelV2Content);
-                }
-              }
-
-              if (msg.action === "finish") {
-                if (resolved) return;
-                resolved = true;
-                const finishReason = (msg.finishReason ?? "stop") as LanguageModelV2FinishReason;
-                const usage = (msg.usage ?? { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined }) as LanguageModelV2Usage;
-                const providerMetadata = msg.providerMetadata ?? {};
-                const content: LanguageModelV2Content[] = [];
-                if (reasoning) content.push({ type: "reasoning", text: reasoning } as LanguageModelV2Content);
-                if (responseText) content.push({ type: "text", text: responseText } as LanguageModelV2Content);
-                content.push(...toolCalls);
-                opts.abortSignal?.removeEventListener("abort", abort);
-                reader.releaseLock();
-                resolve({ content, finishReason, usage, providerMetadata });
-                return;
-              }
-
-              if (msg.action === "error") {
-                if (resolved) return;
-                resolved = true;
-                opts.abortSignal?.removeEventListener("abort", abort);
-                reader.releaseLock();
-                reject(new Error(msg.message));
-                return;
-              }
-            }
+        if (chi === "chunk") {
+          const ct = msg.chunkType as string;
+          if (ct === "reasoning_delta" && typeof msg.delta === "string") reasoning += msg.delta;
+          if (ct === "text_delta" && typeof msg.delta === "string") responseText += msg.delta;
+          if (ct === "tool_input_start" && msg.toolCallId) sap.set(msg.toolCallId as string, "");
+          if (ct === "tool_input_delta" && msg.toolCallId && msg.partialJson) {
+            const prev = sap.get(msg.toolCallId as string) ?? "";
+            sap.set(msg.toolCallId as string, prev + msg.partialJson);
           }
-        } finally {
-          try { reader.releaseLock(); } catch {}
+          if (ct === "tool_call" && msg.toolCallId && msg.toolName) {
+            const accumulated = sap.get(msg.toolCallId as string) ?? "{}";
+            const mapped = mapToolInput(msg.toolName as string, accumulated);
+            let input: unknown = {};
+            try { input = JSON.parse(mapped); } catch { input = {}; }
+            toolCalls.push({
+              type: "tool-call", toolCallId: msg.toolCallId,
+              toolName: mapToolName(msg.toolName as string), input,
+            } as LanguageModelV2Content);
+          }
         }
-        if (!resolved) { resolved = true; reject(new Error("stream ended without finish")); }
-      }).catch((e) => {
-        if (!resolved) { resolved = true; reject(e); }
-      });
 
-      setTimeout(() => { if (!resolved) abort(); }, 120000);
+        if (chi === "finish") {
+          clearTimeout(timeout);
+          const content: LanguageModelV2Content[] = [];
+          if (reasoning) content.push({ type: "reasoning", text: reasoning } as LanguageModelV2Content);
+          if (responseText) content.push({ type: "text", text: responseText } as LanguageModelV2Content);
+          content.push(...toolCalls);
+          resolve({
+            content,
+            finishReason: (msg.finishReason ?? "stop") as LanguageModelV2FinishReason,
+            usage: (msg.usage ?? { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined }) as LanguageModelV2Usage,
+            providerMetadata: msg.providerMetadata ?? {},
+          });
+        }
+
+        if (chi === "error") {
+          clearTimeout(timeout);
+          reject(new Error(msg.message as string));
+        }
+      }).catch(reject);
     });
 
     return {
