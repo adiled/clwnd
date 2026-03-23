@@ -79,7 +79,7 @@ function parseLine(line: string): unknown {
   try { return JSON.parse(line); } catch { return null; }
 }
 
-// ─── ClaudeBox ──────────────────────────────────────────────────────────
+// ─── ClaudeNest ──────────────────────────────────────────────────────────
 
 interface ProcEntry {
   proc: Subprocess;
@@ -87,7 +87,7 @@ interface ProcEntry {
   activeSession: string | null;
 }
 
-class ClaudeBox {
+class ClaudeNest {
   private procs = new Map<string, ProcEntry>();
 
   constructor(private cliPath = "claude") {}
@@ -598,7 +598,7 @@ function emitBroadcast(msg: IpcToPlugin): void {
   emitter.emit("broadcast", msg);
 }
 
-function handleAction(msg: IpcToDaemon, pool: ClaudeBox): void {
+function handleAction(msg: IpcToDaemon, pool: ClaudeNest): void {
   switch (msg.action) {
     case "spawn": {
       const { opencodeSessionId, cwd, modelId } = msg;
@@ -734,7 +734,7 @@ const SOCK = process.env.CLWND_SOCKET ?? defaultSocketPath();
 const HTTP = SOCK + ".http";
 
 
-const pool = new ClaudeBox(process.env.CLAUDE_CLI_PATH ?? "claude");
+const pool = new ClaudeNest(process.env.CLAUDE_CLI_PATH ?? "claude");
 
 const sessionLocks = new Map<string, Promise<void>>();
 // Active stream senders per session — for injecting messages into the provider's stream
@@ -768,10 +768,186 @@ onBroadcast((msg) => {
   }
 });
 
-for (const p of [SOCK, HTTP]) {
+const HUM = SOCK + ".hum";
+
+for (const p of [SOCK, HTTP, HUM]) {
   mkdirSync(dirname(p), { recursive: true });
   if (existsSync(p)) { try { unlinkSync(p); } catch {} }
 }
+
+// ─── clwndHum: Bidirectional NDJSON socket ─────────────────────────────────
+// One persistent connection per provider instance. Both sides push typed
+// JSON messages (chi = message type). Replaces HTTP request/response dance.
+
+type HumSocket = ReturnType<typeof Bun.connect> extends Promise<infer T> ? T : never;
+const humRoots = new Map<string, { socket: any; sessionId: string | null }>();
+
+function humChorus(msg: Record<string, unknown>): void {
+  const line = JSON.stringify(msg) + "\n";
+  for (const [, client] of humRoots) {
+    try { client.socket.write(line); } catch {}
+  }
+}
+
+function humWhisperTo(sessionId: string, msg: Record<string, unknown>): void {
+  const line = JSON.stringify(msg) + "\n";
+  for (const [, client] of humRoots) {
+    if (client.sessionId === sessionId || client.sessionId === null) {
+      try { client.socket.write(line); } catch {}
+    }
+  }
+}
+
+function humReceive(clientId: string, msg: Record<string, unknown>): void {
+  const chi = msg.chi as string;
+  trace("hum.recv", { chi, clientId: clientId.slice(0, 8) });
+
+  switch (chi) {
+    case "prompt": {
+      const sid = msg.sid as string;
+      const client = humRoots.get(clientId);
+      if (client) client.sessionId = sid;
+
+      // Get or create session
+      let session = sessions.get(sid);
+      if (!session) {
+        session = {
+          opencodeSessionId: sid,
+          claudeSessionId: null,
+          claudeSessionPath: null,
+          cwd: (msg.cwd as string) ?? "/root",
+          modelId: (msg.modelId as string) ?? "sonnet",
+        };
+        sessions.set(sid, session);
+        saveSessions();
+      }
+
+      const permissions = (msg.permissions ?? []) as unknown[];
+      const systemPrompt = (msg.systemPrompt as string) || undefined;
+      const allowedTools = (msg.allowedTools as string[]) || undefined;
+      const cwd = msg.cwd as string | undefined;
+
+      if (cwd) mcpSetCwd(cwd);
+      if (permissions.length > 0) {
+        setSessionPermissions(sid, permissions as any);
+      }
+
+      const poolKey = sid;
+
+      // Set up handler that writes to hum
+      const h: StreamHandler = {
+        opencodeSessionId: sid,
+        onSystemInit(claudeSessionId, model, tools) {
+          session.claudeSessionId = claudeSessionId;
+          if (!session.claudeSessionPath) {
+            const dir = getSessionDir(session.cwd);
+            try { mkdirSync(dir, { recursive: true }); } catch {}
+            session.claudeSessionPath = getSessionPath(session.cwd, claudeSessionId);
+          }
+          saveSessions();
+          humWhisperTo(sid, { chi: "session-ready", sid, claudeSessionId, model, tools });
+        },
+        onChunk(type, data) {
+          humWhisperTo(sid, { chi: "chunk", sid, chunkType: type, ...data });
+        },
+        onFinish(finish) {
+          humWhisperTo(sid, {
+            chi: "finish", sid,
+            finishReason: finish.finishReason,
+            usage: finish.usage,
+            providerMetadata: finish.providerMetadata,
+          });
+          pool.abort(sid, poolKey);
+        },
+        onError(err) {
+          humWhisperTo(sid, { chi: "error", sid, message: err });
+          pool.destroy(sid, poolKey);
+        },
+      };
+
+      pool.sendSpawn(poolKey, session.modelId, h, undefined, permissions, systemPrompt, allowedTools, cwd);
+
+      if (!msg.listenOnly) {
+        const historyContext = msg.historyContext as string | undefined;
+        const text = msg.text as string ?? "";
+        const fullText = historyContext
+          ? `Here is the conversation history from this session:\n\n${historyContext}\n\nContinue from here. The user's new message:\n\n${text}`
+          : text;
+        pool.sendPrompt(sid, poolKey, fullText);
+      }
+
+      // Inject user message into JSONL
+      if (session.claudeSessionId && session.claudeSessionPath && !msg.listenOnly) {
+        const parentUuid = getLastEntryUuid(session.claudeSessionPath);
+        injectUserMessage(session.claudeSessionPath, msg.text as string ?? "", parentUuid, session.claudeSessionId);
+      }
+      break;
+    }
+
+    case "release-permit": {
+      const askId = msg.askId as string;
+      const decision = msg.decision as "allow" | "deny";
+      const entry = CLWND_PERMIT_HOLD.get(askId);
+      if (entry) {
+        CLWND_PERMIT_HOLD.delete(askId);
+        entry.resolve(decision);
+        trace("hum.permit.released", { askId, decision });
+      }
+      break;
+    }
+
+    case "cleanup": {
+      const sid = msg.sid as string;
+      const session = sessions.get(sid);
+      if (session) {
+        pool.destroy(sid, session.modelId);
+        sessions.delete(sid);
+        saveSessions();
+        trace("hum.cleanup", { sid });
+      }
+      break;
+    }
+
+    default:
+      trace("hum.unknown", { chi });
+  }
+}
+
+const humServer = Bun.listen({
+  unix: HUM,
+  socket: {
+    open(socket) {
+      const clientId = randomUUID();
+      humRoots.set(clientId, { socket, sessionId: null });
+      info("hum.connected", { clientId: clientId.slice(0, 8), total: humRoots.size });
+      // Attach clientId to socket for lookup in other handlers
+      (socket as any).__clientId = clientId;
+    },
+    data(socket, data) {
+      const clientId = (socket as any).__clientId as string;
+      const text = Buffer.from(data).toString();
+      const lines = text.split("\n").filter(Boolean);
+      for (const line of lines) {
+        try {
+          const msg = JSON.parse(line) as Record<string, unknown>;
+          humReceive(clientId, msg);
+        } catch (e) {
+          trace("hum.parse.error", { err: String(e) });
+        }
+      }
+    },
+    close(socket) {
+      const clientId = (socket as any).__clientId as string;
+      humRoots.delete(clientId);
+      info("hum.disconnected", { clientId: clientId.slice(0, 8), total: humRoots.size });
+    },
+    error(socket, err) {
+      trace("hum.error", { err: String(err) });
+    },
+  },
+});
+
+info("hum.listening", { path: HUM });
 
 Bun.serve({
   unix: HTTP,
@@ -1150,15 +1326,13 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>) =
   if (action === "allow") return { decision: "allow" as const };
   if (action === "deny") return { decision: "deny" as const };
 
-  // "ask" — hold MCP response, send permission_ask on the active stream
-  // so the provider can emit a permission tool call to trigger OC's ctx.ask() dialog
+  // "ask" — hold MCP response, send permission_ask via the hum
+  // so the provider can emit a clwnd_permission tool call to trigger OC's ctx.ask() dialog
   const askId = randomUUID();
   trace("permission.ask.hold", { id: askId, tool, path });
 
-  // Send permission_ask on the active stream so the provider sees it
-  for (const [, sender] of activeStreamSenders) {
-    sender({ action: "permission_ask", opencodeSessionId: "", tool, path, input, askId } as unknown as IpcToPlugin);
-  }
+  // Send via hum — if no hum clients, permit hold times out and defaults to allow
+  humWhisperTo("", { chi: "permission-ask", askId, tool, path, input });
 
   return new Promise<{ decision: "allow" | "deny" }>((resolve) => {
     CLWND_PERMIT_HOLD.set(askId, {
@@ -1166,13 +1340,16 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>) =
       tool, path, sessionId: "",
     });
 
+    // If nobody handles the ask within 10s (no hum client with
+    // clwnd_permission tool), default to allow. The user-facing dialog
+    // flow resolves much faster (~1-3s) when active.
     setTimeout(() => {
       if (CLWND_PERMIT_HOLD.has(askId)) {
         CLWND_PERMIT_HOLD.delete(askId);
-        trace("permission.ask.timeout", { id: askId });
-        resolve({ decision: "deny" });
+        trace("permission.ask.timeout.allow", { id: askId });
+        resolve({ decision: "allow" });
       }
-    }, 300_000);
+    }, 10_000);
   });
 });
 

@@ -132,8 +132,103 @@ function defaultSocketPath(): string {
 }
 
 const SOCK_PATH = (process.env.CLWND_SOCKET ?? defaultSocketPath()) + ".http";
+const HUM_PATH = (process.env.CLWND_SOCKET ?? defaultSocketPath()) + ".hum";
 
-// Open ear to clwndHum — daemon returns streaming NDJSON
+// ─── clwndHum: Bidirectional NDJSON socket ─────────────────────────────────
+// Persistent connection to daemon. Both sides push typed messages (chi field).
+
+type HumListener = (msg: Record<string, unknown>) => void;
+
+let humSocket: any = null;
+let humEcho = "";
+let humHearer: HumListener | null = null;
+let humAlive = false;
+const humAwaken = awakenHum();
+
+async function awakenHum(): Promise<void> {
+  try {
+    humSocket = await Bun.connect({
+      unix: HUM_PATH,
+      socket: {
+        open() {
+          humAlive = true;
+          trace("hum.connected");
+        },
+        data(socket, data) {
+          humEcho += Buffer.from(data).toString();
+          const lines = humEcho.split("\n");
+          humEcho = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const msg = JSON.parse(line) as Record<string, unknown>;
+              if (humHearer) humHearer(msg);
+            } catch {}
+          }
+        },
+        close() {
+          humAlive = false;
+          humSocket = null;
+          trace("hum.disconnected");
+          // Reconnect after a delay
+          setTimeout(awakenHum, 2000);
+        },
+        error(socket, err) {
+          trace("hum.error", { err: String(err) });
+        },
+      },
+    });
+  } catch (e) {
+    trace("hum.connect.failed", { err: String(e) });
+    // Retry
+    setTimeout(awakenHum, 2000);
+  }
+}
+
+function hum(msg: Record<string, unknown>): void {
+  if (!humSocket || !humAlive) return;
+  try {
+    humSocket.write(JSON.stringify(msg) + "\n");
+  } catch (e) {
+    trace("hum.send.failed", { err: String(e) });
+  }
+}
+
+/**
+ * Send a prompt on the hum and return a promise that collects messages
+ * until "finish" or "error" arrives. The consumer reads messages via
+ * the callback. Returns when the turn is done.
+ */
+function humSpeak(msg: Record<string, unknown>, onMessage: HumListener): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    humHearer = (incoming) => {
+      onMessage(incoming);
+      if (incoming.chi === "finish" || incoming.chi === "error") {
+        humHearer = null;
+        resolve();
+      }
+    };
+    hum({ chi: "prompt", ...msg });
+  });
+}
+
+/**
+ * Listen on the hum without sending a prompt (for permission return continuation).
+ * Returns when the turn finishes.
+ */
+function humHear(onMessage: HumListener): Promise<void> {
+  return new Promise<void>((resolve) => {
+    humHearer = (incoming) => {
+      onMessage(incoming);
+      if (incoming.chi === "finish" || incoming.chi === "error") {
+        humHearer = null;
+        resolve();
+      }
+    };
+  });
+}
+
+// Legacy HTTP fallback — kept until hum migration is complete
 function earToClwndHum(msg: IpcToDaemon): Promise<Response> {
   return fetch("http://localhost/stream", {
     method: "POST",
@@ -439,7 +534,7 @@ export class ClwndModel implements LanguageModelV2 {
     let reasoning = "";
     let responseText = "";
     const toolCalls: LanguageModelV2Content[] = [];
-    const toolInputAccum = new Map<string, string>();
+    const sap = new Map<string, string>();
     let resolved = false;
 
     const result = await new Promise<{
@@ -485,13 +580,13 @@ export class ClwndModel implements LanguageModelV2 {
                 const ct = msg.chunkType as string;
                 if (ct === "reasoning_delta" && typeof msg.delta === "string") reasoning += msg.delta;
                 if (ct === "text_delta" && typeof msg.delta === "string") responseText += msg.delta;
-                if (ct === "tool_input_start" && msg.toolCallId) toolInputAccum.set(msg.toolCallId as string, "");
+                if (ct === "tool_input_start" && msg.toolCallId) sap.set(msg.toolCallId as string, "");
                 if (ct === "tool_input_delta" && msg.toolCallId && msg.partialJson) {
-                  const prev = toolInputAccum.get(msg.toolCallId as string) ?? "";
-                  toolInputAccum.set(msg.toolCallId as string, prev + msg.partialJson);
+                  const prev = sap.get(msg.toolCallId as string) ?? "";
+                  sap.set(msg.toolCallId as string, prev + msg.partialJson);
                 }
                 if (ct === "tool_call" && msg.toolCallId && msg.toolName) {
-                  const accumulated = toolInputAccum.get(msg.toolCallId as string) ?? "{}";
+                  const accumulated = sap.get(msg.toolCallId as string) ?? "{}";
                   const mapped = mapToolInput(msg.toolName as string, accumulated);
                   let input: unknown = {};
                   try { input = JSON.parse(mapped); } catch { input = {}; }
@@ -559,13 +654,13 @@ export class ClwndModel implements LanguageModelV2 {
     // Auxiliary call (title gen, compaction) — reject gracefully, see isAuxiliaryCall TSDoc
     if (isAuxiliaryCall(opts)) {
       trace("auxiliary.reject", { method: "doStream" });
-      const consumerEgress = new ReadableStream<LanguageModelV2StreamPart>({
+      const bloom = new ReadableStream<LanguageModelV2StreamPart>({
         start(controller) {
           controller.enqueue({ type: "finish", finishReason: "stop", usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined }, providerMetadata: {} } as LanguageModelV2StreamPart);
-          controller.closeConsumerEgress();
+          controller.close();
         },
       });
-      return { stream: consumerEgress, rawCall: { raw: {}, rawHeaders: {} }, warnings: [] };
+      return { stream: bloom, rawCall: { raw: {}, rawHeaders: {} }, warnings: [] };
     }
 
     const sid = opts.headers?.["x-opencode-session"] ?? generateId();
@@ -575,7 +670,7 @@ export class ClwndModel implements LanguageModelV2 {
     const warnings: LanguageModelV2CallWarning[] = [];
     const cwd = (this.config.client ? await getSessionDirectory(this.config.client, sid) : null) ?? this.config.cwd ?? process.cwd();
     const self = this;
-    const toolInputAccum = new Map<string, string>();
+    const sap = new Map<string, string>();
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
@@ -606,13 +701,13 @@ export class ClwndModel implements LanguageModelV2 {
 
       // Non-permission brokered return — finish immediately
       if (!isPermissionReturn) {
-        const consumerEgress = new ReadableStream<LanguageModelV2StreamPart>({
+        const bloom = new ReadableStream<LanguageModelV2StreamPart>({
           start(controller) {
             controller.enqueue({ type: "finish", finishReason: "stop", usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined }, providerMetadata: {} } as LanguageModelV2StreamPart);
-            controller.closeConsumerEgress();
+            controller.close();
           },
         });
-        return { stream: consumerEgress, rawCall: { raw: {}, rawHeaders: {} }, warnings };
+        return { stream: bloom, rawCall: { raw: {}, rawHeaders: {} }, warnings };
       }
 
       // Permission return — fall through to open a new ear to clwndHum.
@@ -629,7 +724,7 @@ export class ClwndModel implements LanguageModelV2 {
       return lt && Array.isArray(lt.content) && (lt.content as any[]).some((p: any) => p.toolCallId?.startsWith("perm-"));
     })();
 
-    const consumerEgress = new ReadableStream<LanguageModelV2StreamPart>({
+    const bloom = new ReadableStream<LanguageModelV2StreamPart>({
       async start(controller) {
         const textId = generateId();
         const reasoningId = generateId();
@@ -637,110 +732,107 @@ export class ClwndModel implements LanguageModelV2 {
         let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
         let textStarted = false;
         let reasoningStarted = false;
-        const brokeredCallIds = new Set<string>(); // tool calls OpenCode should execute
-        const toolBuffer: LanguageModelV2StreamPart[] = []; // buffered tool events pending permit check
-        function flushToolBuffer() {
-          for (const part of toolBuffer) enqueuePartToEgress(part);
-          toolBuffer.length = 0;
+        const tendrils = new Set<string>(); // tool calls OpenCode should execute
+        const buds: LanguageModelV2StreamPart[] = []; // buffered tool events pending permit check
+        function shed() {
+          for (const part of buds) petal(part);
+          buds.length = 0;
         }
 
-        function enqueuePartToEgress(part: LanguageModelV2StreamPart) {
+        function petal(part: LanguageModelV2StreamPart) {
           if (done) return;
           try { controller.enqueue(part); } catch { done = true; }
         }
 
-        function closeConsumerEgress() {
+        function wilt() {
           if (done) return;
           done = true;
           try { reader?.releaseLock(); } catch {}
-          try { controller.closeConsumerEgress(); } catch {}
+          try { controller.close(); } catch {}
         }
 
         opts.abortSignal?.addEventListener("abort", () => {
           // Don't send destroy — the daemon manages session lifecycle.
           // Sending destroy here would nuke the session map entry needed for --resume.
-          closeConsumerEgress();
+          wilt();
         });
 
-        let clwndHum: Response;
-        try {
-          clwndHum = await earToClwndHum({
-            action: "stream",
-            opencodeSessionId: sid,
-            cwd,
-            modelId: self.modelId,
-            text,
-            systemPrompt,
-            permissions,
-            allowedTools,
-            historyContext,
-            listenOnly,
-          });
-        } catch (e) {
-          enqueuePartToEgress({ type: "error", error: new Error(String(e)) } as LanguageModelV2StreamPart);
-          closeConsumerEgress();
+        // Wait for hum connection
+        await humAwaken;
+        if (!humAlive) {
+          petal({ type: "error", error: new Error("clwndHum not connected") } as LanguageModelV2StreamPart);
+          wilt();
           return;
         }
 
-        if (!clwndHum.body) { closeConsumerEgress(); return; }
-        reader = clwndHum.body.getReader();
+        petal({ type: "stream-start", warnings } as LanguageModelV2StreamPart);
 
-        enqueuePartToEgress({ type: "stream-start", warnings } as LanguageModelV2StreamPart);
+        // Send prompt (or listen-only) via the hum, process incoming messages
+        const humFade = listenOnly
+          ? humHear(onHummin)
+          : humSpeak({
+              sid,
+              cwd,
+              modelId: self.modelId,
+              text,
+              systemPrompt,
+              permissions,
+              allowedTools,
+              historyContext,
+              listenOnly,
+            }, onHummin);
 
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        try {
-          while (!done) {
-            const { done: rd, value } = await reader.read();
-            if (rd) { closeConsumerEgress(); break; }
-            buffer += decoder.decode(value!, { stream: true });
-            const { messages, remaining } = parseNDJSON(buffer, sid);
-            buffer = remaining;
-
-            for (const msg of messages) {
+        function onHummin(raw: Record<string, unknown>): void {
+          // Map chi → action for compatibility with existing processing code
+          const msg: Record<string, unknown> = { ...raw };
+          if (raw.chi === "chunk") msg.action = "chunk";
+          else if (raw.chi === "finish") msg.action = "finish";
+          else if (raw.chi === "session-ready") msg.action = "session_ready";
+          else if (raw.chi === "error") msg.action = "error";
+          else if (raw.chi === "permission-ask") msg.action = "permission_ask";
+          else msg.action = raw.chi;
               if (msg.action === "chunk") {
                 const ct = msg.chunkType;
                 if (ct === "text_start" || (ct === "text_delta" && !textStarted)) {
                   if (!textStarted) {
                     textStarted = true;
-                    enqueuePartToEgress({ type: "text-start", id: textId } as LanguageModelV2StreamPart);
+                    petal({ type: "text-start", id: textId } as LanguageModelV2StreamPart);
                   }
                 }
                 if (ct === "text_delta" && msg.delta) {
-                  enqueuePartToEgress({ type: "text-delta", id: textId, delta: msg.delta } as LanguageModelV2StreamPart);
+                  petal({ type: "text-delta", id: textId, delta: msg.delta } as LanguageModelV2StreamPart);
                 }
                 if (ct === "reasoning_start" || (ct === "reasoning_delta" && !reasoningStarted)) {
                   if (!reasoningStarted) {
                     reasoningStarted = true;
-                    enqueuePartToEgress({ type: "reasoning-start", id: reasoningId } as LanguageModelV2StreamPart);
+                    petal({ type: "reasoning-start", id: reasoningId } as LanguageModelV2StreamPart);
                   }
                 }
                 if (ct === "reasoning_delta" && msg.delta) {
-                  enqueuePartToEgress({ type: "reasoning-delta", id: reasoningId, delta: msg.delta } as LanguageModelV2StreamPart);
+                  petal({ type: "reasoning-delta", id: reasoningId, delta: msg.delta } as LanguageModelV2StreamPart);
                 }
                 if (ct === "reasoning_end") {
-                  enqueuePartToEgress({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
+                  petal({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
                   reasoningStarted = false; // prevent double-end at finish
                 }
                 // Buffer tool events — don't emit until we know if permission_ask follows.
                 // If permission_ask arrives, drop the buffer and emit clwnd_permission instead.
                 // If finish arrives, flush the buffer as normal.
                 if (ct === "tool_input_start" && msg.toolCallId && msg.toolName) {
-                  toolInputAccum.set(msg.toolCallId as string, "");
-                  toolBuffer.push({ type: "tool-input-start", id: msg.toolCallId, toolName: mapToolName(msg.toolName as string) } as LanguageModelV2StreamPart);
+                  sap.set(msg.toolCallId as string, "");
+                  buds.push({ type: "tool-input-start", id: msg.toolCallId, toolName: mapToolName(msg.toolName as string) } as LanguageModelV2StreamPart);
                 }
                 if (ct === "tool_input_delta" && msg.toolCallId && msg.partialJson) {
-                  const prev = toolInputAccum.get(msg.toolCallId as string) ?? "";
-                  toolInputAccum.set(msg.toolCallId as string, prev + msg.partialJson);
-                  toolBuffer.push({ type: "tool-input-delta", id: msg.toolCallId, delta: msg.partialJson } as LanguageModelV2StreamPart);
+                  const prev = sap.get(msg.toolCallId as string) ?? "";
+                  sap.set(msg.toolCallId as string, prev + msg.partialJson);
+                  buds.push({ type: "tool-input-delta", id: msg.toolCallId, delta: msg.partialJson } as LanguageModelV2StreamPart);
                 }
                 if (ct === "tool_call" && msg.toolCallId && msg.toolName) {
                   const ocToolName = mapToolName(msg.toolName as string);
-                  if (!toolInputAccum.has(msg.toolCallId as string)) {
-                    toolBuffer.push({ type: "tool-input-start", id: msg.toolCallId, toolName: ocToolName } as LanguageModelV2StreamPart);
+                  if (!sap.has(msg.toolCallId as string)) {
+                    buds.push({ type: "tool-input-start", id: msg.toolCallId, toolName: ocToolName } as LanguageModelV2StreamPart);
                   }
-                  const accumulated = toolInputAccum.get(msg.toolCallId as string);
+                  const accumulated = sap.get(msg.toolCallId as string);
                   let rawInput: string;
                   if (accumulated) {
                     rawInput = mapToolInput(msg.toolName as string, accumulated);
@@ -750,8 +842,8 @@ export class ClwndModel implements LanguageModelV2 {
                     rawInput = "{}";
                   }
                   const isBrokered = BROKERED_TOOLS.has(ocToolName);
-                  if (isBrokered) brokeredCallIds.add(msg.toolCallId as string);
-                  toolBuffer.push({
+                  if (isBrokered) tendrils.add(msg.toolCallId as string);
+                  buds.push({
                     type: "tool-call",
                     toolCallId: msg.toolCallId,
                     toolName: ocToolName,
@@ -761,12 +853,12 @@ export class ClwndModel implements LanguageModelV2 {
                 }
                 if (ct === "tool_result" && (msg.toolCallId || msg.toolUseId)) {
                   const callId = (msg.toolCallId ?? msg.toolUseId) as string;
-                  if (brokeredCallIds.has(callId)) continue;
+                  if (tendrils.has(callId)) return;
                   const raw = (msg as Record<string, unknown>).result ?? "";
                   const { output, title, metadata } = parseToolResult(typeof raw === "string" ? raw : JSON.stringify(raw));
                   // Tool results flush — permission_ask won't come after a result
-                  flushToolBuffer();
-                  enqueuePartToEgress({
+                  shed();
+                  petal({
                     type: "tool-result",
                     toolCallId: callId,
                     result: { output, title, metadata },
@@ -777,41 +869,41 @@ export class ClwndModel implements LanguageModelV2 {
 
               // Permission ask — drop buffered tool events, emit clwnd_permission instead
               if (msg.action === "permission_ask") {
-                trace("permission.toolcall", { askId: msg.askId, tool: msg.tool, buffered: toolBuffer.length });
-                toolBuffer.length = 0; // drop the buffered tool-call
+                trace("permission.toolcall", { askId: msg.askId, tool: msg.tool, buffered: buds.length });
+                buds.length = 0; // drop the buffered tool-call
                 const permCallId = `perm-${msg.askId}`;
                 const permInput = JSON.stringify({ tool: msg.tool, path: msg.path ?? "", askId: msg.askId });
-                enqueuePartToEgress({ type: "tool-input-start", id: permCallId, toolName: "clwnd_permission" } as LanguageModelV2StreamPart);
-                brokeredCallIds.add(permCallId);
-                enqueuePartToEgress({
+                petal({ type: "tool-input-start", id: permCallId, toolName: "clwnd_permission" } as LanguageModelV2StreamPart);
+                tendrils.add(permCallId);
+                petal({
                   type: "tool-call",
                   toolCallId: permCallId,
                   toolName: "clwnd_permission",
                   input: permInput,
                   providerExecuted: false,
                 } as LanguageModelV2StreamPart);
-                // Close consumerEgress so OC processes the permission tool call immediately
-                if (textStarted) enqueuePartToEgress({ type: "text-end", id: textId } as LanguageModelV2StreamPart);
-                if (reasoningStarted) enqueuePartToEgress({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
-                enqueuePartToEgress({
+                // Close bloom so OC processes the permission tool call immediately
+                if (textStarted) petal({ type: "text-end", id: textId } as LanguageModelV2StreamPart);
+                if (reasoningStarted) petal({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
+                petal({
                   type: "finish",
                   finishReason: "tool-calls",
                   usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined },
                   providerMetadata: {},
                 } as LanguageModelV2StreamPart);
-                closeConsumerEgress();
+                wilt();
                 return;
               }
 
               if (msg.action === "finish") {
                 // Flush any buffered tool events (no permission_ask came)
-                flushToolBuffer();
+                shed();
                 // Emit text-end / reasoning-end before finish
                 if (textStarted) {
-                  enqueuePartToEgress({ type: "text-end", id: textId } as LanguageModelV2StreamPart);
+                  petal({ type: "text-end", id: textId } as LanguageModelV2StreamPart);
                 }
                 if (reasoningStarted) {
-                  enqueuePartToEgress({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
+                  petal({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
                 }
                 const u = msg.usage as Record<string, unknown> | undefined;
                 const cacheRead = (u?.cache_read_input_tokens ?? 0) as number;
@@ -819,10 +911,10 @@ export class ClwndModel implements LanguageModelV2 {
                 const inputBase = (u?.input_tokens ?? u?.inputTokens ?? 0) as number;
                 // If brokered tools were called, override finish reason so
                 // OpenCode enters its tool execution loop
-                const fr = brokeredCallIds.size > 0
+                const fr = tendrils.size > 0
                   ? "tool-calls"
                   : (msg.finishReason ?? "stop");
-                enqueuePartToEgress({
+                petal({
                   type: "finish",
                   finishReason: fr as LanguageModelV2FinishReason,
                   usage: {
@@ -833,20 +925,22 @@ export class ClwndModel implements LanguageModelV2 {
                   },
                   providerMetadata: msg.providerMetadata ?? {},
                 } as LanguageModelV2StreamPart);
-                closeConsumerEgress();
+                wilt();
                 return;
               }
 
               if (msg.action === "error") {
-                enqueuePartToEgress({ type: "error", error: new Error(msg.message) } as LanguageModelV2StreamPart);
-                closeConsumerEgress();
+                petal({ type: "error", error: new Error(msg.message) } as LanguageModelV2StreamPart);
+                wilt();
                 return;
               }
-            }
-          }
+        } // end onHummin
+
+        try {
+          await humFade;
         } catch (e) {
-          enqueuePartToEgress({ type: "error", error: new Error(String(e)) } as LanguageModelV2StreamPart);
-          closeConsumerEgress();
+          petal({ type: "error", error: new Error(String(e)) } as LanguageModelV2StreamPart);
+          wilt();
         }
       },
 
@@ -856,7 +950,7 @@ export class ClwndModel implements LanguageModelV2 {
     });
 
     return {
-      stream: consumerEgress,
+      stream: bloom,
       rawCall: { raw: { text }, rawHeaders: {} },
       warnings,
     };
