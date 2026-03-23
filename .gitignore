@@ -5,4 +5,5 @@ bun.lock
 .claude/
 *.md
 !README.md
+!HUMAN2HUMAN.md
 dev
