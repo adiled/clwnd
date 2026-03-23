@@ -133,8 +133,8 @@ function defaultSocketPath(): string {
 
 const SOCK_PATH = (process.env.CLWND_SOCKET ?? defaultSocketPath()) + ".http";
 
-// POST to daemon, get streaming NDJSON response back
-function streamCall(msg: IpcToDaemon): Promise<Response> {
+// Open ear to clwndHum — daemon returns streaming NDJSON
+function earToClwndHum(msg: IpcToDaemon): Promise<Response> {
   return fetch("http://localhost/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -182,8 +182,12 @@ function isBrokeredToolReturn(prompt: LanguageModelV2Prompt): boolean {
   if (prompt.length < 2) return false;
   const last = prompt[prompt.length - 1];
   if (last.role !== "tool" || !Array.isArray(last.content)) return false;
-  for (const part of last.content as Array<{ type: string; toolName?: string }>) {
-    if (part.type === "tool-result" && part.toolName && BROKERED_TOOLS.has(part.toolName)) {
+  for (const part of last.content as Array<{ type: string; toolName?: string; toolCallId?: string }>) {
+    if (part.type === "tool-result" && (
+      (part.toolName && BROKERED_TOOLS.has(part.toolName)) ||
+      part.toolName === "clwnd_permission" ||
+      part.toolCallId?.startsWith("perm-")
+    )) {
       return true;
     }
   }
@@ -452,7 +456,7 @@ export class ClwndModel implements LanguageModelV2 {
       };
       opts.abortSignal?.addEventListener("abort", abort);
 
-      streamCall({
+      earToClwndHum({
         action: "stream",
         opencodeSessionId: sid,
         cwd,
@@ -462,9 +466,9 @@ export class ClwndModel implements LanguageModelV2 {
         permissions,
         allowedTools,
         historyContext,
-      }).then(async (resp) => {
-        if (!resp.body) { abort(); return; }
-        const reader = resp.body.getReader();
+      }).then(async (clwndHum) => {
+        if (!clwndHum.body) { abort(); return; }
+        const reader = clwndHum.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
 
@@ -555,13 +559,13 @@ export class ClwndModel implements LanguageModelV2 {
     // Auxiliary call (title gen, compaction) — reject gracefully, see isAuxiliaryCall TSDoc
     if (isAuxiliaryCall(opts)) {
       trace("auxiliary.reject", { method: "doStream" });
-      const stream = new ReadableStream<LanguageModelV2StreamPart>({
+      const consumerEgress = new ReadableStream<LanguageModelV2StreamPart>({
         start(controller) {
           controller.enqueue({ type: "finish", finishReason: "stop", usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined }, providerMetadata: {} } as LanguageModelV2StreamPart);
-          controller.close();
+          controller.closeConsumerEgress();
         },
       });
-      return { stream, rawCall: { raw: {}, rawHeaders: {} }, warnings: [] };
+      return { stream: consumerEgress, rawCall: { raw: {}, rawHeaders: {} }, warnings: [] };
     }
 
     const sid = opts.headers?.["x-opencode-session"] ?? generateId();
@@ -584,44 +588,48 @@ export class ClwndModel implements LanguageModelV2 {
     }
 
     // Brokered tool return — OpenCode executed the tool, sending result back.
-    // Claude already responded in the previous turn. Finish immediately.
-    // For permission tool calls, relay the result to the daemon.
     if (isBrokeredToolReturn(opts.prompt)) {
       trace("brokered.return", { sid });
 
-      // Check if this is a permission return
+      // Check if this is a permission return — if so, fall through to normal
+      // stream handling so Claude CLI's continuation (write + response) flows to OC
+      let isPermissionReturn = false;
       const lastTool = opts.prompt.findLast(m => m.role === "tool");
       if (lastTool && Array.isArray(lastTool.content)) {
         for (const part of lastTool.content as Array<{ type: string; toolCallId?: string; result?: unknown; isError?: boolean }>) {
           if (part.type === "tool-result" && part.toolCallId?.startsWith("perm-")) {
-            const askId = part.toolCallId.replace("perm-", "");
-            const decision = part.isError ? "deny" : "allow";
-            trace("permission.return", { askId, decision });
-            // Tell daemon the permission decision
-            try {
-              await fetch("http://localhost/permission-perm-result", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ askId, decision }),
-                unix: SOCK_PATH,
-              } as RequestInit);
-            } catch (e) {
-              trace("permission.return.failed", { err: String(e) });
-            }
+            isPermissionReturn = true;
+            trace("permission.return", { callId: part.toolCallId });
           }
         }
       }
 
-      const stream = new ReadableStream<LanguageModelV2StreamPart>({
-        start(controller) {
-          controller.enqueue({ type: "finish", finishReason: "stop", usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined }, providerMetadata: {} } as LanguageModelV2StreamPart);
-          controller.close();
-        },
-      });
-      return { stream, rawCall: { raw: {}, rawHeaders: {} }, warnings };
+      // Non-permission brokered return — finish immediately
+      if (!isPermissionReturn) {
+        const consumerEgress = new ReadableStream<LanguageModelV2StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: "finish", finishReason: "stop", usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined }, providerMetadata: {} } as LanguageModelV2StreamPart);
+            controller.closeConsumerEgress();
+          },
+        });
+        return { stream: consumerEgress, rawCall: { raw: {}, rawHeaders: {} }, warnings };
+      }
+
+      // Permission return — fall through to open a new ear to clwndHum.
+      // Claude CLI already executed the tool and is continuing. The daemon's
+      // stream endpoint will attach to the persistent process and forward
+      // the write tool call + result + text response to OC.
+      trace("permission.continue", { sid });
+      historyContext = undefined; // don't re-seed
     }
 
-    const stream = new ReadableStream<LanguageModelV2StreamPart>({
+    // Flag for permission return — daemon should listen only, not send a prompt
+    const listenOnly = isBrokeredToolReturn(opts.prompt) && (() => {
+      const lt = opts.prompt.findLast(m => m.role === "tool");
+      return lt && Array.isArray(lt.content) && (lt.content as any[]).some((p: any) => p.toolCallId?.startsWith("perm-"));
+    })();
+
+    const consumerEgress = new ReadableStream<LanguageModelV2StreamPart>({
       async start(controller) {
         const textId = generateId();
         const reasoningId = generateId();
@@ -630,28 +638,33 @@ export class ClwndModel implements LanguageModelV2 {
         let textStarted = false;
         let reasoningStarted = false;
         const brokeredCallIds = new Set<string>(); // tool calls OpenCode should execute
+        const toolBuffer: LanguageModelV2StreamPart[] = []; // buffered tool events pending permit check
+        function flushToolBuffer() {
+          for (const part of toolBuffer) enqueuePartToEgress(part);
+          toolBuffer.length = 0;
+        }
 
-        function emit(part: LanguageModelV2StreamPart) {
+        function enqueuePartToEgress(part: LanguageModelV2StreamPart) {
           if (done) return;
           try { controller.enqueue(part); } catch { done = true; }
         }
 
-        function close() {
+        function closeConsumerEgress() {
           if (done) return;
           done = true;
           try { reader?.releaseLock(); } catch {}
-          try { controller.close(); } catch {}
+          try { controller.closeConsumerEgress(); } catch {}
         }
 
         opts.abortSignal?.addEventListener("abort", () => {
           // Don't send destroy — the daemon manages session lifecycle.
           // Sending destroy here would nuke the session map entry needed for --resume.
-          close();
+          closeConsumerEgress();
         });
 
-        let resp: Response;
+        let clwndHum: Response;
         try {
-          resp = await streamCall({
+          clwndHum = await earToClwndHum({
             action: "stream",
             opencodeSessionId: sid,
             cwd,
@@ -661,17 +674,18 @@ export class ClwndModel implements LanguageModelV2 {
             permissions,
             allowedTools,
             historyContext,
+            listenOnly,
           });
         } catch (e) {
-          emit({ type: "error", error: new Error(String(e)) } as LanguageModelV2StreamPart);
-          close();
+          enqueuePartToEgress({ type: "error", error: new Error(String(e)) } as LanguageModelV2StreamPart);
+          closeConsumerEgress();
           return;
         }
 
-        if (!resp.body) { close(); return; }
-        reader = resp.body.getReader();
+        if (!clwndHum.body) { closeConsumerEgress(); return; }
+        reader = clwndHum.body.getReader();
 
-        emit({ type: "stream-start", warnings } as LanguageModelV2StreamPart);
+        enqueuePartToEgress({ type: "stream-start", warnings } as LanguageModelV2StreamPart);
 
         const decoder = new TextDecoder();
         let buffer = "";
@@ -679,7 +693,7 @@ export class ClwndModel implements LanguageModelV2 {
         try {
           while (!done) {
             const { done: rd, value } = await reader.read();
-            if (rd) { close(); break; }
+            if (rd) { closeConsumerEgress(); break; }
             buffer += decoder.decode(value!, { stream: true });
             const { messages, remaining } = parseNDJSON(buffer, sid);
             buffer = remaining;
@@ -690,43 +704,42 @@ export class ClwndModel implements LanguageModelV2 {
                 if (ct === "text_start" || (ct === "text_delta" && !textStarted)) {
                   if (!textStarted) {
                     textStarted = true;
-                    emit({ type: "text-start", id: textId } as LanguageModelV2StreamPart);
+                    enqueuePartToEgress({ type: "text-start", id: textId } as LanguageModelV2StreamPart);
                   }
                 }
                 if (ct === "text_delta" && msg.delta) {
-                  emit({ type: "text-delta", id: textId, delta: msg.delta } as LanguageModelV2StreamPart);
+                  enqueuePartToEgress({ type: "text-delta", id: textId, delta: msg.delta } as LanguageModelV2StreamPart);
                 }
                 if (ct === "reasoning_start" || (ct === "reasoning_delta" && !reasoningStarted)) {
                   if (!reasoningStarted) {
                     reasoningStarted = true;
-                    emit({ type: "reasoning-start", id: reasoningId } as LanguageModelV2StreamPart);
+                    enqueuePartToEgress({ type: "reasoning-start", id: reasoningId } as LanguageModelV2StreamPart);
                   }
                 }
                 if (ct === "reasoning_delta" && msg.delta) {
-                  emit({ type: "reasoning-delta", id: reasoningId, delta: msg.delta } as LanguageModelV2StreamPart);
+                  enqueuePartToEgress({ type: "reasoning-delta", id: reasoningId, delta: msg.delta } as LanguageModelV2StreamPart);
                 }
                 if (ct === "reasoning_end") {
-                  emit({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
+                  enqueuePartToEgress({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
                   reasoningStarted = false; // prevent double-end at finish
                 }
+                // Buffer tool events — don't emit until we know if permission_ask follows.
+                // If permission_ask arrives, drop the buffer and emit clwnd_permission instead.
+                // If finish arrives, flush the buffer as normal.
                 if (ct === "tool_input_start" && msg.toolCallId && msg.toolName) {
                   toolInputAccum.set(msg.toolCallId as string, "");
-                  emit({ type: "tool-input-start", id: msg.toolCallId, toolName: mapToolName(msg.toolName as string) } as LanguageModelV2StreamPart);
+                  toolBuffer.push({ type: "tool-input-start", id: msg.toolCallId, toolName: mapToolName(msg.toolName as string) } as LanguageModelV2StreamPart);
                 }
                 if (ct === "tool_input_delta" && msg.toolCallId && msg.partialJson) {
                   const prev = toolInputAccum.get(msg.toolCallId as string) ?? "";
                   toolInputAccum.set(msg.toolCallId as string, prev + msg.partialJson);
-                  emit({ type: "tool-input-delta", id: msg.toolCallId, delta: msg.partialJson } as LanguageModelV2StreamPart);
+                  toolBuffer.push({ type: "tool-input-delta", id: msg.toolCallId, delta: msg.partialJson } as LanguageModelV2StreamPart);
                 }
                 if (ct === "tool_call" && msg.toolCallId && msg.toolName) {
                   const ocToolName = mapToolName(msg.toolName as string);
-                  // For MCP tools, tool_input_start may never fire (Claude CLI emits
-                  // the full assistant message, not streaming content blocks). Emit
-                  // tool-input-start so OpenCode's processor creates the part entry.
                   if (!toolInputAccum.has(msg.toolCallId as string)) {
-                    emit({ type: "tool-input-start", id: msg.toolCallId, toolName: ocToolName } as LanguageModelV2StreamPart);
+                    toolBuffer.push({ type: "tool-input-start", id: msg.toolCallId, toolName: ocToolName } as LanguageModelV2StreamPart);
                   }
-                  // Resolve input: prefer accumulated from streaming, fall back to msg.input
                   const accumulated = toolInputAccum.get(msg.toolCallId as string);
                   let rawInput: string;
                   if (accumulated) {
@@ -738,7 +751,7 @@ export class ClwndModel implements LanguageModelV2 {
                   }
                   const isBrokered = BROKERED_TOOLS.has(ocToolName);
                   if (isBrokered) brokeredCallIds.add(msg.toolCallId as string);
-                  emit({
+                  toolBuffer.push({
                     type: "tool-call",
                     toolCallId: msg.toolCallId,
                     toolName: ocToolName,
@@ -748,11 +761,12 @@ export class ClwndModel implements LanguageModelV2 {
                 }
                 if (ct === "tool_result" && (msg.toolCallId || msg.toolUseId)) {
                   const callId = (msg.toolCallId ?? msg.toolUseId) as string;
-                  // Swallow results for brokered tools — OpenCode will execute them
                   if (brokeredCallIds.has(callId)) continue;
                   const raw = (msg as Record<string, unknown>).result ?? "";
                   const { output, title, metadata } = parseToolResult(typeof raw === "string" ? raw : JSON.stringify(raw));
-                  emit({
+                  // Tool results flush — permission_ask won't come after a result
+                  flushToolBuffer();
+                  enqueuePartToEgress({
                     type: "tool-result",
                     toolCallId: callId,
                     result: { output, title, metadata },
@@ -761,44 +775,43 @@ export class ClwndModel implements LanguageModelV2 {
                 }
               }
 
-              // Phantom tool call for permission ask — emit clwnd_permission
-              // tool with providerExecuted: false. OC executes it via
-              // resolveTools() → execute() → ctx.ask() → TUI permission dialog.
-              // Then emit finish with tool-calls to close the stream so OC
-              // processes it immediately.
+              // Permission ask — drop buffered tool events, emit clwnd_permission instead
               if (msg.action === "permission_ask") {
+                trace("permission.toolcall", { askId: msg.askId, tool: msg.tool, buffered: toolBuffer.length });
+                toolBuffer.length = 0; // drop the buffered tool-call
                 const permCallId = `perm-${msg.askId}`;
                 const permInput = JSON.stringify({ tool: msg.tool, path: msg.path ?? "", askId: msg.askId });
-                trace("permission.toolcall", { askId: msg.askId, tool: msg.tool });
-                emit({ type: "tool-input-start", id: permCallId, toolName: "clwnd_permission" } as LanguageModelV2StreamPart);
+                enqueuePartToEgress({ type: "tool-input-start", id: permCallId, toolName: "clwnd_permission" } as LanguageModelV2StreamPart);
                 brokeredCallIds.add(permCallId);
-                emit({
+                enqueuePartToEgress({
                   type: "tool-call",
                   toolCallId: permCallId,
                   toolName: "clwnd_permission",
                   input: permInput,
                   providerExecuted: false,
                 } as LanguageModelV2StreamPart);
-                // Close stream so OC processes the permission tool call immediately
-                if (textStarted) emit({ type: "text-end", id: textId } as LanguageModelV2StreamPart);
-                if (reasoningStarted) emit({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
-                emit({
+                // Close consumerEgress so OC processes the permission tool call immediately
+                if (textStarted) enqueuePartToEgress({ type: "text-end", id: textId } as LanguageModelV2StreamPart);
+                if (reasoningStarted) enqueuePartToEgress({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
+                enqueuePartToEgress({
                   type: "finish",
                   finishReason: "tool-calls",
                   usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined },
                   providerMetadata: {},
                 } as LanguageModelV2StreamPart);
-                close();
+                closeConsumerEgress();
                 return;
               }
 
               if (msg.action === "finish") {
+                // Flush any buffered tool events (no permission_ask came)
+                flushToolBuffer();
                 // Emit text-end / reasoning-end before finish
                 if (textStarted) {
-                  emit({ type: "text-end", id: textId } as LanguageModelV2StreamPart);
+                  enqueuePartToEgress({ type: "text-end", id: textId } as LanguageModelV2StreamPart);
                 }
                 if (reasoningStarted) {
-                  emit({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
+                  enqueuePartToEgress({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
                 }
                 const u = msg.usage as Record<string, unknown> | undefined;
                 const cacheRead = (u?.cache_read_input_tokens ?? 0) as number;
@@ -809,7 +822,7 @@ export class ClwndModel implements LanguageModelV2 {
                 const fr = brokeredCallIds.size > 0
                   ? "tool-calls"
                   : (msg.finishReason ?? "stop");
-                emit({
+                enqueuePartToEgress({
                   type: "finish",
                   finishReason: fr as LanguageModelV2FinishReason,
                   usage: {
@@ -820,20 +833,20 @@ export class ClwndModel implements LanguageModelV2 {
                   },
                   providerMetadata: msg.providerMetadata ?? {},
                 } as LanguageModelV2StreamPart);
-                close();
+                closeConsumerEgress();
                 return;
               }
 
               if (msg.action === "error") {
-                emit({ type: "error", error: new Error(msg.message) } as LanguageModelV2StreamPart);
-                close();
+                enqueuePartToEgress({ type: "error", error: new Error(msg.message) } as LanguageModelV2StreamPart);
+                closeConsumerEgress();
                 return;
               }
             }
           }
         } catch (e) {
-          emit({ type: "error", error: new Error(String(e)) } as LanguageModelV2StreamPart);
-          close();
+          enqueuePartToEgress({ type: "error", error: new Error(String(e)) } as LanguageModelV2StreamPart);
+          closeConsumerEgress();
         }
       },
 
@@ -843,7 +856,7 @@ export class ClwndModel implements LanguageModelV2 {
     });
 
     return {
-      stream,
+      stream: consumerEgress,
       rawCall: { raw: { text }, rawHeaders: {} },
       warnings,
     };

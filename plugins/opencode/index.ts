@@ -53,9 +53,9 @@ async function startCallbackServer(): Promise<string> {
 
 // ─── Permission Ask State ──────────────────────────────────────────────────
 // When the daemon holds a permission_prompt MCP call and sends permission_ask
-// on the stream, the provider emits a permission tool call for clwnd_permission.
+// on the clwndHum, the provider enqueues a permission tool call for clwnd_permission.
 // OC executes it → the plugin tool's execute() fires → calls ctx.ask() →
-// TUI dialog → user responds → we resolve the pending permission here →
+// TUI dialog → user responds → we release the permit hold →
 // daemon unblocks permission_prompt → Claude CLI proceeds.
 
 interface PendingPermission {
@@ -146,7 +146,7 @@ export const clwndPlugin: Plugin = async (input) => {
           trace("clwnd_permission.approved", { tool: args.tool, askId });
           if (askId) {
             try {
-              const resp = await fetch("http://localhost/permission-result", {
+              const resp = await fetch("http://localhost/release-permit-hold", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ askId, decision: "allow" }),

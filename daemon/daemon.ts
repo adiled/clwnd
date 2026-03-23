@@ -79,7 +79,7 @@ function parseLine(line: string): unknown {
   try { return JSON.parse(line); } catch { return null; }
 }
 
-// ─── SubprocessPool ──────────────────────────────────────────────────────────
+// ─── ClaudeBox ──────────────────────────────────────────────────────────
 
 interface ProcEntry {
   proc: Subprocess;
@@ -87,7 +87,7 @@ interface ProcEntry {
   activeSession: string | null;
 }
 
-class SubprocessPool {
+class ClaudeBox {
   private procs = new Map<string, ProcEntry>();
 
   constructor(private cliPath = "claude") {}
@@ -315,17 +315,17 @@ class SubprocessPool {
           error: "Denied by session permission rules",
         }) + "\n");
       } else if (action === "ask") {
-        // Store as pending — resolved via /permission-respond endpoint
+        // Store in CLWND_PERMIT_HOLD — resolved via /release-permit-hold
         const askId = requestId;
         trace("permission.ask.hold", { id: askId, tool: toolName, path });
 
         // Notify plugin to show toast
-        askPlugin("permission-ask", {
+        ClwndWhisper.whisper("permission-ask", {
           id: askId, sessionId: entry.activeSession ?? "",
           tool: toolName, path, input: m.input ?? {},
         }).catch(() => {});
 
-        pendingPermission.set(askId, {
+        CLWND_PERMIT_HOLD.set(askId, {
           resolve: (decision) => {
             if (decision === "allow") {
               entry.proc.stdin?.write(JSON.stringify({
@@ -350,9 +350,9 @@ class SubprocessPool {
 
         // Timeout after 5 min
         setTimeout(() => {
-          if (pendingPermission.has(askId)) {
-            const p = pendingPermission.get(askId)!;
-            pendingPermission.delete(askId);
+          if (CLWND_PERMIT_HOLD.has(askId)) {
+            const p = CLWND_PERMIT_HOLD.get(askId)!;
+            CLWND_PERMIT_HOLD.delete(askId);
             p.resolve("deny");
             trace("permission.ask.timeout", { id: askId });
           }
@@ -438,24 +438,26 @@ class SubprocessPool {
 
 let pluginCallbackUrl: string | null = null;
 
-async function askPlugin<T = any>(type: string, payload: any, timeoutMs = 120_000): Promise<T> {
-  if (!pluginCallbackUrl) throw new Error("No plugin callback registered");
-  const id = randomUUID();
-  trace("channel.send", { type, id });
-  const resp = await fetch(pluginCallbackUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ type, id, payload }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  const body = await resp.json() as { id: string; result: T };
-  return body.result;
-}
+const ClwndWhisper = {
+  async whisper<T = any>(type: string, payload: any, timeoutMs = 120_000): Promise<T> {
+    if (!pluginCallbackUrl) throw new Error("No plugin callback registered");
+    const id = randomUUID();
+    trace("channel.send", { type, id });
+    const resp = await fetch(pluginCallbackUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type, id, payload }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const body = await resp.json() as { id: string; result: T };
+    return body.result;
+  },
+};
 
 // ─── Permission State ───────────────────────────────────────────────────────
 
 // Pending permission asks — held PreToolUse hook responses waiting for user decision
-const pendingPermission = new Map<string, {
+const CLWND_PERMIT_HOLD = new Map<string, {
   resolve: (decision: "allow" | "deny") => void;
   tool: string;
   path?: string;
@@ -596,7 +598,7 @@ function emitBroadcast(msg: IpcToPlugin): void {
   emitter.emit("broadcast", msg);
 }
 
-function handleAction(msg: IpcToDaemon, pool: SubprocessPool): void {
+function handleAction(msg: IpcToDaemon, pool: ClaudeBox): void {
   switch (msg.action) {
     case "spawn": {
       const { opencodeSessionId, cwd, modelId } = msg;
@@ -732,7 +734,7 @@ const SOCK = process.env.CLWND_SOCKET ?? defaultSocketPath();
 const HTTP = SOCK + ".http";
 
 
-const pool = new SubprocessPool(process.env.CLAUDE_CLI_PATH ?? "claude");
+const pool = new ClaudeBox(process.env.CLAUDE_CLI_PATH ?? "claude");
 
 const sessionLocks = new Map<string, Promise<void>>();
 // Active stream senders per session — for injecting messages into the provider's stream
@@ -795,15 +797,15 @@ Bun.serve({
     }
 
     // Phantom permission result — provider tells daemon the ctx.ask() outcome
-    if (req.method === "POST" && url.pathname === "/permission-result") {
+    if (req.method === "POST" && url.pathname === "/release-permit-hold") {
       return req.json().then((body: { askId: string; decision: "allow" | "deny" }) => {
-        const entry = pendingPermission.get(body.askId);
+        const entry = CLWND_PERMIT_HOLD.get(body.askId);
         if (entry) {
-          pendingPermission.delete(body.askId);
+          CLWND_PERMIT_HOLD.delete(body.askId);
           entry.resolve(body.decision);
           trace("permission.resolved", { askId: body.askId, decision: body.decision });
         } else {
-          trace("permission.notfound", { askId: body.askId, pending: Array.from(pendingPermission.keys()).join(",") });
+          trace("permission.notfound", { askId: body.askId, pending: Array.from(CLWND_PERMIT_HOLD.keys()).join(",") });
         }
         return new Response("ok");
       }).catch(() => new Response("error", { status: 400 }));
@@ -852,7 +854,7 @@ Bun.serve({
         // Persistent process: poolKey = opencodeSessionId (one process per OC session)
         const poolKey = opencodeSessionId;
 
-        const stream = new ReadableStream({
+        const clwndHum = new ReadableStream({
           start(controller) {
             const send = (msg: IpcToPlugin) => {
               if (closed) return;
@@ -926,19 +928,22 @@ Bun.serve({
 
             // First turn: spawn process. Subsequent turns: reuse existing.
             pool.sendSpawn(poolKey, session.modelId, h, undefined, permissions, systemPrompt, allowedTools, cwd as string);
-            const historyContext = body.historyContext as string | undefined;
-            const fullText = historyContext
-              ? `Here is the conversation history from this session:\n\n${historyContext}\n\nContinue from here. The user's new message:\n\n${text}`
-              : (text ?? "");
-            pool.sendPrompt(opencodeSessionId, poolKey, fullText);
+            // listenOnly: don't send a prompt, just read stdout (for permission return)
+            if (!body.listenOnly) {
+              const historyContext = body.historyContext as string | undefined;
+              const fullText = historyContext
+                ? `Here is the conversation history from this session:\n\n${historyContext}\n\nContinue from here. The user's new message:\n\n${text}`
+                : (text ?? "");
+              pool.sendPrompt(opencodeSessionId, poolKey, fullText);
+            }
           },
           cancel() {
             closed = true;
             activeStreamSenders.delete(opencodeSessionId);
-            // If there's a pending permission ask, the stream was closed
+            // If there's a permit hold, the consumerEgress was closed
             // for a permission tool call — DON'T destroy the process, it needs
             // to stay alive for the permission_prompt MCP response.
-            if (pendingPermission.size > 0) {
+            if (CLWND_PERMIT_HOLD.size > 0) {
               pool.abort(opencodeSessionId, poolKey);
               releaseLock!();
               return;
@@ -967,7 +972,7 @@ Bun.serve({
           },
         });
 
-        return new Response(stream, {
+        return new Response(clwndHum, {
           headers: { "Content-Type": "application/x-ndjson" },
         });
       }).catch(() => new Response("error", { status: 500 }));
@@ -1054,7 +1059,7 @@ const mcpServer = Bun.serve({
         if (action === "deny") return hookDeny("Denied by session permission rules");
 
         // "ask" — treated as allow until a viable UX solution is found.
-        // Infrastructure exists (pendingPermission, /permission-pending, /permission-respond)
+        // Infrastructure exists (CLWND_PERMIT_HOLD, /release-permit-hold)
         // but OC's session lock prevents in-band user interaction during a turn.
         // See PERMISSION_ASK_PROPOSAL.md for investigation history.
         if (action === "ask") return hookAllow();
@@ -1065,17 +1070,17 @@ const mcpServer = Bun.serve({
         trace("permission.ask.hold", { id: askId, tool: toolName, path });
 
         // Notify plugin to show toast (fire and forget)
-        askPlugin("permission-ask", {
+        ClwndWhisper.whisper("permission-ask", {
           id: askId, sessionId: ocSessionId ?? sessionId,
           tool: toolName, path, input: body.tool_input ?? {},
         }).catch(() => {});
 
         // Hold until /permission-respond resolves this, or timeout
         const decision = await new Promise<"allow" | "deny">((resolve) => {
-          pendingPermission.set(askId, { resolve, tool: toolName, path, sessionId: ocSessionId ?? sessionId });
+          CLWND_PERMIT_HOLD.set(askId, { resolve, tool: toolName, path, sessionId: ocSessionId ?? sessionId });
           setTimeout(() => {
-            if (pendingPermission.has(askId)) {
-              pendingPermission.delete(askId);
+            if (CLWND_PERMIT_HOLD.has(askId)) {
+              CLWND_PERMIT_HOLD.delete(askId);
               trace("permission.ask.timeout", { id: askId });
               resolve("deny");
             }
@@ -1092,25 +1097,25 @@ const mcpServer = Bun.serve({
       }
     }
 
-    // GET /permission-pending — list pending permission asks
+    // GET /permission-pending — list active permit holds
     if (req.method === "GET" && url.pathname === "/permission-pending") {
-      const pending = Array.from(pendingPermission.entries()).map(([id, p]) => ({
+      const pending = Array.from(CLWND_PERMIT_HOLD.entries()).map(([id, p]) => ({
         id, tool: p.tool, path: p.path, sessionId: p.sessionId,
       }));
       return Response.json(pending);
     }
 
-    // POST /permission-respond — resolve a pending permission ask
+    // POST /permission-respond — release a permit hold
     if (req.method === "POST" && url.pathname === "/permission-respond") {
       try {
         const body = await req.json() as { id?: string; decision: "allow" | "deny" };
         // If no id, resolve the first pending
-        const id = body.id ?? pendingPermission.keys().next().value;
-        if (!id || !pendingPermission.has(id as string)) {
-          return Response.json({ error: "no pending permission" }, { status: 404 });
+        const id = body.id ?? CLWND_PERMIT_HOLD.keys().next().value;
+        if (!id || !CLWND_PERMIT_HOLD.has(id as string)) {
+          return Response.json({ error: "no active permit hold" }, { status: 404 });
         }
-        const entry = pendingPermission.get(id as string)!;
-        pendingPermission.delete(id as string);
+        const entry = CLWND_PERMIT_HOLD.get(id as string)!;
+        CLWND_PERMIT_HOLD.delete(id as string);
         entry.resolve(body.decision);
         trace("permission.respond", { id, decision: body.decision });
         return Response.json({ ok: true });
@@ -1156,14 +1161,14 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>) =
   }
 
   return new Promise<{ decision: "allow" | "deny" }>((resolve) => {
-    pendingPermission.set(askId, {
+    CLWND_PERMIT_HOLD.set(askId, {
       resolve: (decision) => resolve({ decision }),
       tool, path, sessionId: "",
     });
 
     setTimeout(() => {
-      if (pendingPermission.has(askId)) {
-        pendingPermission.delete(askId);
+      if (CLWND_PERMIT_HOLD.has(askId)) {
+        CLWND_PERMIT_HOLD.delete(askId);
         trace("permission.ask.timeout", { id: askId });
         resolve({ decision: "deny" });
       }

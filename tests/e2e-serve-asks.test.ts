@@ -116,30 +116,56 @@ describe("e2e-serve-asks: permission dialog via phantom tool call", () => {
       signal: AbortSignal.timeout(180_000),
     }).then(r => r.json()).catch(() => null);
 
-    // Poll GET /permission for pending permissions and auto-approve
-    let approved = false;
-    for (let i = 0; i < 60; i++) {
-      await Bun.sleep(2_000);
-      try {
-        const pending = await fetch(`${BASE}/permission`).then(r => r.json()) as any[];
-        if (pending && pending.length > 0) {
-          for (const perm of pending) {
-            await fetch(`${BASE}/permission/${perm.id}/reply`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ reply: "once" }),
-            });
-            approved = true;
+    // Keep approving ALL permission prompts until editPromise resolves.
+    // Claude's turn may trigger multiple ask permissions (edit, read, etc.)
+    let approvedCount = 0;
+    const approver = (async () => {
+      while (true) {
+        await Bun.sleep(1_000);
+        try {
+          const pending = await fetch(`${BASE}/permission`).then(r => r.json()) as any[];
+          if (pending && pending.length > 0) {
+            for (const perm of pending) {
+              await fetch(`${BASE}/permission/${perm.id}/reply`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ reply: "once" }),
+              });
+              approvedCount++;
+            }
           }
-          if (approved) break;
-        }
-      } catch {}
-    }
+        } catch { break; }
+      }
+    })();
 
-    await editPromise;
+    const resp = await editPromise;
+    // Stop the approver
+    approver.catch(() => {});
 
-    // Permission dialog was created and approved
-    expect(approved).toBe(true);
+    // At least one permission dialog was created and approved
+    expect(approvedCount).toBeGreaterThan(0);
+
+    // Claude responded with a message (not hung, not empty)
+    const text = (resp?.parts ?? [])
+      .filter((p: any) => p.type === "text")
+      .map((p: any) => p.text ?? "")
+      .join("");
+    expect(text.length).toBeGreaterThan(0);
+
+    // OC session has tool activity in its message history
+    const msgs = await api(`/session/${sid}/message`);
+    const allParts = (msgs as any[]).flatMap((m: any) => m.parts ?? []);
+    // Should have tool parts (clwnd_permission and/or edit)
+    const toolParts = allParts.filter((p: any) => p.type === "tool");
+    expect(toolParts.length).toBeGreaterThan(0);
+
+    // No pending permissions left — session is clean
+    const pendingAfter = await fetch(`${BASE}/permission`).then(r => r.json()) as any[];
+    expect(pendingAfter.length).toBe(0);
+
+    // Session exists and is accessible (not stuck)
+    const session = await api(`/session/${sid}`) as any;
+    expect(session.id).toBe(sid);
 
     // File should be edited
     const content = await Bun.file(join(PROJECT_DIR, "hello.txt")).text();
