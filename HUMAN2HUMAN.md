@@ -37,7 +37,7 @@ file system operations being fully delegated to `clwnd`
 
 brokering of tool calls delegated to `clwnd`, where they can't be done purely in opencode or claude code cli
 
-session / state management deleted to opencode core / server
+session / state management delegated to opencode core / server
 
 all interactive tooling delegated to opencode's clients (not limited to TUI)
 
