@@ -802,6 +802,8 @@ Bun.serve({
           pendingAsk.delete(body.askId);
           entry.resolve(body.decision);
           trace("phantom.resolved", { askId: body.askId, decision: body.decision });
+        } else {
+          trace("phantom.notfound", { askId: body.askId, pending: Array.from(pendingAsk.keys()).join(",") });
         }
         return new Response("ok");
       }).catch(() => new Response("error", { status: 400 }));
@@ -932,9 +934,16 @@ Bun.serve({
           },
           cancel() {
             closed = true;
-            // Send shutdown_request to gracefully stop the current turn.
-            // The process may be mid-tool-execution — shutdown_request lets
-            // Claude CLI clean up rather than leaving it in a bad state.
+            activeStreamSenders.delete(opencodeSessionId);
+            // If there's a pending permission ask, the stream was closed
+            // for a phantom tool call — DON'T destroy the process, it needs
+            // to stay alive for the permission_prompt MCP response.
+            if (pendingAsk.size > 0) {
+              pool.abort(opencodeSessionId, poolKey);
+              releaseLock!();
+              return;
+            }
+            // Otherwise, graceful shutdown — process is stuck or user cancelled.
             const entry = pool.getEntry(poolKey);
             if (entry?.proc.stdin) {
               try {
@@ -946,7 +955,6 @@ Bun.serve({
                   timestamp: new Date().toISOString(),
                 }) + "\n");
               } catch {}
-              // Give it a moment to shut down, then destroy if still alive
               setTimeout(() => {
                 if (pool.getEntry(poolKey)) {
                   pool.destroy(opencodeSessionId, poolKey);

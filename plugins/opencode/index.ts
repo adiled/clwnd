@@ -128,6 +128,7 @@ export const clwndPlugin: Plugin = async (input) => {
         args: {
           tool: tool.schema.string().describe("Tool name requesting permission"),
           path: tool.schema.string().optional().describe("File path"),
+          askId: tool.schema.string().optional().describe("Permission ask ID"),
         },
         async execute(args, ctx) {
           trace("clwnd_permission.execute", { tool: args.tool, path: args.path });
@@ -141,20 +142,19 @@ export const clwndPlugin: Plugin = async (input) => {
           });
 
           // User approved. Tell daemon to unblock the permission_prompt MCP.
-          trace("clwnd_permission.approved", { tool: args.tool });
-          if (pendingPermission.current?.tool === args.tool) {
-            const askId = pendingPermission.current.askId;
-            pendingPermission.current = null;
-            // Resolve daemon's pendingAsk via HTTP
+          const askId = args.askId;
+          trace("clwnd_permission.approved", { tool: args.tool, askId });
+          if (askId) {
             try {
-              await fetch("http://localhost/permission-phantom-result", {
+              const resp = await fetch("http://localhost/permission-phantom-result", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ askId, decision: "allow" }),
                 unix: SOCK_PATH,
               } as RequestInit);
+              trace("clwnd_permission.resolved", { askId, status: resp.status });
             } catch (e) {
-              trace("clwnd_permission.resolve.failed", { err: String(e) });
+              trace("clwnd_permission.resolve.failed", { askId, err: String(e) });
             }
           }
 

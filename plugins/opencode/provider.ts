@@ -768,7 +768,7 @@ export class ClwndModel implements LanguageModelV2 {
               // processes it immediately.
               if (msg.action === "permission_ask") {
                 const phantomId = `phantom-${msg.askId}`;
-                const phantomInput = JSON.stringify({ tool: msg.tool, path: msg.path ?? "" });
+                const phantomInput = JSON.stringify({ tool: msg.tool, path: msg.path ?? "", askId: msg.askId });
                 trace("phantom.emit", { askId: msg.askId, tool: msg.tool });
                 emit({ type: "tool-input-start", id: phantomId, toolName: "clwnd_permission" } as LanguageModelV2StreamPart);
                 brokeredCallIds.add(phantomId);
