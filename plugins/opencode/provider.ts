@@ -585,28 +585,28 @@ export class ClwndModel implements LanguageModelV2 {
 
     // Brokered tool return — OpenCode executed the tool, sending result back.
     // Claude already responded in the previous turn. Finish immediately.
-    // For phantom permission tool calls, relay the result to the daemon.
+    // For permission tool calls, relay the result to the daemon.
     if (isBrokeredToolReturn(opts.prompt)) {
       trace("brokered.return", { sid });
 
-      // Check if this is a phantom permission return
+      // Check if this is a permission return
       const lastTool = opts.prompt.findLast(m => m.role === "tool");
       if (lastTool && Array.isArray(lastTool.content)) {
         for (const part of lastTool.content as Array<{ type: string; toolCallId?: string; result?: unknown; isError?: boolean }>) {
-          if (part.type === "tool-result" && part.toolCallId?.startsWith("phantom-")) {
-            const askId = part.toolCallId.replace("phantom-", "");
+          if (part.type === "tool-result" && part.toolCallId?.startsWith("perm-")) {
+            const askId = part.toolCallId.replace("perm-", "");
             const decision = part.isError ? "deny" : "allow";
-            trace("phantom.return", { askId, decision });
+            trace("permission.return", { askId, decision });
             // Tell daemon the permission decision
             try {
-              await fetch("http://localhost/permission-phantom-result", {
+              await fetch("http://localhost/permission-perm-result", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ askId, decision }),
                 unix: SOCK_PATH,
               } as RequestInit);
             } catch (e) {
-              trace("phantom.return.failed", { err: String(e) });
+              trace("permission.return.failed", { err: String(e) });
             }
           }
         }
@@ -767,19 +767,19 @@ export class ClwndModel implements LanguageModelV2 {
               // Then emit finish with tool-calls to close the stream so OC
               // processes it immediately.
               if (msg.action === "permission_ask") {
-                const phantomId = `phantom-${msg.askId}`;
-                const phantomInput = JSON.stringify({ tool: msg.tool, path: msg.path ?? "", askId: msg.askId });
-                trace("phantom.emit", { askId: msg.askId, tool: msg.tool });
-                emit({ type: "tool-input-start", id: phantomId, toolName: "clwnd_permission" } as LanguageModelV2StreamPart);
-                brokeredCallIds.add(phantomId);
+                const permCallId = `perm-${msg.askId}`;
+                const permInput = JSON.stringify({ tool: msg.tool, path: msg.path ?? "", askId: msg.askId });
+                trace("permission.toolcall", { askId: msg.askId, tool: msg.tool });
+                emit({ type: "tool-input-start", id: permCallId, toolName: "clwnd_permission" } as LanguageModelV2StreamPart);
+                brokeredCallIds.add(permCallId);
                 emit({
                   type: "tool-call",
-                  toolCallId: phantomId,
+                  toolCallId: permCallId,
                   toolName: "clwnd_permission",
-                  input: phantomInput,
+                  input: permInput,
                   providerExecuted: false,
                 } as LanguageModelV2StreamPart);
-                // Close stream so OC processes the phantom immediately
+                // Close stream so OC processes the permission tool call immediately
                 if (textStarted) emit({ type: "text-end", id: textId } as LanguageModelV2StreamPart);
                 if (reasoningStarted) emit({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
                 emit({

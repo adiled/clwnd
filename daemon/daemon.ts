@@ -325,7 +325,7 @@ class SubprocessPool {
           tool: toolName, path, input: m.input ?? {},
         }).catch(() => {});
 
-        pendingAsk.set(askId, {
+        pendingPermission.set(askId, {
           resolve: (decision) => {
             if (decision === "allow") {
               entry.proc.stdin?.write(JSON.stringify({
@@ -350,9 +350,9 @@ class SubprocessPool {
 
         // Timeout after 5 min
         setTimeout(() => {
-          if (pendingAsk.has(askId)) {
-            const p = pendingAsk.get(askId)!;
-            pendingAsk.delete(askId);
+          if (pendingPermission.has(askId)) {
+            const p = pendingPermission.get(askId)!;
+            pendingPermission.delete(askId);
             p.resolve("deny");
             trace("permission.ask.timeout", { id: askId });
           }
@@ -455,7 +455,7 @@ async function askPlugin<T = any>(type: string, payload: any, timeoutMs = 120_00
 // ─── Permission State ───────────────────────────────────────────────────────
 
 // Pending permission asks — held PreToolUse hook responses waiting for user decision
-const pendingAsk = new Map<string, {
+const pendingPermission = new Map<string, {
   resolve: (decision: "allow" | "deny") => void;
   tool: string;
   path?: string;
@@ -795,15 +795,15 @@ Bun.serve({
     }
 
     // Phantom permission result — provider tells daemon the ctx.ask() outcome
-    if (req.method === "POST" && url.pathname === "/permission-phantom-result") {
+    if (req.method === "POST" && url.pathname === "/permission-result") {
       return req.json().then((body: { askId: string; decision: "allow" | "deny" }) => {
-        const entry = pendingAsk.get(body.askId);
+        const entry = pendingPermission.get(body.askId);
         if (entry) {
-          pendingAsk.delete(body.askId);
+          pendingPermission.delete(body.askId);
           entry.resolve(body.decision);
-          trace("phantom.resolved", { askId: body.askId, decision: body.decision });
+          trace("permission.resolved", { askId: body.askId, decision: body.decision });
         } else {
-          trace("phantom.notfound", { askId: body.askId, pending: Array.from(pendingAsk.keys()).join(",") });
+          trace("permission.notfound", { askId: body.askId, pending: Array.from(pendingPermission.keys()).join(",") });
         }
         return new Response("ok");
       }).catch(() => new Response("error", { status: 400 }));
@@ -936,9 +936,9 @@ Bun.serve({
             closed = true;
             activeStreamSenders.delete(opencodeSessionId);
             // If there's a pending permission ask, the stream was closed
-            // for a phantom tool call — DON'T destroy the process, it needs
+            // for a permission tool call — DON'T destroy the process, it needs
             // to stay alive for the permission_prompt MCP response.
-            if (pendingAsk.size > 0) {
+            if (pendingPermission.size > 0) {
               pool.abort(opencodeSessionId, poolKey);
               releaseLock!();
               return;
@@ -1054,7 +1054,7 @@ const mcpServer = Bun.serve({
         if (action === "deny") return hookDeny("Denied by session permission rules");
 
         // "ask" — treated as allow until a viable UX solution is found.
-        // Infrastructure exists (pendingAsk, /permission-pending, /permission-respond)
+        // Infrastructure exists (pendingPermission, /permission-pending, /permission-respond)
         // but OC's session lock prevents in-band user interaction during a turn.
         // See PERMISSION_ASK_PROPOSAL.md for investigation history.
         if (action === "ask") return hookAllow();
@@ -1072,10 +1072,10 @@ const mcpServer = Bun.serve({
 
         // Hold until /permission-respond resolves this, or timeout
         const decision = await new Promise<"allow" | "deny">((resolve) => {
-          pendingAsk.set(askId, { resolve, tool: toolName, path, sessionId: ocSessionId ?? sessionId });
+          pendingPermission.set(askId, { resolve, tool: toolName, path, sessionId: ocSessionId ?? sessionId });
           setTimeout(() => {
-            if (pendingAsk.has(askId)) {
-              pendingAsk.delete(askId);
+            if (pendingPermission.has(askId)) {
+              pendingPermission.delete(askId);
               trace("permission.ask.timeout", { id: askId });
               resolve("deny");
             }
@@ -1094,7 +1094,7 @@ const mcpServer = Bun.serve({
 
     // GET /permission-pending — list pending permission asks
     if (req.method === "GET" && url.pathname === "/permission-pending") {
-      const pending = Array.from(pendingAsk.entries()).map(([id, p]) => ({
+      const pending = Array.from(pendingPermission.entries()).map(([id, p]) => ({
         id, tool: p.tool, path: p.path, sessionId: p.sessionId,
       }));
       return Response.json(pending);
@@ -1105,12 +1105,12 @@ const mcpServer = Bun.serve({
       try {
         const body = await req.json() as { id?: string; decision: "allow" | "deny" };
         // If no id, resolve the first pending
-        const id = body.id ?? pendingAsk.keys().next().value;
-        if (!id || !pendingAsk.has(id as string)) {
+        const id = body.id ?? pendingPermission.keys().next().value;
+        if (!id || !pendingPermission.has(id as string)) {
           return Response.json({ error: "no pending permission" }, { status: 404 });
         }
-        const entry = pendingAsk.get(id as string)!;
-        pendingAsk.delete(id as string);
+        const entry = pendingPermission.get(id as string)!;
+        pendingPermission.delete(id as string);
         entry.resolve(body.decision);
         trace("permission.respond", { id, decision: body.decision });
         return Response.json({ ok: true });
@@ -1145,8 +1145,8 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>) =
   if (action === "allow") return { decision: "allow" as const };
   if (action === "deny") return { decision: "deny" as const };
 
-  // "ask" — hold MCP response, send phantom permission ask on the active stream
-  // so the provider can emit a phantom tool call to trigger OC's ctx.ask() dialog
+  // "ask" — hold MCP response, send permission_ask on the active stream
+  // so the provider can emit a permission tool call to trigger OC's ctx.ask() dialog
   const askId = randomUUID();
   trace("permission.ask.hold", { id: askId, tool, path });
 
@@ -1156,14 +1156,14 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>) =
   }
 
   return new Promise<{ decision: "allow" | "deny" }>((resolve) => {
-    pendingAsk.set(askId, {
+    pendingPermission.set(askId, {
       resolve: (decision) => resolve({ decision }),
       tool, path, sessionId: "",
     });
 
     setTimeout(() => {
-      if (pendingAsk.has(askId)) {
-        pendingAsk.delete(askId);
+      if (pendingPermission.has(askId)) {
+        pendingPermission.delete(askId);
         trace("permission.ask.timeout", { id: askId });
         resolve({ decision: "deny" });
       }
