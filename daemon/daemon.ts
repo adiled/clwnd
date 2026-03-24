@@ -688,6 +688,15 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
       break;
     }
 
+    case "log": {
+      const level = msg.level as string;
+      const event = msg.event as string;
+      const data = msg.data as Record<string, unknown> | undefined;
+      if (level === "info") info(event, data);
+      else trace(event, data);
+      break;
+    }
+
     default:
       trace("hum.msg.unknown", { chi });
   }

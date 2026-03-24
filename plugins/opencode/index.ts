@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { createClwnd, setSharedClient, setLogClient, hum, trace } from "./provider.ts";
+import { createClwnd, setSharedClient, setLogClient, hum, trace, log } from "./provider.ts";
 
 // ─── Small Model Discovery ──────────────────────────────────────────────────
 // Provider config lives in opencode.json (managed by install script).
@@ -20,7 +20,7 @@ async function syncSmallModel(client: any): Promise<void> {
         if (m.cost && m.cost.input === 0 && m.cost.output === 0 && m.tool_call) {
           const pick = `${p.id}/${mid}`;
           await client.config.update({ body: { small_model: pick } });
-          trace("small.synced", { model: pick });
+          log("small.synced", { model: pick });
           return;
         }
       }
@@ -36,6 +36,8 @@ export const clwndPlugin: Plugin = async (input) => {
   setSharedClient(input.client);
   setLogClient(input.client);
   const provider = createClwnd({ client: input.client, pluginInput: input });
+
+  log("plugin.loaded", { directory: input.directory });
 
   // Discover free model for title gen / compaction
   syncSmallModel(input.client).catch(() => {});

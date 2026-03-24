@@ -14,6 +14,7 @@ export function trace(event: string, data?: Record<string, unknown>): void {
       body: { service, level: "debug" as const, message: event, extra: data },
     }).catch(() => {});
   }
+  hum({ chi: "log", level: "trace", event, data });
 }
 
 export function log(event: string, data?: Record<string, unknown>): void {
@@ -23,6 +24,7 @@ export function log(event: string, data?: Record<string, unknown>): void {
       body: { service, level: "info" as const, message: event, extra: data },
     }).catch(() => {});
   }
+  hum({ chi: "log", level: "info", event, data });
 }
 import type {
   LanguageModelV2,
