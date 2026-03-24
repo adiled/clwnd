@@ -1,4 +1,7 @@
+// Skipped: tests legacy HTTP /stream endpoint (removed in hum migration).
+// TODO: absorb test cases into colocated unit tests per source file.
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+describe.skip("smoke", () => { test("placeholder", () => {}) });
 import { spawn, type Subprocess } from "bun";
 import { existsSync, unlinkSync, readdirSync, rmSync, mkdirSync, readFileSync } from "fs";
 import { join } from "path";
