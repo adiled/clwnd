@@ -1,27 +1,38 @@
 import { generateId } from "@ai-sdk/provider-utils";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
-// Sends to OC's log via client.app.log() — shows in `opencode debug`.
-// Falls back to file before client is available.
+// Three destinations: plugin log file (always), hum → daemon (when connected), OC debug (when client ready).
+
+import { appendFileSync, mkdirSync } from "fs";
+
+const LOG_DIR = `${process.env.XDG_STATE_HOME || process.env.HOME + "/.local/state"}/clwnd`;
+const LOG_FILE = `${LOG_DIR}/plugin.log`;
+try { mkdirSync(LOG_DIR, { recursive: true }); } catch {}
+
+function writeLog(level: string, event: string, data?: Record<string, unknown>): void {
+  const parts = [new Date().toISOString(), `[${level}]`, event];
+  if (data) for (const [k, v] of Object.entries(data)) parts.push(`${k}=${v}`);
+  try { appendFileSync(LOG_FILE, parts.join(" ") + "\n"); } catch {}
+}
 
 let logClient: any = null;
 export function setLogClient(client: any): void { logClient = client; }
 
 export function trace(event: string, data?: Record<string, unknown>): void {
-  const service = "clwnd";
+  writeLog("trace", event, data);
   if (logClient?.app?.log) {
     logClient.app.log({
-      body: { service, level: "debug" as const, message: event, extra: data },
+      body: { service: "clwnd", level: "debug" as const, message: event, extra: data },
     }).catch(() => {});
   }
   hum({ chi: "log", level: "trace", event, data });
 }
 
 export function log(event: string, data?: Record<string, unknown>): void {
-  const service = "clwnd";
+  writeLog("info", event, data);
   if (logClient?.app?.log) {
     logClient.app.log({
-      body: { service, level: "info" as const, message: event, extra: data },
+      body: { service: "clwnd", level: "info" as const, message: event, extra: data },
     }).catch(() => {});
   }
   hum({ chi: "log", level: "info", event, data });
