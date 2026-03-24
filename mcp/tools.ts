@@ -199,7 +199,7 @@ function execRead(args: { file_path: string; offset?: number; limit?: number }):
     return {
       output: numbered,
       title: relative(CWD, p) || p,
-      metadata: { preview: slice.slice(0, 20).join("\n"), truncated, loaded: [p] },
+      metadata: { truncated, loaded: [p] },
     };
   } catch (e: any) {
     return { output: `Error reading ${p}: ${e.message}`, title: p };
@@ -237,7 +237,7 @@ function execEdit(args: { file_path: string; old_string: string; new_string: str
   return {
     output: `Updated ${p}`,
     title: relative(CWD, p) || p,
-    metadata: { diff, filediff: diff, diagnostics: [] },
+    metadata: { diff, diagnostics: [] },
   };
 }
 
@@ -274,7 +274,6 @@ function execBash(args: { command: string; description?: string; timeout?: numbe
     output,
     title: args.description ?? args.command.slice(0, 80),
     metadata: {
-      output: output.length > 50000 ? output.slice(0, 50000) + "\n\n..." : output,
       exit: exitCode,
       description: args.description ?? args.command.slice(0, 80),
     },
