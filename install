@@ -106,6 +106,9 @@ try {
 
 // Register plugin — models + provider sync happens at runtime via OC API
 if (!config.plugin) config.plugin = [];
+// Clean stale npm plugin entries
+const stale = ['@clwnd/opencode'];
+config.plugin = config.plugin.filter(p => !stale.includes(p));
 if (!config.plugin.includes(pluginRef)) {
   config.plugin.push(pluginRef);
   console.log('  added plugin: ' + pluginRef);
