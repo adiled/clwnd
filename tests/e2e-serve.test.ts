@@ -335,6 +335,39 @@ describe("e2e-serve: abort recovery", () => {
     const text = extractResponseText(resp);
     expect(text).toContain("4");
   }, TIMEOUT);
+
+  test("interrupt during tool execution recovers cleanly", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Start a long-running tool call
+    const ctrl = new AbortController();
+    const abortedReq = fetch(`${BASE}/session/${sid}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: MODEL,
+        parts: [{ type: "text", text: "Run this bash command: sleep 8 && echo done" }],
+      }),
+      signal: ctrl.signal,
+    }).catch(() => null);
+
+    // Let the tool start executing, then interrupt
+    await Bun.sleep(4_000);
+    ctrl.abort();
+    await abortedReq;
+
+    await Bun.sleep(5_000);
+
+    // Session must recover — respond coherently with sane token count
+    const resp = await sendMessage(sid, "Say hello.");
+    const text = extractResponseText(resp);
+    expect(text.length).toBeGreaterThan(0);
+
+    // Token count should not be corrupted (no astronomical blowup)
+    const tokens = resp.info?.tokens?.input ?? 0;
+    expect(tokens).toBeLessThan(50_000);
+  }, TIMEOUT);
 });
 
 describe("e2e-serve: provider migration", () => {
