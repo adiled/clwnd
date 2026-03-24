@@ -298,6 +298,24 @@ describe("e2e-serve: agent switching", () => {
     expect(refused || !fileExists).toBe(true);
   }, TIMEOUT);
 
+  test("repeated turns in same mode do not inflate tokens from system reminders", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Turn 1 in plan mode — includes full system reminder
+    const r1 = await sendMessage(sid, "Say hi.", "plan");
+    const t1 = r1.info?.tokens?.input ?? 0;
+
+    // Turn 2 in same mode — reminder should be stripped (already sent)
+    const r2 = await sendMessage(sid, "Say bye.", "plan");
+    const t2 = r2.info?.tokens?.input ?? 0;
+
+    // Turn 2 should not be significantly larger than turn 1.
+    // Without stripping, the reminder (~2KB) would compound each turn.
+    // Allow 2x for conversation growth, but not 3x+ (which would mean duplication).
+    expect(t2).toBeLessThan(t1 * 2);
+  }, TIMEOUT);
+
   test("build mode after plan mode can edit files", async () => {
     skipIfDead();
     const sid = await createSession();
