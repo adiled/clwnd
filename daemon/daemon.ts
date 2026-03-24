@@ -702,41 +702,41 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
   }
 }
 
-const humServer = Bun.listen({
-  unix: HUM,
-  socket: {
-    open(socket) {
-      const clientId = randomUUID();
-      humRoots.set(clientId, { socket, sessionId: null });
-      info("hum.connected", { clientId: clientId.slice(0, 8), total: humRoots.size });
-      // Attach clientId to socket for lookup in other handlers
-      (socket as any).__clientId = clientId;
-    },
-    data(socket, data) {
-      const clientId = (socket as any).__clientId as string;
-      const text = Buffer.from(data).toString();
-      const lines = text.split("\n").filter(Boolean);
-      for (const line of lines) {
-        try {
-          const msg = JSON.parse(line) as Record<string, unknown>;
-          humReceive(clientId, msg);
-        } catch (e) {
-          trace("hum.parse.failed", { err: String(e) });
-        }
+import { createServer, type Socket } from "net";
+
+const humServer = createServer((socket: Socket) => {
+  const clientId = randomUUID();
+  humRoots.set(clientId, { socket, sessionId: null });
+  info("hum.connected", { clientId: clientId.slice(0, 8), total: humRoots.size });
+
+  let buf = "";
+  socket.on("data", (data) => {
+    buf += data.toString();
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line) continue;
+      try {
+        humReceive(clientId, JSON.parse(line));
+      } catch (e) {
+        trace("hum.parse.failed", { err: String(e) });
       }
-    },
-    close(socket) {
-      const clientId = (socket as any).__clientId as string;
-      humRoots.delete(clientId);
-      info("hum.disconnected", { clientId: clientId.slice(0, 8), total: humRoots.size });
-    },
-    error(socket, err) {
-      trace("hum.socket.failed", { err: String(err) });
-    },
-  },
+    }
+  });
+
+  socket.on("close", () => {
+    humRoots.delete(clientId);
+    info("hum.disconnected", { clientId: clientId.slice(0, 8), total: humRoots.size });
+  });
+
+  socket.on("error", (err) => {
+    trace("hum.socket.failed", { err: String(err) });
+  });
 });
 
-info("hum.listening", { path: HUM });
+humServer.listen(HUM, () => {
+  info("hum.listening", { path: HUM });
+});
 
 Bun.serve({
   unix: HTTP,

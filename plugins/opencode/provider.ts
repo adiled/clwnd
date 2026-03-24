@@ -143,11 +143,14 @@ function defaultSocketPath(): string {
 const HUM_PATH = (process.env.CLWND_SOCKET ?? defaultSocketPath()) + ".hum";
 
 // ─── clwndHum: Bidirectional NDJSON socket ─────────────────────────────────
-// Persistent connection to daemon. Both sides push typed messages (chi field).
+// Persistent connection to daemon via net.connect (Node-compatible).
+// Both sides push typed messages (chi field).
+
+import { connect as netConnect, type Socket as NetSocket } from "net";
 
 type HumListener = (msg: Record<string, unknown>) => void;
 
-let humSocket: any = null;
+let humSocket: NetSocket | null = null;
 let humEcho = "";
 let humHearer: HumListener | null = null;
 let humAlive = false;
@@ -155,40 +158,38 @@ const humAwaken = awakenHum();
 
 async function awakenHum(): Promise<void> {
   try {
-    humSocket = await Bun.connect({
-      unix: HUM_PATH,
-      socket: {
-        open() {
-          humAlive = true;
-          trace("hum.connected");
-        },
-        data(socket, data) {
-          humEcho += Buffer.from(data).toString();
-          const lines = humEcho.split("\n");
-          humEcho = lines.pop() ?? "";
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              const msg = JSON.parse(line) as Record<string, unknown>;
-              if (humHearer) humHearer(msg);
-            } catch {}
-          }
-        },
-        close() {
-          humAlive = false;
-          humSocket = null;
-          trace("hum.disconnected");
-          // Reconnect after a delay
-          setTimeout(awakenHum, 2000);
-        },
-        error(socket, err) {
-          trace("hum.error", { err: String(err) });
-        },
-      },
+    humSocket = netConnect({ path: HUM_PATH });
+
+    humSocket.on("connect", () => {
+      humAlive = true;
+      trace("hum.connected");
+    });
+
+    humSocket.on("data", (data) => {
+      humEcho += data.toString();
+      const lines = humEcho.split("\n");
+      humEcho = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const msg = JSON.parse(line) as Record<string, unknown>;
+          if (humHearer) humHearer(msg);
+        } catch {}
+      }
+    });
+
+    humSocket.on("close", () => {
+      humAlive = false;
+      humSocket = null;
+      trace("hum.disconnected");
+      setTimeout(awakenHum, 2000);
+    });
+
+    humSocket.on("error", (err) => {
+      trace("hum.error", { err: String(err) });
     });
   } catch (e) {
     trace("hum.connect.failed", { err: String(e) });
-    // Retry
     setTimeout(awakenHum, 2000);
   }
 }
