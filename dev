@@ -1,0 +1,23 @@
+#!/bin/bash
+set -e
+cd "$(dirname "$0")"
+
+TARGET="${CLWND_DEV_USER:-clwnd}"
+TARGET_SRC="$(eval echo ~$TARGET)/.local/share/clwnd/src"
+
+bun run build
+
+cp dist/daemon/index.js "$TARGET_SRC/dist/daemon/index.js"
+cp plugins/opencode/dist/index.js "$TARGET_SRC/plugins/opencode/dist/index.js"
+chown "$TARGET:$TARGET" "$TARGET_SRC/dist/daemon/index.js" "$TARGET_SRC/plugins/opencode/dist/index.js"
+
+# Copy plugin to .opencode/plugins/ for OC auto-load
+TARGET_HOME="$(eval echo ~$TARGET)"
+PLUGINS_DIR="$TARGET_HOME/.opencode/plugins"
+mkdir -p "$PLUGINS_DIR"
+cp plugins/opencode/dist/index.js "$PLUGINS_DIR/clwnd.js"
+chown "$TARGET:$TARGET" "$PLUGINS_DIR/clwnd.js"
+
+su -l "$TARGET" -c 'systemctl --user restart clwnd'
+sleep 1
+echo "deployed to $TARGET"

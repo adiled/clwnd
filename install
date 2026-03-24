@@ -78,6 +78,14 @@ do_build() {
 
   echo "[build] compiling..."
   bun run build
+
+  # Dev mode: copy plugin to .opencode/plugins/ so OC auto-loads it
+  if [ -n "$CLWND_DEV" ]; then
+    local PLUGINS_DIR="$HOME/.opencode/plugins"
+    mkdir -p "$PLUGINS_DIR"
+    cp "$CLWND_SRC/plugins/opencode/dist/index.js" "$PLUGINS_DIR/clwnd.js"
+    echo "[build] copied plugin to $PLUGINS_DIR/clwnd.js"
+  fi
 }
 
 plugin_ref() {
@@ -105,11 +113,17 @@ try {
   config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 } catch {}
 
-// Plugin — dev uses file://, non-dev uses npm package
+// Plugin cleanup: remove both known refs, then add the correct one
 if (!config.plugin) config.plugin = [];
-config.plugin = config.plugin.filter(p => p !== '@clwnd/opencode' && !(p.includes('clwnd') && p.startsWith('file://')));
-config.plugin.push(pluginRef);
-console.log('  set plugin: ' + pluginRef);
+const fileRef = 'file://${CLWND_SRC}/plugins/opencode/dist/index.js';
+const npmRef = '@clwnd/opencode';
+config.plugin = config.plugin.filter(p => p !== fileRef && p !== npmRef);
+if (pluginRef === npmRef) {
+  config.plugin.push(npmRef);
+  console.log('  set plugin: ' + npmRef);
+} else {
+  console.log('  dev mode: plugin via .opencode/plugins/');
+}
 
 // Provider + models — always sync to match registry
 if (!config.provider) config.provider = {};
