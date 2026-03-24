@@ -324,36 +324,27 @@ function extractText(prompt: LanguageModelV2Prompt): string {
  * per session. If the prompt has new turns (e.g., from model switches), injects
  * only the new ones. Returns null if there's nothing new to inject.
  */
-const seededCount = new Map<string, number>();
 
+// Disabled — was injecting full OC conversation history into every prompt,
+// doubling context since the persistent Claude CLI process already has it.
+// Intended for cross-provider session migration (#7) but needs a different
+// approach: only inject turns the process genuinely hasn't seen.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function extractHistory(prompt: LanguageModelV2Prompt, sessionId?: string): string | null {
-  // Find the last user message index — everything before it is history
   let lastUserIdx = -1;
   for (let i = prompt.length - 1; i >= 0; i--) {
     if (prompt[i].role === "user") { lastUserIdx = i; break; }
   }
   const historyMsgs = prompt.slice(0, lastUserIdx).filter(m => m.role === "user" || m.role === "assistant");
   if (historyMsgs.length === 0) return null;
-
-  // Check if there are new messages since last seed
-  const prevCount = sessionId ? (seededCount.get(sessionId) ?? 0) : 0;
-  if (historyMsgs.length <= prevCount) return null;
-  if (sessionId) seededCount.set(sessionId, historyMsgs.length);
-
-  // Only inject messages the process hasn't seen
-  const newMsgs = historyMsgs.slice(prevCount);
-
   const lines: string[] = [];
-  for (const m of newMsgs) {
+  for (const m of historyMsgs) {
     const role = m.role === "user" ? "User" : "Assistant";
     let text = "";
-    if (typeof m.content === "string") {
-      text = m.content;
-    } else if (Array.isArray(m.content)) {
+    if (typeof m.content === "string") text = m.content;
+    else if (Array.isArray(m.content)) {
       text = (m.content as Array<{ type: string; text?: string }>)
-        .filter(p => p.type === "text" && p.text)
-        .map(p => p.text!)
-        .join("\n");
+        .filter(p => p.type === "text" && p.text).map(p => p.text!).join("\n");
     }
     if (text) lines.push(`${role}: ${text}`);
   }
@@ -483,14 +474,6 @@ export class ClwndModel implements LanguageModelV2 {
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
-    // Inject conversation history the persistent process hasn't seen
-    let historyContext: string | undefined;
-    const history = extractHistory(opts.prompt, sid);
-    if (history) {
-      historyContext = history;
-      trace("history.seed", { sid, turns: history.split("\n\n").length });
-    }
-
     let reasoning = "";
     let responseText = "";
     const toolCalls: LanguageModelV2Content[] = [];
@@ -510,9 +493,10 @@ export class ClwndModel implements LanguageModelV2 {
 
       humSpeak({
         sid, cwd, modelId: this.modelId, text,
-        systemPrompt, permissions, allowedTools, historyContext,
+        systemPrompt, permissions, allowedTools,
       }, (msg) => {
         const chi = msg.chi as string;
+        if (chi === "tool-meta") return; // out-of-band, not needed for doGenerate
 
         if (chi === "chunk") {
           const ct = msg.chunkType as string;
@@ -594,13 +578,6 @@ export class ClwndModel implements LanguageModelV2 {
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
-    // Inject conversation history the persistent process hasn't seen
-    let historyContext: string | undefined;
-    const history = extractHistory(opts.prompt, sid);
-    if (history) {
-      historyContext = history;
-      trace("history.seed", { sid, turns: history.split("\n\n").length });
-    }
 
     // Brokered tool return — OpenCode executed the tool, sending result back.
     if (isBrokeredToolReturn(opts.prompt)) {
@@ -635,7 +612,6 @@ export class ClwndModel implements LanguageModelV2 {
       // stream endpoint will attach to the persistent process and forward
       // the write tool call + result + text response to OC.
       trace("permission.continue", { sid });
-      historyContext = undefined; // don't re-seed
     }
 
     // Flag for permission return — daemon should listen only, not send a prompt
@@ -698,11 +674,20 @@ export class ClwndModel implements LanguageModelV2 {
               systemPrompt,
               permissions,
               allowedTools,
-              historyContext,
               listenOnly,
             }, onHummin);
 
+        // Out-of-band tool metadata queue — daemon hums meta before Claude CLI streams the result
+        const metaQueue: Array<{ tool: string; title?: string; metadata?: Record<string, unknown> }> = [];
+
         function onHummin(raw: Record<string, unknown>): void {
+          // Tool metadata arrives out-of-band — queue it for the next tool_result
+          if (raw.chi === "tool-meta") {
+            metaQueue.push({ tool: raw.tool as string, title: raw.title as string, metadata: raw.metadata as Record<string, unknown> });
+            trace("meta.received", { tool: raw.tool });
+            return;
+          }
+
           // Map chi → action for compatibility with existing processing code
           const msg: Record<string, unknown> = { ...raw };
           if (raw.chi === "chunk") msg.action = "chunk";
@@ -774,9 +759,14 @@ export class ClwndModel implements LanguageModelV2 {
                 if (ct === "tool_result" && (msg.toolCallId || msg.toolUseId)) {
                   const callId = (msg.toolCallId ?? msg.toolUseId) as string;
                   if (tendrils.has(callId)) return;
-                  const raw = (msg as Record<string, unknown>).result ?? "";
-                  const { output, title, metadata } = parseToolResult(typeof raw === "string" ? raw : JSON.stringify(raw));
-                  // Tool results flush — permission_ask won't come after a result
+                  const rawResult = (msg as Record<string, unknown>).result ?? "";
+                  const resultText = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
+                  // Prefer out-of-band metadata (hummed separately, never touched Claude CLI)
+                  // Fall back to parsing <!--clwnd-meta:--> for backward compat
+                  const queued = metaQueue.shift();
+                  const output = queued ? resultText : parseToolResult(resultText).output;
+                  const title = queued?.title ?? parseToolResult(resultText).title;
+                  const metadata = queued?.metadata ?? parseToolResult(resultText).metadata;
                   shed();
                   petal({
                     type: "tool-result",

@@ -635,12 +635,7 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
       nest.awaken(poolKey, session.modelId, listener, undefined, permissions, systemPrompt, allowedTools, cwd);
 
       if (!msg.listenOnly) {
-        const historyContext = msg.historyContext as string | undefined;
-        const text = msg.text as string ?? "";
-        const fullText = historyContext
-          ? `Here is the conversation history from this session:\n\n${historyContext}\n\nContinue from here. The user's new message:\n\n${text}`
-          : text;
-        nest.murmur(sid, poolKey, fullText);
+        nest.murmur(sid, poolKey, msg.text as string ?? "");
       }
 
       // Inject user message into JSONL
@@ -750,7 +745,7 @@ Bun.serve({
 
 // ─── MCP HTTP Server (persistent, no cold start) ────────────────────────────
 
-import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms, setAllowedTools as mcpSetAllowed, setPermissionCallback } from "../mcp/tools.ts";
+import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms, setAllowedTools as mcpSetAllowed, setPermissionCallback, setMetaCallback } from "../mcp/tools.ts";
 
 const MCP_PORT = parseInt(process.env.CLWND_MCP_PORT ?? "0") || 0;
 
@@ -908,6 +903,22 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>) =
       }
     }, 10_000);
   });
+});
+
+// Wire tool metadata to hum — OC gets it out-of-band, Claude CLI never sees it
+setMetaCallback((toolName, callId, title, metadata) => {
+  // Find the active session to hum to
+  for (const [sid, session] of sessions) {
+    const roost = nest.roost(sid);
+    if (roost && roost.activeSid === sid) {
+      hum(sid, { chi: "tool-meta", tool: toolName, callId, title, metadata });
+      trace("meta.hummed", { tool: toolName, sid });
+      return;
+    }
+  }
+  // No active session — broadcast to all hum clients
+  humChorus({ chi: "tool-meta", tool: toolName, callId, title, metadata });
+  trace("meta.hummed.broadcast", { tool: toolName });
 });
 
 // ─── Auto-update ─────────────────────────────────────────────────────────────

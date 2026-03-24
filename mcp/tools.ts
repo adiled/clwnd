@@ -167,6 +167,13 @@ export function setPermissionCallback(cb: typeof permissionCallback): void {
   permissionCallback = cb;
 }
 
+// Callback for tool metadata — daemon hums it out-of-band instead of embedding in MCP response
+let metaCallback: ((toolName: string, callId: string, title?: string, metadata?: Record<string, unknown>) => void) | null = null;
+
+export function setMetaCallback(cb: typeof metaCallback): void {
+  metaCallback = cb;
+}
+
 // ─── Tool Execution ─────────────────────────────────────────────────────────
 
 export interface ToolResult {
@@ -383,16 +390,14 @@ export async function handleMcpRequest(body: { jsonrpc: string; id?: number | st
       const callId = `mcp-${body.id ?? Date.now()}`;
       try {
         const result = await executeTool(name, args, callId);
-        const content: Array<{ type: string; text: string }> = [
-          { type: "text", text: result.output },
-        ];
-        if (result.metadata || result.title) {
-          content.push({
-            type: "text",
-            text: `\n<!--clwnd-meta:${JSON.stringify({ title: result.title, metadata: result.metadata })}-->`,
-          });
+        // Metadata goes out-of-band via hum — Claude CLI never sees it
+        if (metaCallback && (result.metadata || result.title)) {
+          metaCallback(name, callId, result.title, result.metadata);
         }
-        return { jsonrpc: "2.0", id: body.id, result: { content } };
+        return {
+          jsonrpc: "2.0", id: body.id,
+          result: { content: [{ type: "text", text: result.output }] },
+        };
       } catch (e: any) {
         return {
           jsonrpc: "2.0", id: body.id,

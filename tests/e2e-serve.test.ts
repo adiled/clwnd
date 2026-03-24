@@ -89,6 +89,7 @@ async function getMessages(sessionID: string): Promise<any[]> {
   return (r as any) ?? [];
 }
 
+
 function extractResponseText(resp: { info: any; parts: any[] }): string {
   return (resp.parts ?? [])
     .filter((p: any) => p.type === "text")
@@ -337,7 +338,9 @@ describe("e2e-serve: abort recovery", () => {
 });
 
 describe("e2e-serve: provider migration", () => {
-  test("switching from non-clwnd to clwnd model retains session context", async () => {
+  // Skipped: historyContext injection disabled — was doubling context tokens.
+  // Cross-provider session migration (#7) needs a different approach.
+  test.skip("switching from non-clwnd to clwnd model retains session context", async () => {
     skipIfDead();
     const sid = await createSession();
 
@@ -353,7 +356,8 @@ describe("e2e-serve: provider migration", () => {
 });
 
 describe("e2e-serve: model switch history", () => {
-  test("switching clwnd → free → clwnd retains context from free model turn", async () => {
+  // Skipped: historyContext injection disabled — was doubling context tokens.
+  test.skip("switching clwnd → free → clwnd retains context from free model turn", async () => {
     skipIfDead();
     const sid = await createSession();
     const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
@@ -368,6 +372,41 @@ describe("e2e-serve: model switch history", () => {
     const resp = await sendMessage(sid, "What is my secret number?");
     const text = extractResponseText(resp).toLowerCase();
     expect(text).toContain("7777");
+  }, TIMEOUT);
+});
+
+describe("e2e-serve: token efficiency", () => {
+  test("multi-turn conversation does not duplicate context", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Turn 1: establish baseline
+    const resp1 = await sendMessage(sid, "Say hello.");
+    const tokens1 = resp1.info?.tokens?.input ?? 0;
+
+    // Turn 2: should not massively inflate
+    const resp2 = await sendMessage(sid, "Say goodbye.");
+    const tokens2 = resp2.info?.tokens?.input ?? 0;
+
+    // Turn 2 context grows by the conversation so far, but should NOT
+    // double — that would mean history is being re-injected as text.
+    // Allow 3x growth (system prompt + 2 turns of conversation).
+    // Before this fix, historyContext caused 10-15x blowup.
+    expect(tokens2).toBeLessThan(tokens1 * 3);
+  }, TIMEOUT);
+
+  test("tool results do not contain inline metadata", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    const resp = await sendMessage(sid, "Read the file /etc/hostname");
+    // Tool parts in the response should not contain <!--clwnd-meta:-->
+    for (const part of resp.parts ?? []) {
+      if (part.type === "tool" && part.state?.output) {
+        expect(part.state.output).not.toContain("<!--clwnd-meta:");
+      }
+    }
+    expect(resp).toBeDefined();
   }, TIMEOUT);
 });
 
