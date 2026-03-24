@@ -331,6 +331,51 @@ describe("e2e-serve: agent switching", () => {
   }, TIMEOUT);
 });
 
+describe("e2e-serve: prompt forwarding", () => {
+  test("plan mode instructions reach Claude and prevent edits", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Plan mode — OC injects system-reminder with plan workflow.
+    // clwnd forwards it as a content part. Claude should obey.
+    const target = join(PROJECT_DIR, "prompt-fwd-test.txt");
+    const resp = await sendMessage(sid, `Create a file at ${target} with content "test"`, "plan");
+    const text = extractResponseText(resp).toLowerCase();
+
+    // Claude should refuse or the file should not exist
+    const fileCreated = existsSync(target);
+    expect(fileCreated).toBe(false);
+  }, TIMEOUT);
+
+  test("build mode after plan delivers new instructions and allows edits", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Turn 1: plan mode
+    await sendMessage(sid, "Acknowledge plan mode.", "plan");
+
+    // Turn 2: switch to build — new system reminder delivered
+    const target = join(PROJECT_DIR, "prompt-fwd-build.txt");
+    await sendMessage(sid, `Write "hello" to ${target}`, "build");
+
+    expect(existsSync(target)).toBe(true);
+  }, TIMEOUT);
+
+  test("system reminder only sent once per mode, not duplicated", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    const r1 = await sendMessage(sid, "Say hi.", "plan");
+    const t1 = r1.info?.tokens?.input ?? 0;
+
+    const r2 = await sendMessage(sid, "Say bye.", "plan");
+    const t2 = r2.info?.tokens?.input ?? 0;
+
+    // Turn 2 should not massively exceed turn 1 — reminder is stripped on repeat
+    expect(t2).toBeLessThan(t1 * 2);
+  }, TIMEOUT);
+});
+
 describe("e2e-serve: CWD from session", () => {
   test("session directory is used for file operations", async () => {
     skipIfDead();

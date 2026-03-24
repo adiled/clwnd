@@ -315,37 +315,48 @@ function deriveAllowedTools(sid: string, opts: { tools?: Array<{ name: string }>
 
 const lastReminder = new Map<string, string>();
 
-function extractText(prompt: LanguageModelV2Prompt, sessionId?: string): string {
+type ContentPart = { type: string; text: string };
+
+function extractContent(prompt: LanguageModelV2Prompt, sessionId?: string): ContentPart[] {
   for (let i = prompt.length - 1; i >= 0; i--) {
     const m = prompt[i];
     if (m.role === "user") {
-      if (typeof m.content === "string") return m.content;
+      if (typeof m.content === "string") return [{ type: "text", text: m.content }];
       if (Array.isArray(m.content)) {
-        const texts: string[] = [];
+        const parts: ContentPart[] = [];
         for (const p of m.content as Array<{ type: string; text?: string }>) {
-          if (p.type === "text" && p.text) texts.push(p.text);
+          if (p.type === "text" && p.text) parts.push({ type: "text", text: p.text });
         }
-        if (texts.length === 0) continue;
-        let text = texts.join("\n\n");
+        if (parts.length === 0) continue;
         // Strip repeated system reminders — only send when changed
         if (sessionId) {
-          const reminder = text.match(/<system-reminder>[\s\S]*?<\/system-reminder>/)?.[0];
-          if (reminder) {
-            const prev = lastReminder.get(sessionId);
-            if (prev === reminder) {
-              text = text.replace(reminder, "").trim();
-              trace("reminder.stripped", { sid: sessionId });
-            } else {
-              lastReminder.set(sessionId, reminder);
-              trace("reminder.updated", { sid: sessionId });
+          for (let j = parts.length - 1; j >= 0; j--) {
+            const reminder = parts[j].text.match(/<system-reminder>[\s\S]*?<\/system-reminder>/)?.[0];
+            if (reminder) {
+              const prev = lastReminder.get(sessionId);
+              if (prev === reminder) {
+                // Remove this part entirely if it's only the reminder, or strip it
+                const stripped = parts[j].text.replace(reminder, "").trim();
+                if (stripped) { parts[j] = { type: "text", text: stripped }; }
+                else { parts.splice(j, 1); }
+                trace("reminder.stripped", { sid: sessionId });
+              } else {
+                lastReminder.set(sessionId, reminder);
+                trace("reminder.updated", { sid: sessionId });
+              }
             }
           }
         }
-        return text;
+        return parts.length > 0 ? parts : [{ type: "text", text: "" }];
       }
     }
   }
-  return "";
+  return [{ type: "text", text: "" }];
+}
+
+// Flatten content parts to string — used where a single string is needed
+function extractText(prompt: LanguageModelV2Prompt, sessionId?: string): string {
+  return extractContent(prompt, sessionId).map(p => p.text).join("\n\n");
 }
 
 /**
@@ -610,7 +621,8 @@ export class ClwndModel implements LanguageModelV2 {
     }
 
     const sid = opts.headers?.["x-opencode-session"] ?? generateId();
-    const text = extractText(opts.prompt, sid);
+    const content = extractContent(opts.prompt, sid);
+    const text = content.map(p => p.text).join("\n\n");
     const systemPrompt = extractSystemPrompt(opts.prompt);
     detectAgent(sid, opts.headers);
     const warnings: LanguageModelV2CallWarning[] = [];
@@ -712,6 +724,7 @@ export class ClwndModel implements LanguageModelV2 {
               sid,
               cwd,
               modelId: self.modelId,
+              content,
               text,
               systemPrompt,
               permissions,

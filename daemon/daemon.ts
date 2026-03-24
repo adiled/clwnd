@@ -18,10 +18,13 @@ interface BloomListener {
 
 // ─── Protocol ────────────────────────────────────────────────────────────────
 
-function encodePrompt(text: string): string {
+function encodePrompt(content: Array<{ type: string; text: string }> | string): string {
+  const parts = typeof content === "string"
+    ? [{ type: "text", text: content }]
+    : content;
   return JSON.stringify({
     type: "user",
-    message: { role: "user", content: [{ type: "text", text }] },
+    message: { role: "user", content: parts },
   });
 }
 
@@ -61,12 +64,13 @@ class ClaudeNest {
     roost.listeners.set(listener.sessionId, listener);
   }
 
-  murmur(sessionId: string, poolKey: string, text: string): void {
+  murmur(sessionId: string, poolKey: string, content: Array<{ type: string; text: string }> | string): void {
     const roost = this.roosts.get(poolKey);
     if (!roost?.proc.stdin) return;
     roost.activeSid = sessionId;
-    trace("nest.murmured", { sid: sessionId, poolKey, len: text.length });
-    roost.proc.stdin.write(encodePrompt(text) + "\n");
+    const len = typeof content === "string" ? content.length : content.reduce((s, p) => s + (p.text?.length ?? 0), 0);
+    trace("nest.murmured", { sid: sessionId, poolKey, len, parts: typeof content === "string" ? 1 : content.length });
+    roost.proc.stdin.write(encodePrompt(content) + "\n");
   }
 
   reply(sessionId: string, poolKey: string, toolUseId: string, result: string): void {
@@ -653,7 +657,8 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
       nest.awaken(poolKey, session.modelId, listener, undefined, permissions, systemPrompt, allowedTools, cwd);
 
       if (!msg.listenOnly) {
-        nest.murmur(sid, poolKey, msg.text as string ?? "");
+        const content = msg.content as Array<{ type: string; text: string }> | undefined;
+        nest.murmur(sid, poolKey, content ?? msg.text as string ?? "");
       }
 
       // Inject user message into JSONL
