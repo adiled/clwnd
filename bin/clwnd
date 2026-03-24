@@ -17,8 +17,11 @@ case "$CMD" in
   update)
     exec bash -c "$(curl -fsSL "https://raw.githubusercontent.com/adiled/clwnd/main/install?t=$(date +%s)")" -- update
     ;;
+  force)
+    exec bash -c "$(curl -fsSL "https://raw.githubusercontent.com/adiled/clwnd/main/install?t=$(date +%s)")" -- install
+    ;;
   uninstall)
-    exec bash -c "$(curl -fsSL https://raw.githubusercontent.com/adiled/clwnd/main/install)" -- uninstall
+    exec bash -c "$(curl -fsSL "https://raw.githubusercontent.com/adiled/clwnd/main/install?t=$(date +%s)")" -- uninstall
     ;;
   status)
     IS_ROOT=$([ "$(id -u)" = "0" ] && echo true || echo false)
@@ -91,6 +94,7 @@ except: print('error reading sessions')
     echo ""
     echo "Commands:"
     echo "  update     Pull latest, rebuild, restart daemon"
+    echo "  force      Fresh install from remote (bypasses cache)"
     echo "  restart    Restart the daemon"
     echo "  status     Show daemon status"
     echo "  logs       Tail daemon logs"
