@@ -1,4 +1,6 @@
 <p align="center">
+
+[![Hypercommit](https://img.shields.io/badge/Hypercommit-DB2475)](https://hypercommit.com/clwnd)
   <img src="clwnd.gif" alt="clwnd" />
 </p>
 
