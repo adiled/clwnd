@@ -525,11 +525,23 @@ export class ClwndModel implements LanguageModelV2 {
           if (reasoning) content.push({ type: "reasoning", text: reasoning } as LanguageModelV2Content);
           if (responseText) content.push({ type: "text", text: responseText } as LanguageModelV2Content);
           content.push(...toolCalls);
+          const fu = msg.usage as Record<string, unknown> | undefined;
+          const fCacheRead = (fu?.cache_read_input_tokens ?? 0) as number;
+          const fCacheWrite = (fu?.cache_creation_input_tokens ?? 0) as number;
+          const fInput = (fu?.input_tokens ?? 0) as number;
           resolve({
             content,
             finishReason: (msg.finishReason ?? "stop") as LanguageModelV2FinishReason,
-            usage: (msg.usage ?? { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined }) as LanguageModelV2Usage,
-            providerMetadata: msg.providerMetadata ?? {},
+            usage: {
+              inputTokens: fInput + fCacheRead + fCacheWrite,
+              outputTokens: (fu?.output_tokens ?? 0) as number,
+              totalTokens: undefined,
+              cachedInputTokens: fCacheRead,
+            } as LanguageModelV2Usage,
+            providerMetadata: {
+              ...((msg.providerMetadata ?? {}) as Record<string, unknown>),
+              anthropic: { cacheCreationInputTokens: fCacheWrite },
+            },
           });
         }
 
@@ -819,8 +831,6 @@ export class ClwndModel implements LanguageModelV2 {
                 const cacheRead = (u?.cache_read_input_tokens ?? 0) as number;
                 const cacheWrite = (u?.cache_creation_input_tokens ?? 0) as number;
                 const inputBase = (u?.input_tokens ?? u?.inputTokens ?? 0) as number;
-                // If brokered tools were called, override finish reason so
-                // OpenCode enters its tool execution loop
                 const fr = tendrils.size > 0
                   ? "tool-calls"
                   : (msg.finishReason ?? "stop");
@@ -831,9 +841,14 @@ export class ClwndModel implements LanguageModelV2 {
                     inputTokens: inputBase + cacheRead + cacheWrite,
                     outputTokens: (u?.output_tokens ?? u?.outputTokens) as number | undefined,
                     totalTokens: undefined,
-                    cache: { read: cacheRead, write: cacheWrite },
+                    // OC reads cachedInputTokens for cache read
+                    cachedInputTokens: cacheRead,
                   },
-                  providerMetadata: msg.providerMetadata ?? {},
+                  providerMetadata: {
+                    ...((msg.providerMetadata ?? {}) as Record<string, unknown>),
+                    // OC reads anthropic.cacheCreationInputTokens for cache write
+                    anthropic: { cacheCreationInputTokens: cacheWrite },
+                  },
                 } as LanguageModelV2StreamPart);
                 wilt();
                 return;

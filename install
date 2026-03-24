@@ -127,6 +127,7 @@ if (config.provider['opencode-clwnd']) {
       id,
       name: entry.name,
       tool_call: entry.tool_call ?? true,
+      limit: entry.limit,
       provider: { npm: pluginRef }
     };
   }
