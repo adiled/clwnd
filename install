@@ -184,8 +184,6 @@ register_service() {
     <string>${XDG_RUNTIME_DIR}</string>
     <key>PATH</key>
     <string>$(dirname $CLAUDE):$(dirname $BUN):/usr/local/bin:/usr/bin:/bin</string>
-    <key>CLWND_PERMISSION_MODE</key>
-    <string>bypassPermissions</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
