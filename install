@@ -129,13 +129,7 @@ if (pluginRef === npmRef) {
 if (!config.provider) config.provider = {};
 const models = {};
 for (const [id, entry] of Object.entries(registry)) {
-  models[id] = {
-    id,
-    name: entry.name,
-    tool_call: entry.tool_call ?? true,
-    limit: entry.limit,
-    provider: { npm: pluginRef }
-  };
+  models[id] = { ...entry, provider: { npm: pluginRef } };
 }
 config.provider['opencode-clwnd'] = { npm: pluginRef, models };
 console.log('  synced clwnd provider with ' + Object.keys(models).length + ' models');
