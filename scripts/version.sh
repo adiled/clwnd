@@ -43,6 +43,5 @@ git push --tags
 
 echo "released v$NEXT"
 
-# Update compatibility report
-echo "updating compat report..."
-bash "$(dirname "$0")/update-compat.sh"
+# Compat report deferred — run manually: bash scripts/update-compat.sh
+echo "released v$NEXT — run scripts/update-compat.sh when ready"
