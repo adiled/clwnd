@@ -105,14 +105,11 @@ try {
   config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 } catch {}
 
-// Plugin
+// Plugin — dev uses file://, non-dev uses npm package
 if (!config.plugin) config.plugin = [];
-if (!config.plugin.includes(pluginRef)) {
-  config.plugin.push(pluginRef);
-  console.log('  added plugin: ' + pluginRef);
-} else {
-  console.log('  plugin already registered');
-}
+config.plugin = config.plugin.filter(p => p !== '@clwnd/opencode' && !(p.includes('clwnd') && p.startsWith('file://')));
+config.plugin.push(pluginRef);
+console.log('  set plugin: ' + pluginRef);
 
 // Provider + models — always sync to match registry
 if (!config.provider) config.provider = {};
