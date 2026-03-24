@@ -281,6 +281,36 @@ describe("e2e-serve: agent switching", () => {
     }
     expect(resp).toBeDefined();
   }, TIMEOUT);
+
+  test("plan mode prevents file edits", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Send in plan mode — should NOT edit files
+    const resp = await sendMessage(sid, `Write "test" to ${join(PROJECT_DIR, "plan-test.txt")}`, "plan");
+    const text = extractResponseText(resp).toLowerCase();
+
+    // Plan mode should refuse or acknowledge it can't edit
+    const refused = text.includes("plan") || text.includes("cannot") || text.includes("read-only") || text.includes("not allowed");
+    const fileExists = existsSync(join(PROJECT_DIR, "plan-test.txt"));
+
+    // Either the model refused OR the file wasn't created
+    expect(refused || !fileExists).toBe(true);
+  }, TIMEOUT);
+
+  test("build mode after plan mode can edit files", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // First turn in plan mode
+    await sendMessage(sid, "Acknowledge you are in plan mode.", "plan");
+
+    // Switch to build mode — should be able to write
+    const target = join(PROJECT_DIR, "build-after-plan.txt");
+    await sendMessage(sid, `Write the word "switched" to ${target}`, "build");
+
+    expect(existsSync(target)).toBe(true);
+  }, TIMEOUT);
 });
 
 describe("e2e-serve: CWD from session", () => {

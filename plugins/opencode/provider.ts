@@ -313,19 +313,35 @@ function deriveAllowedTools(sid: string, opts: { tools?: Array<{ name: string }>
   return result;
 }
 
-function extractText(prompt: LanguageModelV2Prompt): string {
+const lastReminder = new Map<string, string>();
+
+function extractText(prompt: LanguageModelV2Prompt, sessionId?: string): string {
   for (let i = prompt.length - 1; i >= 0; i--) {
     const m = prompt[i];
     if (m.role === "user") {
       if (typeof m.content === "string") return m.content;
       if (Array.isArray(m.content)) {
-        // Collect ALL text parts — plan mode and other synthetic instructions
-        // are injected as additional text parts in the same user message
         const texts: string[] = [];
         for (const p of m.content as Array<{ type: string; text?: string }>) {
           if (p.type === "text" && p.text) texts.push(p.text);
         }
-        if (texts.length > 0) return texts.join("\n\n");
+        if (texts.length === 0) continue;
+        let text = texts.join("\n\n");
+        // Strip repeated system reminders — only send when changed
+        if (sessionId) {
+          const reminder = text.match(/<system-reminder>[\s\S]*?<\/system-reminder>/)?.[0];
+          if (reminder) {
+            const prev = lastReminder.get(sessionId);
+            if (prev === reminder) {
+              text = text.replace(reminder, "").trim();
+              trace("reminder.stripped", { sid: sessionId });
+            } else {
+              lastReminder.set(sessionId, reminder);
+              trace("reminder.updated", { sid: sessionId });
+            }
+          }
+        }
+        return text;
       }
     }
   }
@@ -480,7 +496,7 @@ export class ClwndModel implements LanguageModelV2 {
     }
 
     const sid = opts.headers?.["x-opencode-session"] ?? generateId();
-    const text = extractText(opts.prompt);
+    const text = extractText(opts.prompt, sid);
     const systemPrompt = extractSystemPrompt(opts.prompt);
     detectAgent(sid, opts.headers);
     const warnings: LanguageModelV2CallWarning[] = [];
@@ -594,7 +610,7 @@ export class ClwndModel implements LanguageModelV2 {
     }
 
     const sid = opts.headers?.["x-opencode-session"] ?? generateId();
-    const text = extractText(opts.prompt);
+    const text = extractText(opts.prompt, sid);
     const systemPrompt = extractSystemPrompt(opts.prompt);
     detectAgent(sid, opts.headers);
     const warnings: LanguageModelV2CallWarning[] = [];

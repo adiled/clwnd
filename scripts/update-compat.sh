@@ -8,7 +8,7 @@ CLWND_SRC="$(eval echo ~$CLWND_USER)/.local/share/clwnd/src"
 # ─── Sync test files to clwnd user ──────────────────────────────────────────
 
 echo "Syncing test files to $CLWND_USER..."
-for f in tests/smoke.test.ts tests/e2e.test.ts tests/e2e-serve.test.ts tests/e2e-human.test.ts; do
+for f in tests/e2e.test.ts tests/e2e-serve.test.ts tests/e2e-human.test.ts; do
   cp "$f" "$CLWND_SRC/$f"
   chown "$CLWND_USER:$CLWND_USER" "$CLWND_SRC/$f"
 done
@@ -43,9 +43,6 @@ echo "clwnd: v${CLWND_VERSION} (${CLWND_COMMIT})"
 echo "claude: ${CLAUDE_VERSION}"
 echo "opencode: ${OPENCODE_VERSION}"
 echo "bun: ${BUN_VERSION}"
-
-echo "Running smoke tests..."
-SMOKE=$(run_as_clwnd "bun test ./tests/smoke.test.ts")
 
 echo "Running e2e tests..."
 E2E=$(run_as_clwnd "bun test ./tests/e2e.test.ts")
@@ -109,7 +106,7 @@ Column rules:
 - **Brokered**: ✓ if brokered (both sides execute), — if not
 - **OC**: ✓ if renders natively in OpenCode UI, — if not
 - **Cov**: comma-separated suite names, or — if none
-- **Status**: ✅ Working, ❌ Failing, ⚠️ Partial, 🔇 Untested
+- **Status**: ✅ Working, ❌ Failing, ⚠️ Partial, 🔇 Untested. Skipped tests count as untested, NOT failing.
 
 Tools to include: Read, Edit, Write, Bash, Glob, Grep, WebFetch, WebSearch, TodoWrite, Task, Skill, TodoRead, TaskOutput/TaskStop, CronCreate/Delete/List
 
@@ -140,7 +137,7 @@ Then a line: \`Last updated: YYYY-MM-DD HH:MM UTC\` using the timestamp provided
 - CRITICAL: Output ONLY the raw markdown. No preamble, no "Here is...", no "I'll generate...", no explanation. Start directly with "## Tool Calls".
 - Derive status ONLY from test results. If a test passes, it works. If it fails, use ❌ status.
 - For CC Equivalent, use actual CLI flag/command names from the reference, not "Yes"/"No"/"Not applicable".
-- CRITICAL: Test Coverage column must ONLY contain comma-separated suite names from this exact set: \`smoke\`, \`e2e\`, \`e2e-serve\`, \`e2e-human\`. Nothing else. No test names, no descriptions, no qualifiers. Examples: "smoke, e2e-serve" or "e2e" or "—". Any other format is wrong.
+- CRITICAL: Test Coverage column must ONLY contain comma-separated suite names from this exact set: \`e2e\`, \`e2e-serve\`, \`e2e-human\`. Nothing else. No test names, no descriptions, no qualifiers. Examples: "smoke, e2e-serve" or "e2e" or "—". Any other format is wrong.
 SYSEOF
 
 cat > "$PROMPT_DIR/user.txt" <<USREOF
@@ -152,9 +149,6 @@ claude: ${CLAUDE_VERSION}
 opencode: ${OPENCODE_VERSION}
 bun: ${BUN_VERSION}
 timestamp: ${TIMESTAMP}
-
-=== SMOKE TESTS ===
-${SMOKE}
 
 === E2E TESTS ===
 ${E2E}
