@@ -154,15 +154,7 @@ class ClaudeNest {
     const proc = spawn({
       cmd,
       cwd: spawnCwd,
-      env: (() => {
-        const env = { ...process.env, TERM: "xterm-256color" };
-        // Prevent direnv from blocking Claude CLI spawn
-        delete env.DIRENV_DIR;
-        delete env.DIRENV_FILE;
-        delete env.DIRENV_WATCHES;
-        delete env.DIRENV_DIFF;
-        return env;
-      })(),
+      env: { ...process.env, TERM: "xterm-256color", DIRENV_DISABLE: "1" },
       stdout: "pipe",
       stdin: "pipe",
       stderr: "pipe",
