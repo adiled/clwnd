@@ -98,15 +98,15 @@ configure_opencode() {
 const fs = require('fs');
 const configPath = '${OPENCODE_CONFIG}';
 const pluginRef = '${PLUGIN_REF}';
+const registry = JSON.parse(fs.readFileSync('${CLWND_SRC}/models.json', 'utf8'));
 
 let config = {};
 try {
   config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 } catch {}
 
-// Register plugin — models + provider sync happens at runtime via OC API
+// Plugin
 if (!config.plugin) config.plugin = [];
-// Clean stale npm plugin entries
 const stale = ['@clwnd/opencode'];
 config.plugin = config.plugin.filter(p => !stale.includes(p));
 if (!config.plugin.includes(pluginRef)) {
@@ -116,15 +116,25 @@ if (!config.plugin.includes(pluginRef)) {
   console.log('  plugin already registered');
 }
 
-// Clean up legacy: remove provider config written by older installs
-// Plugin now syncs this at runtime via client.config.update()
-if (config.provider?.['opencode-clwnd']) {
-  delete config.provider['opencode-clwnd'];
-  console.log('  removed legacy provider config (now managed by plugin)');
+// Provider + models — always sync to match registry
+if (!config.provider) config.provider = {};
+const models = {};
+for (const [id, entry] of Object.entries(registry)) {
+  models[id] = {
+    id,
+    name: entry.name,
+    tool_call: entry.tool_call ?? true,
+    limit: entry.limit,
+    provider: { npm: pluginRef }
+  };
 }
+config.provider['opencode-clwnd'] = { npm: pluginRef, models };
+console.log('  synced clwnd provider with ' + Object.keys(models).length + ' models');
+
+// Clean legacy small_model — plugin manages at runtime
 if (config.small_model) {
   delete config.small_model;
-  console.log('  removed legacy small_model (now managed by plugin)');
+  console.log('  removed legacy small_model (managed by plugin)');
 }
 
 fs.mkdirSync(require('path').dirname(configPath), { recursive: true });
