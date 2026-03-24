@@ -118,24 +118,23 @@ if (!config.plugin.includes(pluginRef)) {
 // Add provider + models
 if (!config.provider) config.provider = {};
 
-if (config.provider['opencode-clwnd']) {
-  console.log('  provider already configured, skipping');
-} else {
-  const models = {};
-  for (const [id, entry] of Object.entries(registry)) {
-    models[id] = {
-      id,
-      name: entry.name,
-      tool_call: entry.tool_call ?? true,
-      limit: entry.limit,
-      provider: { npm: pluginRef }
-    };
-  }
-  config.provider['opencode-clwnd'] = {
-    npm: pluginRef,
-    models
+const wanted = {};
+for (const [id, entry] of Object.entries(registry)) {
+  wanted[id] = {
+    id,
+    name: entry.name,
+    tool_call: entry.tool_call ?? true,
+    limit: entry.limit,
+    provider: { npm: pluginRef }
   };
-  console.log('  added clwnd provider with ' + Object.keys(models).length + ' models');
+}
+const wantedProvider = { npm: pluginRef, models: wanted };
+const existing = config.provider['opencode-clwnd'];
+if (JSON.stringify(existing) !== JSON.stringify(wantedProvider)) {
+  config.provider['opencode-clwnd'] = wantedProvider;
+  console.log('  updated clwnd provider with ' + Object.keys(wanted).length + ' models');
+} else {
+  console.log('  provider up to date');
 }
 
 fs.mkdirSync(require('path').dirname(configPath), { recursive: true });
