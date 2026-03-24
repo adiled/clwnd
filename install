@@ -161,9 +161,8 @@ register_service() {
   <string>${PLIST_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/sh</string>
-    <string>-c</string>
-    <string>exec ${BUN} ${CLWND_SRC}/dist/daemon/index.js</string>
+    <string>${BUN}</string>
+    <string>${CLWND_SRC}/dist/daemon/index.js</string>
   </array>
   <key>WorkingDirectory</key>
   <string>${CLWND_SRC}</string>
