@@ -614,9 +614,27 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
           saveSessions();
           hum(sid, { chi: "session-ready", sid, claudeSessionId, model, tools });
         },
-        onPetal(type, payload) {
-          hum(sid, { chi: "chunk", sid, chunkType: type, ...payload });
-        },
+        onPetal: (() => {
+          let batch: string[] = [];
+          let pending = false;
+          return (type: string, payload: Record<string, unknown>) => {
+            batch.push(JSON.stringify({ chi: "chunk", sid, chunkType: type, ...payload }));
+            if (!pending) {
+              pending = true;
+              queueMicrotask(() => {
+                // Single socket write for all buffered chunks
+                const line = batch.join("\n") + "\n";
+                batch = [];
+                pending = false;
+                for (const [, client] of humRoots) {
+                  if (client.sessionId === sid || client.sessionId === null) {
+                    try { client.socket.write(line); } catch {}
+                  }
+                }
+              });
+            }
+          };
+        })(),
         onWilt(harvest) {
           hum(sid, {
             chi: "finish", sid,
