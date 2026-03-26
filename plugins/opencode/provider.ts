@@ -183,7 +183,8 @@ async function awakenHum(): Promise<void> {
     humSocket.on("close", () => {
       humAlive = false;
       humSocket = null;
-      turnsSent.clear(); // process died, new one knows nothing
+      // Don't clear turnsSent — OC's prompt history doesn't change on hum reconnect.
+      // The daemon tracks needsRespawn separately for process lifecycle.
       trace("hum.disconnected");
       // Refresh the await-able promise so doStream waits for reconnect
       humAwaken = new Promise<void>(r => { humReady = { resolve: r }; });

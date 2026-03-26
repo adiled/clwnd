@@ -731,11 +731,7 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
         nest.murmur(sid, poolKey, content ?? msg.text as string ?? "");
       }
 
-      // Inject user message into JSONL
-      if (session.claudeSessionId && session.claudeSessionPath && !msg.listenOnly) {
-        const parentUuid = getLastEntryUuid(session.claudeSessionPath);
-        injectUserMessage(session.claudeSessionPath, msg.text as string ?? "", parentUuid, session.claudeSessionId);
-      }
+      // Claude CLI writes user messages to JSONL itself — no need to inject
       break;
     }
 
@@ -775,13 +771,12 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
         sessions.set(sid, session);
       }
 
-      if (!session.claudeSessionId || !session.claudeSessionPath) {
-        const seedId = randomUUID();
-        const seedPath = createClaudeSession(session.cwd, seedId);
-        session.claudeSessionId = seedId;
-        session.claudeSessionPath = seedPath;
-      }
-      exportToJsonl(session.claudeSessionPath!, session.claudeSessionId!, historyMsgs);
+      // Always create fresh JSONL — prevents duplicate messages from repeated seeds
+      const seedId = session.claudeSessionId ?? randomUUID();
+      const seedPath = createClaudeSession(session.cwd, seedId);
+      session.claudeSessionId = seedId;
+      session.claudeSessionPath = seedPath;
+      exportToJsonl(seedPath, seedId, historyMsgs);
       session.needsRespawn = true;
       saveSessions();
       trace("seed.exported", { sid, claudeId: session.claudeSessionId, turns: historyMsgs.length, needsRespawn: true });
@@ -848,6 +843,12 @@ Bun.serve({
       return new Response(JSON.stringify({ pid: process.pid, procs: nest.survey(), sessions: sessions.size }), {
         headers: { "Content-Type": "application/json" },
       });
+    }
+
+    if (req.method === "GET" && url.pathname === "/sessions") {
+      const out: Record<string, unknown> = {};
+      for (const [sid, s] of sessions) out[sid] = s;
+      return Response.json(out);
     }
 
     // Cleanup — tests use this to tear down sessions

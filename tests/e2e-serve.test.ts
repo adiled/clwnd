@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "bun:test";
 import { spawn, type Subprocess } from "bun";
-import { existsSync, rmSync, mkdirSync } from "fs";
+import { existsSync, rmSync, mkdirSync, readFileSync } from "fs";
 import { join } from "path";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -80,6 +80,75 @@ async function sweepDaemonSessions(): Promise<number> {
   }
 }
 
+// ─── Integrity Assertions ────────────────────────────────────────────────────
+
+async function getSessionState(sid: string): Promise<any> {
+  try {
+    const r = await fetch("http://localhost/sessions", { unix: DAEMON_SOCK } as RequestInit);
+    const all = await r.json() as Record<string, any>;
+    return all[sid];
+  } catch { return null; }
+}
+
+function assertCleanHistory(jsonlPath: string): void {
+  if (!existsSync(jsonlPath)) return;
+  const lines = readFileSync(jsonlPath, "utf-8").trim().split("\n")
+    .filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+  // Ghost entries from --resume are expected for seeded sessions.
+  // Only flag if there are MORE ghosts than seeded user messages (indicates re-seeding).
+  const ghosts = lines.filter((l: any) =>
+    l.type === "assistant" &&
+    l.message?.content?.[0]?.text?.includes("No response requested")
+  );
+  const userMsgs = lines.filter((l: any) => l.type === "user" && l.message?.role === "user");
+  // More ghosts than half the user messages suggests re-seeding / duplication
+  if (ghosts.length > Math.ceil(userMsgs.length / 2)) {
+    throw new Error(`Excessive ghost entries: ${ghosts.length} ghosts vs ${userMsgs.length} user messages — likely re-seeding`);
+  }
+
+  // No duplicate consecutive user messages
+  const userTexts = lines
+    .filter((l: any) => l.type === "user" && l.message?.role === "user")
+    .map((l: any) => {
+      const c = l.message.content;
+      if (typeof c === "string") return c;
+      if (Array.isArray(c)) return c.filter((p: any) => p.type === "text").map((p: any) => p.text).join("");
+      return "";
+    });
+  for (let i = 1; i < userTexts.length; i++) {
+    if (userTexts[i] && userTexts[i] === userTexts[i - 1]) {
+      throw new Error(`Duplicate consecutive user message in JSONL at index ${i}: "${userTexts[i].slice(0, 80)}"`);
+    }
+  }
+}
+
+function assertCleanPetals(resp: { info: any; parts: any[] }): void {
+  const parts = resp.parts ?? [];
+  const textParts = parts.filter((p: any) => p.type === "text" && p.text);
+
+  // No seed context leaking into response
+  for (const p of textParts) {
+    expect(p.text).not.toContain("Previous conversation context:");
+    expect(p.text).not.toContain("<!--clwnd-meta:");
+  }
+
+  // No consecutive duplicate text parts
+  for (let i = 1; i < textParts.length; i++) {
+    if (textParts[i].text && textParts[i].text === textParts[i - 1].text) {
+      throw new Error(`Duplicate consecutive text petal: "${textParts[i].text.slice(0, 80)}"`);
+    }
+  }
+
+  // Tool parts are completed, not stuck
+  const toolParts = parts.filter((p: any) => p.type === "tool");
+  for (const t of toolParts) {
+    expect(["completed", "error"]).toContain(t.state?.status);
+  }
+}
+
+// ─── Message Sending ─────────────────────────────────────────────────────────
+
 async function sendMessage(sessionID: string, text: string, agent?: string, timeoutMs = 120_000, model = MODEL): Promise<{ info: any; parts: any[] }> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -94,7 +163,10 @@ async function sendMessage(sessionID: string, text: string, agent?: string, time
       }),
       signal: ctrl.signal,
     });
-    return r.json() as any;
+    const resp = await r.json() as any;
+    // Auto-assert petal integrity on every response
+    assertCleanPetals(resp);
+    return resp;
   } finally {
     clearTimeout(timer);
   }
@@ -243,6 +315,19 @@ afterAll(async () => {
 // ─── Per-Test Cleanup ───────────────────────────────────────────────────────
 
 afterEach(async () => {
+  // JSONL health check before cleanup — catches duplicates, ghosts, corruption
+  for (const sid of activeSessions) {
+    try {
+      const state = await getSessionState(sid);
+      if (state?.claudeSessionPath) {
+        assertCleanHistory(state.claudeSessionPath);
+      }
+    } catch (e) {
+      // Log but don't swallow — let the assertion fail the test
+      if (e instanceof Error && (e.message.includes("Duplicate") || e.message.includes("Ghost"))) throw e;
+    }
+  }
+
   // Delete all sessions created during the test
   while (activeSessions.length > 0) {
     const sid = activeSessions.pop()!;
