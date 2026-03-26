@@ -563,11 +563,9 @@ describe("e2e-serve: concurrent sessions", () => {
     const sidA = await createSession();
     const sidB = await createSession();
 
-    // Establish different facts in parallel
-    await Promise.all([
-      sendMessage(sidA, "My secret word is FLAMINGO. Acknowledge."),
-      sendMessage(sidB, "My secret word is PELICAN. Acknowledge."),
-    ]);
+    // Establish facts sequentially (avoid 4 simultaneous claude spawns)
+    await sendMessage(sidA, "My secret word is FLAMINGO. Acknowledge.");
+    await sendMessage(sidB, "My secret word is PELICAN. Acknowledge.");
 
     // Query in parallel — each should only know its own secret
     const [respA, respB] = await Promise.all([
