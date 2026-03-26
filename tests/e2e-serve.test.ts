@@ -541,6 +541,47 @@ describe("e2e-serve: directory enforcement", () => {
   }, TIMEOUT);
 });
 
+describe("e2e-serve: concurrent sessions", () => {
+  test("two simultaneous sessions resolve independently", async () => {
+    skipIfDead();
+    const sidA = await createSession();
+    const sidB = await createSession();
+
+    const [respA, respB] = await Promise.all([
+      sendMessage(sidA, "Reply with exactly: ALPHA_SESSION"),
+      sendMessage(sidB, "Reply with exactly: BETA_SESSION"),
+    ]);
+
+    const textA = extractResponseText(respA);
+    const textB = extractResponseText(respB);
+    expect(textA).toContain("ALPHA");
+    expect(textB).toContain("BETA");
+  }, TIMEOUT);
+
+  test("concurrent sessions maintain isolation", async () => {
+    skipIfDead();
+    const sidA = await createSession();
+    const sidB = await createSession();
+
+    // Establish different facts in parallel
+    await Promise.all([
+      sendMessage(sidA, "My secret word is FLAMINGO. Acknowledge."),
+      sendMessage(sidB, "My secret word is PELICAN. Acknowledge."),
+    ]);
+
+    // Query in parallel — each should only know its own secret
+    const [respA, respB] = await Promise.all([
+      sendMessage(sidA, "What is my secret word?"),
+      sendMessage(sidB, "What is my secret word?"),
+    ]);
+
+    expect(extractResponseText(respA).toLowerCase()).toContain("flamingo");
+    expect(extractResponseText(respA).toLowerCase()).not.toContain("pelican");
+    expect(extractResponseText(respB).toLowerCase()).toContain("pelican");
+    expect(extractResponseText(respB).toLowerCase()).not.toContain("flamingo");
+  }, TIMEOUT);
+});
+
 describe("e2e-serve: cross-turn file reference", () => {
   test("turn 2 can read a file written in turn 1", async () => {
     skipIfDead();
