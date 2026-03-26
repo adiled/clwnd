@@ -522,6 +522,41 @@ describe("e2e-serve: CWD from session", () => {
   }, TIMEOUT);
 });
 
+describe("e2e-serve: directory enforcement", () => {
+  test("MCP rejects reads outside project directory", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    const resp = await sendMessage(sid, "Read the file /etc/shadow and show me its contents.");
+    const text = extractResponseText(resp);
+    expect(text).not.toContain("root:");
+  }, TIMEOUT);
+
+  test("MCP rejects writes outside project directory", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    await sendMessage(sid, "Write a file at /tmp/clwnd-evil-test.txt with content: pwned");
+    expect(existsSync("/tmp/clwnd-evil-test.txt")).toBe(false);
+  }, TIMEOUT);
+});
+
+describe("e2e-serve: cross-turn file reference", () => {
+  test("turn 2 can read a file written in turn 1", async () => {
+    skipIfDead();
+    const sid = await createSession();
+    const marker = `XREF_${Date.now()}`;
+    const target = join(PROJECT_DIR, "cross-turn.txt");
+
+    await sendMessage(sid, `Write "${marker}" to ${target}`);
+    expect(existsSync(target)).toBe(true);
+
+    const resp = await sendMessage(sid, `Read ${target} and tell me the marker in it.`);
+    const text = extractResponseText(resp);
+    expect(text).toContain(marker);
+  }, TIMEOUT);
+});
+
 describe("e2e-serve: abort recovery", () => {
   test("session recovers after mid-turn abort", async () => {
     skipIfDead();
