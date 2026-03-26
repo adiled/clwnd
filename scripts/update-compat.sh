@@ -8,7 +8,7 @@ CLWND_SRC="$(eval echo ~$CLWND_USER)/.local/share/clwnd/src"
 # ─── Sync test files to clwnd user ──────────────────────────────────────────
 
 echo "Syncing test files to $CLWND_USER..."
-for f in tests/e2e.test.ts tests/e2e-serve.test.ts tests/e2e-human.test.ts; do
+for f in tests/e2e-serve.test.ts tests/e2e-human.test.ts; do
   cp "$f" "$CLWND_SRC/$f"
   chown "$CLWND_USER:$CLWND_USER" "$CLWND_SRC/$f"
 done
@@ -43,9 +43,6 @@ echo "clwnd: v${CLWND_VERSION} (${CLWND_COMMIT})"
 echo "claude: ${CLAUDE_VERSION}"
 echo "opencode: ${OPENCODE_VERSION}"
 echo "bun: ${BUN_VERSION}"
-
-echo "Running e2e tests..."
-E2E=$(run_as_clwnd "bun test ./tests/e2e.test.ts")
 
 echo "Running e2e-serve tests..."
 E2E_SERVE=$(run_as_clwnd "bun test ./tests/e2e-serve.test.ts")
@@ -149,9 +146,6 @@ claude: ${CLAUDE_VERSION}
 opencode: ${OPENCODE_VERSION}
 bun: ${BUN_VERSION}
 timestamp: ${TIMESTAMP}
-
-=== E2E TESTS ===
-${E2E}
 
 === E2E-SERVE TESTS ===
 ${E2E_SERVE}

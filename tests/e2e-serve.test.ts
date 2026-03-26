@@ -371,6 +371,19 @@ describe("e2e-serve: session basics", () => {
     const text = extractResponseText(resp).toLowerCase();
     expect(text).toContain("mars");
   }, TIMEOUT);
+
+  test("three-turn continuity recalls multiple facts", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    await sendMessage(sid, "My lucky number is 73. Acknowledge.");
+    await sendMessage(sid, "My favorite city is Tokyo. Acknowledge.");
+
+    const resp = await sendMessage(sid, "What is my lucky number and favorite city?");
+    const text = extractResponseText(resp).toLowerCase();
+    expect(text).toContain("73");
+    expect(text).toContain("tokyo");
+  }, TIMEOUT);
 });
 
 describe("e2e-serve: agent switching", () => {
