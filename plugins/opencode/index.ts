@@ -39,8 +39,8 @@ export const clwndPlugin: Plugin = async (input) => {
 
   log("plugin.loaded", { directory: input.directory });
 
-  // Discover free model for title gen / compaction
-  syncSmallModel(input.client).catch(() => {});
+  // Delay to avoid config update triggering OC reload during startup
+  setTimeout(() => syncSmallModel(input.client).catch(() => {}), 10000);
 
   return {
     models: {

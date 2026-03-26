@@ -54,8 +54,20 @@ class ClaudeNest {
 
   awaken(poolKey: string, modelId: string, listener: BloomListener, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[], sessionCwd?: string): void {
     let roost = this.roosts.get(poolKey);
+
+    // Respawn if session was seeded with new history
+    const session = sessions.get(poolKey);
+    if (roost && session?.needsRespawn) {
+      trace("nest.respawn", { poolKey, reason: "seed" });
+      try { roost.proc.kill(); } catch {}
+      this.roosts.delete(poolKey);
+      roost = undefined;
+      session.needsRespawn = false;
+      saveSessions();
+    }
+
     if (!roost) {
-      roost = this.spawnProc(poolKey, modelId, claudeSessionId, permissions, systemPrompt, allowedTools, sessionCwd);
+      roost = this.spawnProc(poolKey, modelId, claudeSessionId ?? session?.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, sessionCwd);
     } else {
       mcpSetPerms((permissions ?? []) as any);
       mcpSetAllowed(allowedTools);
@@ -153,6 +165,10 @@ class ClaudeNest {
     // System prompt set once at spawn — persistent process keeps it
     if (systemPrompt) {
       cmd.push("--system-prompt", systemPrompt);
+    }
+    // Resume from seeded JSONL session (cold-start history export)
+    if (claudeSessionId) {
+      cmd.push("--resume", claudeSessionId);
     }
     const spawnCwd = sessionCwd ?? process.env.CLWND_CWD ?? process.env.HOME ?? "/";
     const proc = spawn({
@@ -374,6 +390,9 @@ class ClaudeNest {
 
     if (msg.type === "result") {
       this.streamedTurn = false;
+      if (msg.subtype === "error_during_execution" || msg.is_error) {
+        trace("stream.result.error", { raw: JSON.stringify(msg).slice(0, 500) });
+      }
       listener.onWilt({
         finishReason: (msg.stop_reason as string) ?? "stop",
         usage: msg.usage as Record<string, number> | undefined,
@@ -431,6 +450,8 @@ interface Session {
   claudeSessionPath: string | null;
   cwd: string;
   modelId: string;
+  needsRespawn?: boolean;
+  lastAccessed?: number;
 }
 
 const STATE_DIR = process.env.XDG_STATE_HOME
@@ -463,7 +484,7 @@ const sessions = loadSessions();
 const CLAUDE_BASE = `${process.env.HOME}/.claude`;
 
 function cwdHash(cwd: string): string {
-  return cwd.replace(/[^a-zA-Z0-9]/g, "-").replace(/^-+|-+$/g, "");
+  return cwd.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+$/g, "");
 }
 
 function getSessionDir(cwd: string): string {
@@ -531,6 +552,52 @@ function defaultSocketPath(): string {
   return "/tmp/clwnd.sock";
 }
 
+// ─── History Export ──────────────────────────────────────────────────────────
+// Write OC conversation history to Claude CLI's JSONL format for cold-start seeding.
+
+function exportToJsonl(sessionPath: string, sessionId: string, history: Array<{ role: string; content: unknown }>): void {
+  let parentUuid: string | null = getLastEntryUuid(sessionPath);
+
+  for (const msg of history) {
+    const contentArr = msg.content;
+    let text = "";
+    if (typeof contentArr === "string") {
+      text = contentArr;
+    } else if (Array.isArray(contentArr)) {
+      text = (contentArr as Array<{ type: string; text?: string; result?: unknown }>)
+        .filter(p => p.type === "text" && p.text)
+        .map(p => p.text!)
+        .join("\n");
+    }
+
+    if (msg.role === "user") {
+      parentUuid = appendToJsonl(sessionPath, {
+        type: "user", parentUuid, sessionId,
+        message: { role: "user", content: [{ type: "text", text }] },
+        entrypoint: "sdk-cli",
+      });
+    } else if (msg.role === "assistant") {
+      parentUuid = appendToJsonl(sessionPath, {
+        type: "assistant", parentUuid, sessionId,
+        message: { role: "assistant", content: [{ type: "text", text }] },
+      });
+    } else if (msg.role === "tool") {
+      // Tool results as user messages with tool_result content
+      const parts = Array.isArray(contentArr) ? contentArr as Array<{ type: string; toolCallId?: string; result?: unknown }> : [];
+      for (const part of parts) {
+        if (part.type === "tool-result" && part.toolCallId) {
+          const result = typeof part.result === "string" ? part.result : JSON.stringify(part.result ?? "");
+          parentUuid = appendToJsonl(sessionPath, {
+            type: "user", parentUuid, sessionId,
+            message: { role: "user", content: [{ type: "tool_result", tool_use_id: part.toolCallId, content: result }] },
+            entrypoint: "sdk-cli",
+          });
+        }
+      }
+    }
+  }
+}
+
 const SOCK = process.env.CLWND_SOCKET ?? defaultSocketPath();
 const HTTP = SOCK + ".http";
 
@@ -593,6 +660,7 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
         saveSessions();
         trace("session.created", { sid, model: session.modelId });
       }
+      session.lastAccessed = Date.now();
 
       const permissions = (msg.permissions ?? []) as unknown[];
       const systemPrompt = (msg.systemPrompt as string) || undefined;
@@ -605,6 +673,8 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
       }
 
       const poolKey = sid;
+
+      // History seeding now handled by chi: "seed" (sent before prompt)
 
       const listener: BloomListener = {
         sessionId: sid,
@@ -654,7 +724,7 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
         },
       };
 
-      nest.awaken(poolKey, session.modelId, listener, undefined, permissions, systemPrompt, allowedTools, cwd);
+      nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd);
 
       if (!msg.listenOnly) {
         const content = msg.content as Array<{ type: string; text: string }> | undefined;
@@ -690,6 +760,31 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
         saveSessions();
         trace("hum.session.cleaned", { sid });
       }
+      break;
+    }
+
+    case "seed": {
+      const sid = msg.sid as string;
+      const seedCwd = (msg.cwd as string) ?? process.env.HOME ?? "/";
+      const historyMsgs = msg.history as Array<{ role: string; content: unknown }>;
+      if (!historyMsgs || historyMsgs.length === 0) break;
+
+      let session = sessions.get(sid);
+      if (!session) {
+        session = { opencodeSessionId: sid, claudeSessionId: null, claudeSessionPath: null, cwd: seedCwd, modelId: "sonnet" };
+        sessions.set(sid, session);
+      }
+
+      if (!session.claudeSessionId || !session.claudeSessionPath) {
+        const seedId = randomUUID();
+        const seedPath = createClaudeSession(session.cwd, seedId);
+        session.claudeSessionId = seedId;
+        session.claudeSessionPath = seedPath;
+      }
+      exportToJsonl(session.claudeSessionPath!, session.claudeSessionId!, historyMsgs);
+      session.needsRespawn = true;
+      saveSessions();
+      trace("seed.exported", { sid, claudeId: session.claudeSessionId, turns: historyMsgs.length, needsRespawn: true });
       break;
     }
 
@@ -1002,4 +1097,32 @@ process.on("uncaughtException",  e => info("process.uncaught", { err: String(e) 
 process.on("unhandledRejection", e => info("process.unhandled", { err: String(e) }));
 
 info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid, version: CURRENT_VERSION });
+
+// ─── Session Reaper ─────────────────────────────────────────────────────────
+// Remove stale sessions that haven't been accessed in a while.
+
+const REAP_INTERVAL = 60_000; // check every 60s
+const REAP_MAX_AGE = 60 * 60 * 1000; // 1 hour
+
+function reapSessions(): void {
+  const now = Date.now();
+  let reaped = 0;
+  for (const [sid, session] of sessions) {
+    if (!session.lastAccessed) continue;
+    const age = now - session.lastAccessed;
+    if (age < REAP_MAX_AGE) continue;
+    // Don't reap if a process is alive for this session
+    if (nest.roost(sid)) continue;
+    sessions.delete(sid);
+    reaped++;
+  }
+  if (reaped > 0) {
+    saveSessions();
+    trace("session.reaped", { count: reaped, remaining: sessions.size });
+  }
+}
+
+setInterval(reapSessions, REAP_INTERVAL);
+// Reap on startup too — clean up sessions from before daemon restart
+reapSessions();
 

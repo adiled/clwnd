@@ -154,7 +154,8 @@ let humSocket: NetSocket | null = null;
 let humEcho = "";
 let humHearer: HumListener | null = null;
 let humAlive = false;
-const humAwaken = awakenHum();
+let humReady: { resolve: () => void } | null = null;
+let humAwaken: Promise<void> = awakenHum();
 
 async function awakenHum(): Promise<void> {
   try {
@@ -162,6 +163,7 @@ async function awakenHum(): Promise<void> {
 
     humSocket.on("connect", () => {
       humAlive = true;
+      if (humReady) { humReady.resolve(); humReady = null; }
       trace("hum.connected");
     });
 
@@ -181,7 +183,10 @@ async function awakenHum(): Promise<void> {
     humSocket.on("close", () => {
       humAlive = false;
       humSocket = null;
+      turnsSent.clear(); // process died, new one knows nothing
       trace("hum.disconnected");
+      // Refresh the await-able promise so doStream waits for reconnect
+      humAwaken = new Promise<void>(r => { humReady = { resolve: r }; });
       setTimeout(awakenHum, 2000);
     });
 
@@ -195,11 +200,16 @@ async function awakenHum(): Promise<void> {
 }
 
 export function hum(msg: Record<string, unknown>): void {
-  if (!humSocket || !humAlive) return;
+  if (!humSocket || !humAlive) {
+    writeLog("trace", "hum.send.skipped", { chi: msg.chi as string, alive: humAlive, socket: !!humSocket });
+    return;
+  }
   try {
-    humSocket.write(JSON.stringify(msg) + "\n");
+    const data = JSON.stringify(msg) + "\n";
+    writeLog("trace", "hum.send", { chi: msg.chi as string, len: data.length });
+    humSocket.write(data);
   } catch (e) {
-    trace("hum.send.failed", { err: String(e) });
+    writeLog("trace", "hum.send.failed", { err: String(e) });
   }
 }
 
@@ -208,7 +218,12 @@ export function hum(msg: Record<string, unknown>): void {
  * until "finish" or "error" arrives. The consumer reads messages via
  * the callback. Returns when the turn is done.
  */
-function humSpeak(msg: Record<string, unknown>, onMessage: HumListener): Promise<void> {
+async function humSpeak(msg: Record<string, unknown>, onMessage: HumListener): Promise<void> {
+  // Wait for hum reconnect if it dropped (e.g., OC plugin reload on model switch)
+  if (!humAlive) {
+    writeLog("trace", "humSpeak.waiting", { chi: msg.chi as string });
+    await humAwaken;
+  }
   return new Promise<void>((resolve, reject) => {
     humHearer = (incoming) => {
       onMessage(incoming);
@@ -359,37 +374,52 @@ function extractText(prompt: LanguageModelV2Prompt, sessionId?: string): string 
   return extractContent(prompt, sessionId).map(p => p.text).join("\n\n");
 }
 
-/**
- * Extract conversation history from the prompt that the persistent Claude CLI
- * process hasn't seen yet. Tracks how many history messages were last injected
- * per session. If the prompt has new turns (e.g., from model switches), injects
- * only the new ones. Returns null if there's nothing new to inject.
- */
+// ─── History Seeding (#7) ────────────────────────────────────────────────────
+// Two paths: cold start (JSONL export) and gap fill (content injection).
 
-// Disabled — was injecting full OC conversation history into every prompt,
-// doubling context since the persistent Claude CLI process already has it.
-// Intended for cross-provider session migration (#7) but needs a different
-// approach: only inject turns the process genuinely hasn't seen.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function extractHistory(prompt: LanguageModelV2Prompt, sessionId?: string): string | null {
+const turnsSent = new Map<string, number>();
+
+function countHistoryTurns(prompt: LanguageModelV2Prompt): number {
   let lastUserIdx = -1;
   for (let i = prompt.length - 1; i >= 0; i--) {
     if (prompt[i].role === "user") { lastUserIdx = i; break; }
   }
-  const historyMsgs = prompt.slice(0, lastUserIdx).filter(m => m.role === "user" || m.role === "assistant");
-  if (historyMsgs.length === 0) return null;
-  const lines: string[] = [];
-  for (const m of historyMsgs) {
-    const role = m.role === "user" ? "User" : "Assistant";
-    let text = "";
-    if (typeof m.content === "string") text = m.content;
-    else if (Array.isArray(m.content)) {
-      text = (m.content as Array<{ type: string; text?: string }>)
-        .filter(p => p.type === "text" && p.text).map(p => p.text!).join("\n");
-    }
-    if (text) lines.push(`${role}: ${text}`);
+  let turns = 0;
+  for (let i = 0; i < lastUserIdx; i++) {
+    if (prompt[i].role === "user") turns++;
   }
-  return lines.length > 0 ? lines.join("\n\n") : null;
+  return turns;
+}
+
+// Path A: Extract full history for JSONL export (cold start)
+function extractHistoryForExport(prompt: LanguageModelV2Prompt): Array<{ role: string; content: unknown }> | null {
+  let lastUserIdx = -1;
+  for (let i = prompt.length - 1; i >= 0; i--) {
+    if (prompt[i].role === "user") { lastUserIdx = i; break; }
+  }
+  const history = prompt.slice(0, lastUserIdx).filter(m => m.role !== "system");
+  return history.length > 0 ? history.map(m => ({ role: m.role, content: m.content })) : null;
+}
+
+// Path B: Extract gap turns for JSONL export (same as Path A but only the missing turns)
+function extractGapForExport(prompt: LanguageModelV2Prompt, after: number): Array<{ role: string; content: unknown }> | null {
+  let lastUserIdx = -1;
+  for (let i = prompt.length - 1; i >= 0; i--) {
+    if (prompt[i].role === "user") { lastUserIdx = i; break; }
+  }
+  // Count user turns to find the gap start point
+  const history = prompt.slice(0, lastUserIdx).filter(m => m.role !== "system");
+  let userCount = 0;
+  let gapStart = 0;
+  for (let i = 0; i < history.length; i++) {
+    if (history[i].role === "user") {
+      userCount++;
+      if (userCount > after) { gapStart = i; break; }
+    }
+  }
+  if (userCount <= after) return null;
+  const gap = history.slice(gapStart);
+  return gap.length > 0 ? gap.map(m => ({ role: m.role, content: m.content })) : null;
 }
 
 function extractSystemPrompt(prompt: LanguageModelV2Prompt): string {
@@ -632,6 +662,32 @@ export class ClwndModel implements LanguageModelV2 {
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
+    // History seeding (#7) — both paths write to JSONL via daemon
+    const historyTurns = countHistoryTurns(opts.prompt);
+    const sent = turnsSent.get(sid) ?? -1; // -1 = never seen this session
+    let history: Array<{ role: string; content: unknown }> | undefined;
+
+    if (!isAuxiliaryCall(opts) && !isBrokeredToolReturn(opts.prompt)) {
+      if (sent === -1 && historyTurns > 0) {
+        // Path A: Cold start — full history
+        history = extractHistoryForExport(opts.prompt) ?? undefined;
+        if (history) {
+          // Send seed immediately via hum — before ReadableStream starts, before OC can reload
+          hum({ chi: "seed", sid, history, cwd });
+          trace("seed.export", { sid, turns: historyTurns });
+        }
+      } else if (sent >= 0 && historyTurns > sent) {
+        // Path B: Gap fill — send seed immediately too
+        const gapHistory = extractGapForExport(opts.prompt, sent);
+        if (gapHistory) {
+          hum({ chi: "seed", sid, history: gapHistory, cwd });
+          history = gapHistory;
+          trace("seed.gap", { sid, from: sent, to: historyTurns });
+        }
+      }
+      // +1 because the current turn (being sent now) will be history on the next call
+      turnsSent.set(sid, historyTurns + 1);
+    }
 
     // Brokered tool return — OpenCode executed the tool, sending result back.
     if (isBrokeredToolReturn(opts.prompt)) {
@@ -674,6 +730,18 @@ export class ClwndModel implements LanguageModelV2 {
       return lt && Array.isArray(lt.content) && (lt.content as any[]).some((p: any) => p.toolCallId?.startsWith("perm-"));
     })();
 
+    // Send prompt synchronously BEFORE creating the stream — survives OC plugin reload
+    let promptSent = false;
+    if (!listenOnly && humAlive) {
+      hum({
+        chi: "prompt", sid, cwd,
+        modelId: self.modelId,
+        content, text, systemPrompt,
+        permissions, allowedTools, listenOnly,
+      });
+      promptSent = true;
+    }
+
     const bloom = new ReadableStream<LanguageModelV2StreamPart>({
       async start(controller) {
         const textId = generateId();
@@ -707,7 +775,7 @@ export class ClwndModel implements LanguageModelV2 {
           wilt();
         });
 
-        // Wait for hum connection
+        // Wait for hum connection (refreshable — survives plugin reload)
         await humAwaken;
         if (!humAlive) {
           petal({ type: "error", error: new Error("clwndHum not connected") } as LanguageModelV2StreamPart);
@@ -717,20 +785,19 @@ export class ClwndModel implements LanguageModelV2 {
 
         petal({ type: "stream-start", warnings } as LanguageModelV2StreamPart);
 
-        // Send prompt (or listen-only) via the hum, process incoming messages
-        const humFade = listenOnly
-          ? humHear(onHummin)
-          : humSpeak({
-              sid,
-              cwd,
-              modelId: self.modelId,
-              content,
-              text,
-              systemPrompt,
-              permissions,
-              allowedTools,
-              listenOnly,
-            }, onHummin);
+        // Listen for responses, then send prompt
+        // Prompt was already sent synchronously before the ReadableStream (see below)
+        const humFade = humHear(onHummin);
+        if (!promptSent) {
+          // Fallback: send prompt here if it wasn't sent synchronously
+          hum({
+            chi: "prompt", sid, cwd,
+            modelId: self.modelId,
+            content, text, systemPrompt,
+            permissions, allowedTools, listenOnly,
+          });
+          promptSent = true;
+        }
 
         // Out-of-band tool metadata queue — daemon hums meta before Claude CLI streams the result
         const metaQueue: Array<{ tool: string; title?: string; metadata?: Record<string, unknown> }> = [];

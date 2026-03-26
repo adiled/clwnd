@@ -60,6 +60,26 @@ async function deleteSession(sid: string): Promise<void> {
   } catch {}
 }
 
+async function sweepDaemonSessions(): Promise<number> {
+  // Get all daemon sessions, cleanup any that exist
+  try {
+    const r = await fetch("http://localhost/status", { unix: DAEMON_SOCK } as RequestInit);
+    const status = await r.json() as { sessions: number; procs: Array<{ sessions: string[] }> };
+    // Collect all session IDs from active processes
+    const allSids: string[] = [];
+    for (const proc of status.procs ?? []) {
+      allSids.push(...(proc.sessions ?? []));
+    }
+    // Cleanup each
+    for (const sid of allSids) {
+      await deleteSession(sid);
+    }
+    return allSids.length;
+  } catch {
+    return 0;
+  }
+}
+
 async function sendMessage(sessionID: string, text: string, agent?: string, timeoutMs = 120_000, model = MODEL): Promise<{ info: any; parts: any[] }> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -146,6 +166,9 @@ async function nuke(pid?: number): Promise<void> {
 let server: Subprocess;
 
 beforeAll(async () => {
+  // Sweep any orphaned daemon sessions from prior runs
+  await sweepDaemonSessions();
+
   // Obliterate anything from a prior run
   await nuke();
 
@@ -205,6 +228,9 @@ beforeAll(async () => {
 }, 30_000);
 
 afterAll(async () => {
+  // Sweep any sessions that leaked during tests
+  await sweepDaemonSessions();
+
   const pid = server?.pid;
   // Nuke by PID (children + parent), by name pattern, and by port
   await nuke(pid);
@@ -463,41 +489,92 @@ describe("e2e-serve: abort recovery", () => {
   }, TIMEOUT);
 });
 
-describe("e2e-serve: provider migration", () => {
-  // Skipped: historyContext injection disabled — was doubling context tokens.
-  // Cross-provider session migration (#7) needs a different approach.
-  test.skip("switching from non-clwnd to clwnd model retains session context", async () => {
+describe("e2e-serve: provider migration (#7)", () => {
+  test("cold start: switching from free model to clwnd retains session context", async () => {
     skipIfDead();
     const sid = await createSession();
 
-    // Simulate pre-clwnd usage: send message with a free OC model (not clwnd)
+    // Turn 1: free OC model (not clwnd) — establishes context
     const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
     await sendMessage(sid, "My project codename is MOONSHOT. Remember this.", undefined, TIMEOUT, freeModel);
 
-    // User switches to clwnd model — this is the migration moment
+    // Turn 2: switch to clwnd — cold start, should seed history from OC prompt
     const resp = await sendMessage(sid, "What is my project codename?");
     const text = extractResponseText(resp).toLowerCase();
     expect(text).toContain("moonshot");
   }, TIMEOUT);
-});
 
-describe("e2e-serve: model switch history", () => {
-  // Skipped: historyContext injection disabled — was doubling context tokens.
-  test.skip("switching clwnd → free → clwnd retains context from free model turn", async () => {
+  test("cold start: multi-turn free model history is preserved", async () => {
     skipIfDead();
     const sid = await createSession();
     const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
 
-    // Turn 1: clwnd model establishes context
+    // Multiple turns with free model
+    await sendMessage(sid, "My dog's name is BISCUIT. Acknowledge.", undefined, TIMEOUT, freeModel);
+    await sendMessage(sid, "My cat's name is MARBLE. Acknowledge.", undefined, TIMEOUT, freeModel);
+
+    // Switch to clwnd — should know both names
+    const resp = await sendMessage(sid, "What are my pets' names?");
+    const text = extractResponseText(resp).toLowerCase();
+    expect(text).toContain("biscuit");
+    expect(text).toContain("marble");
+  }, TIMEOUT);
+
+  test("cold start seeding does not double tokens on subsequent turns", async () => {
+    skipIfDead();
+    const sid = await createSession();
+    const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
+
+    // Establish context with free model
+    await sendMessage(sid, "Remember: ALPHA BETA GAMMA.", undefined, TIMEOUT, freeModel);
+
+    // Turn 1 on clwnd — seeds history
+    const r1 = await sendMessage(sid, "Say ok.");
+    const t1 = r1.info?.tokens?.input ?? 0;
+
+    // Turn 2 on clwnd — should NOT re-seed
+    const r2 = await sendMessage(sid, "Say bye.");
+    const t2 = r2.info?.tokens?.input ?? 0;
+
+    // Turn 2 should not massively exceed turn 1 (no re-seeding)
+    expect(t2).toBeLessThan(t1 * 2);
+  }, TIMEOUT);
+});
+
+describe("e2e-serve: model switch history (#7)", () => {
+  test("gap fill: clwnd → free → clwnd retains context from free model turn", async () => {
+    skipIfDead();
+    const sid = await createSession();
+    const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
+
+    // Turn 1: clwnd establishes context
     await sendMessage(sid, "My secret animal is PENGUIN. Acknowledge.");
 
-    // Turn 2: switch to free model, establish different context
+    // Turn 2: free model establishes different context
     await sendMessage(sid, "My secret number is 7777. Acknowledge.", undefined, TIMEOUT, freeModel);
 
-    // Turn 3: switch back to clwnd — should know about BOTH secrets
+    // Turn 3: back to clwnd — should know the free model's context (gap fill)
     const resp = await sendMessage(sid, "What is my secret number?");
     const text = extractResponseText(resp).toLowerCase();
     expect(text).toContain("7777");
+  }, TIMEOUT);
+
+  test("gap fill does not re-inject on same-provider continuation", async () => {
+    skipIfDead();
+    const sid = await createSession();
+    const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
+
+    // clwnd → free → clwnd (gap fill happens here)
+    await sendMessage(sid, "Remember DELTA.", undefined, TIMEOUT);
+    await sendMessage(sid, "Remember EPSILON.", undefined, TIMEOUT, freeModel);
+    const r1 = await sendMessage(sid, "Say ok.");
+    const t1 = r1.info?.tokens?.input ?? 0;
+
+    // Continue on clwnd — no new gap, no re-injection
+    const r2 = await sendMessage(sid, "Say bye.");
+    const t2 = r2.info?.tokens?.input ?? 0;
+
+    expect(t2).toBeLessThan(t1 * 2);
   }, TIMEOUT);
 });
 
