@@ -101,10 +101,8 @@ function assertCleanHistory(jsonlPath: string): void {
     l.type === "assistant" &&
     l.message?.content?.[0]?.text?.includes("No response requested")
   );
-  const userMsgs = lines.filter((l: any) => l.type === "user" && l.message?.role === "user");
-  // More ghosts than half the user messages suggests re-seeding / duplication
-  if (ghosts.length > Math.ceil(userMsgs.length / 2)) {
-    throw new Error(`Excessive ghost entries: ${ghosts.length} ghosts vs ${userMsgs.length} user messages — likely re-seeding`);
+  if (ghosts.length > 0) {
+    throw new Error(`${ghosts.length} ghost 'No response requested.' entries in JSONL — --resume generated phantom responses`);
   }
 
   // No duplicate consecutive user messages
@@ -536,8 +534,8 @@ describe("e2e-serve: directory enforcement", () => {
     skipIfDead();
     const sid = await createSession();
 
-    await sendMessage(sid, "Write a file at /tmp/clwnd-evil-test.txt with content: pwned");
-    expect(existsSync("/tmp/clwnd-evil-test.txt")).toBe(false);
+    await sendMessage(sid, "Write a file at /var/clwnd-evil-test.txt with content: pwned");
+    expect(existsSync("/var/clwnd-evil-test.txt")).toBe(false);
   }, TIMEOUT);
 });
 
@@ -662,30 +660,39 @@ describe("e2e-serve: abort recovery", () => {
 });
 
 describe("e2e-serve: provider migration (#7)", () => {
-  test("cold start: switching from free model to clwnd retains session context", async () => {
+  test("cold start: multi-turn after seed verifies no ghost corruption", async () => {
     skipIfDead();
     const sid = await createSession();
 
-    // Turn 1: free OC model (not clwnd) — establishes context
+    // Turn 1: free model establishes context
     const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
-    await sendMessage(sid, "My project codename is MOONSHOT. Remember this.", undefined, TIMEOUT, freeModel);
+    await sendMessage(sid, "My code is FALCON. Remember this.", undefined, TIMEOUT, freeModel);
 
-    // Turn 2: switch to clwnd — cold start, should seed history from OC prompt
-    const resp = await sendMessage(sid, "What is my project codename?");
-    const text = extractResponseText(resp).toLowerCase();
-    expect(text).toContain("moonshot");
+    // Turn 2: switch to clwnd — cold start seed. Recalls the fact?
+    const r2 = await sendMessage(sid, "What is my code?");
+    expect(extractResponseText(r2).toLowerCase()).toContain("falcon");
 
-    // JSONL parity: seeded entries should be accepted without ghosts
+    // Turn 3: does Claude remember its OWN last reply, or the ghost?
+    const r3 = await sendMessage(sid, "What was your last reply to me? Quote it briefly.");
+    const t3 = extractResponseText(r3).toLowerCase();
+    expect(t3).toContain("falcon");
+    expect(t3).not.toContain("no response requested");
+
+    // Turn 4: fresh instruction
+    const r4 = await sendMessage(sid, "Say the word EAGLE and nothing else.");
+    expect(extractResponseText(r4).toLowerCase()).toContain("eagle");
+
+    // Turn 5: recall the instruction response
+    const r5 = await sendMessage(sid, "What word did I just ask you to say?");
+    expect(extractResponseText(r5).toLowerCase()).toContain("eagle");
+
+    // JSONL parity: zero ghosts
     const state = await getSessionState(sid);
     if (state?.claudeSessionPath && existsSync(state.claudeSessionPath)) {
       const lines = readFileSync(state.claudeSessionPath, "utf-8").trim().split("\n")
         .filter(Boolean).map((l: string) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
       const ghosts = lines.filter((l: any) => l.message?.content?.[0]?.text?.includes("No response requested"));
-      // --resume may produce 1 ghost on startup; flag if more than that
-      expect(ghosts.length).toBeLessThanOrEqual(1);
-      // Seeded assistant entries should have stop_reason
-      const assistants = lines.filter((l: any) => l.type === "assistant" && l.message?.stop_reason);
-      expect(assistants.length).toBeGreaterThan(0);
+      expect(ghosts.length).toBe(0);
     }
   }, TIMEOUT);
 
@@ -710,8 +717,7 @@ describe("e2e-serve: provider migration (#7)", () => {
       const lines = readFileSync(state.claudeSessionPath, "utf-8").trim().split("\n")
         .filter(Boolean).map((l: string) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
       const ghosts = lines.filter((l: any) => l.message?.content?.[0]?.text?.includes("No response requested"));
-      // --resume may produce 1 ghost on startup; flag if more than that
-      expect(ghosts.length).toBeLessThanOrEqual(1);
+      expect(ghosts.length).toBe(0);
       // No empty assistant messages (tool content should be exported)
       const emptyAssistants = lines.filter((l: any) =>
         l.type === "assistant" && l.message?.role === "assistant" &&
