@@ -674,6 +674,19 @@ describe("e2e-serve: provider migration (#7)", () => {
     const resp = await sendMessage(sid, "What is my project codename?");
     const text = extractResponseText(resp).toLowerCase();
     expect(text).toContain("moonshot");
+
+    // JSONL parity: seeded entries should be accepted without ghosts
+    const state = await getSessionState(sid);
+    if (state?.claudeSessionPath && existsSync(state.claudeSessionPath)) {
+      const lines = readFileSync(state.claudeSessionPath, "utf-8").trim().split("\n")
+        .filter(Boolean).map((l: string) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      const ghosts = lines.filter((l: any) => l.message?.content?.[0]?.text?.includes("No response requested"));
+      // --resume may produce 1 ghost on startup; flag if more than that
+      expect(ghosts.length).toBeLessThanOrEqual(1);
+      // Seeded assistant entries should have stop_reason
+      const assistants = lines.filter((l: any) => l.type === "assistant" && l.message?.stop_reason);
+      expect(assistants.length).toBeGreaterThan(0);
+    }
   }, TIMEOUT);
 
   test("cold start: multi-turn free model history is preserved", async () => {
@@ -690,6 +703,23 @@ describe("e2e-serve: provider migration (#7)", () => {
     const text = extractResponseText(resp).toLowerCase();
     expect(text).toContain("biscuit");
     expect(text).toContain("marble");
+
+    // JSONL parity: no ghosts, no empty assistant entries
+    const state = await getSessionState(sid);
+    if (state?.claudeSessionPath && existsSync(state.claudeSessionPath)) {
+      const lines = readFileSync(state.claudeSessionPath, "utf-8").trim().split("\n")
+        .filter(Boolean).map((l: string) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      const ghosts = lines.filter((l: any) => l.message?.content?.[0]?.text?.includes("No response requested"));
+      // --resume may produce 1 ghost on startup; flag if more than that
+      expect(ghosts.length).toBeLessThanOrEqual(1);
+      // No empty assistant messages (tool content should be exported)
+      const emptyAssistants = lines.filter((l: any) =>
+        l.type === "assistant" && l.message?.role === "assistant" &&
+        Array.isArray(l.message?.content) &&
+        l.message.content.every((c: any) => !c.text && !c.thinking && c.type !== "tool_use")
+      );
+      expect(emptyAssistants.length).toBe(0);
+    }
   }, TIMEOUT);
 
   test("cold start seeding does not double tokens on subsequent turns", async () => {
@@ -710,6 +740,12 @@ describe("e2e-serve: provider migration (#7)", () => {
 
     // Turn 2 should not massively exceed turn 1 (no re-seeding)
     expect(t2).toBeLessThan(t1 * 2);
+
+    // JSONL parity: no duplicate user messages from re-seeding
+    const state = await getSessionState(sid);
+    if (state?.claudeSessionPath && existsSync(state.claudeSessionPath)) {
+      assertCleanHistory(state.claudeSessionPath);
+    }
   }, TIMEOUT);
 });
 

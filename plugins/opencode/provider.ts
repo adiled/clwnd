@@ -1,4 +1,6 @@
 import { generateId } from "@ai-sdk/provider-utils";
+import { randomUUID } from "crypto";
+import * as session from "../../lib/session.ts";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 // Three destinations: plugin log file (always), hum → daemon (when connected), OC debug (when client ready).
@@ -392,7 +394,8 @@ function countHistoryTurns(prompt: LanguageModelV2Prompt): number {
   return turns;
 }
 
-// Path A: Extract full history for JSONL export (cold start)
+// Path A: Extract history EXCLUDING current user message for JSONL export.
+// The current message arrives via stdin (murmur). Seed provides context only.
 function extractHistoryForExport(prompt: LanguageModelV2Prompt): Array<{ role: string; content: unknown }> | null {
   let lastUserIdx = -1;
   for (let i = prompt.length - 1; i >= 0; i--) {
@@ -402,24 +405,24 @@ function extractHistoryForExport(prompt: LanguageModelV2Prompt): Array<{ role: s
   return history.length > 0 ? history.map(m => ({ role: m.role, content: m.content })) : null;
 }
 
-// Path B: Extract gap turns for JSONL export (same as Path A but only the missing turns)
+// Path B: Extract gap turns EXCLUDING current user message for JSONL export.
 function extractGapForExport(prompt: LanguageModelV2Prompt, after: number): Array<{ role: string; content: unknown }> | null {
   let lastUserIdx = -1;
   for (let i = prompt.length - 1; i >= 0; i--) {
     if (prompt[i].role === "user") { lastUserIdx = i; break; }
   }
+  const allHistory = prompt.slice(0, lastUserIdx).filter(m => m.role !== "system");
   // Count user turns to find the gap start point
-  const history = prompt.slice(0, lastUserIdx).filter(m => m.role !== "system");
   let userCount = 0;
   let gapStart = 0;
-  for (let i = 0; i < history.length; i++) {
-    if (history[i].role === "user") {
+  for (let i = 0; i < allHistory.length; i++) {
+    if (allHistory[i].role === "user") {
       userCount++;
       if (userCount > after) { gapStart = i; break; }
     }
   }
   if (userCount <= after) return null;
-  const gap = history.slice(gapStart);
+  const gap = allHistory.slice(gapStart);
   return gap.length > 0 ? gap.map(m => ({ role: m.role, content: m.content })) : null;
 }
 
@@ -663,29 +666,33 @@ export class ClwndModel implements LanguageModelV2 {
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
-    // History seeding (#7) — both paths write to JSONL via daemon
+    // History seeding (#7) — plugin writes JSONL directly, signals daemon
     const historyTurns = countHistoryTurns(opts.prompt);
-    const sent = turnsSent.get(sid) ?? -1; // -1 = never seen this session
-    let history: Array<{ role: string; content: unknown }> | undefined;
+    const sent = turnsSent.get(sid) ?? -1;
+    let seedClaudeId: string | undefined;
+    let seedClaudePath: string | undefined;
 
     if (!isAuxiliaryCall(opts) && !isBrokeredToolReturn(opts.prompt)) {
+      let seedHistory: Array<{ role: string; content: unknown }> | null = null;
+
       if (sent === -1 && historyTurns > 0) {
-        // Path A: Cold start — full history
-        history = extractHistoryForExport(opts.prompt) ?? undefined;
-        if (history) {
-          // Send seed immediately via hum — before ReadableStream starts, before OC can reload
-          hum({ chi: "seed", sid, history, cwd });
-          trace("seed.export", { sid, turns: historyTurns });
-        }
+        seedHistory = extractHistoryForExport(opts.prompt);
+        if (seedHistory) trace("seed.export", { sid, turns: historyTurns });
       } else if (sent >= 0 && historyTurns > sent) {
-        // Path B: Gap fill — send seed immediately too
-        const gapHistory = extractGapForExport(opts.prompt, sent);
-        if (gapHistory) {
-          hum({ chi: "seed", sid, history: gapHistory, cwd });
-          history = gapHistory;
-          trace("seed.gap", { sid, from: sent, to: historyTurns });
-        }
+        seedHistory = extractGapForExport(opts.prompt, sent);
+        if (seedHistory) trace("seed.gap", { sid, from: sent, to: historyTurns });
       }
+
+      if (seedHistory) {
+        // Write JSONL directly — synchronous, survives plugin reload
+        seedClaudeId = randomUUID();
+        seedClaudePath = session.createSession(cwd, seedClaudeId);
+        session.fromPrompt(seedClaudePath, seedClaudeId, seedHistory, cwd);
+        log("seed.written", { sid, claudeId: seedClaudeId, path: seedClaudePath, turns: seedHistory.length });
+        // Lightweight signal to daemon — even if lost, prompt carries the info
+        hum({ chi: "seeded", sid, claudeSessionId: seedClaudeId, claudeSessionPath: seedClaudePath, cwd });
+      }
+
       // +1 because the current turn (being sent now) will be history on the next call
       turnsSent.set(sid, historyTurns + 1);
     }
@@ -739,6 +746,8 @@ export class ClwndModel implements LanguageModelV2 {
         modelId: self.modelId,
         content, text, systemPrompt,
         permissions, allowedTools, listenOnly,
+        // Carry seed info in prompt — daemon uses this even if chi:"seeded" was lost
+        ...(seedClaudeId ? { seedClaudeId, seedClaudePath } : {}),
       });
       promptSent = true;
     }
