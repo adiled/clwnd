@@ -481,7 +481,7 @@ const sessions = loadSessions();
 
 // ─── Session (Claude CLI JSONL) ─────────────────────────────────────────────
 
-import { createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, lastUuid as getLastEntryUuid, fromPrompt as exportToJsonl } from "../lib/session.ts";
+import { sessionDir as getSessionDir, sessionPath as getSessionPath } from "../lib/session.ts";
 
 // ─── HTTP Server ─────────────────────────────────────────────────────────────
 
@@ -495,91 +495,6 @@ function defaultSocketPath(): string {
   return "/tmp/clwnd.sock";
 }
 
-// ─── History Export ──────────────────────────────────────────────────────────
-// Write OC conversation history to Claude CLI's JSONL format for cold-start seeding.
-// Entries must match Claude CLI's exact structure for --resume to accept them.
-
-function exportToJsonl(sessionPath: string, sessionId: string, history: Array<{ role: string; content: unknown }>): void {
-  let parentUuid: string | null = getLastEntryUuid(sessionPath);
-  const cwd = process.env.CLWND_CWD ?? process.env.HOME ?? "/";
-
-  for (const msg of history) {
-    const contentArr = msg.content;
-
-    if (msg.role === "user") {
-      // Build content array — text parts + tool results
-      const content: Array<Record<string, unknown>> = [];
-      if (typeof contentArr === "string") {
-        content.push({ type: "text", text: contentArr });
-      } else if (Array.isArray(contentArr)) {
-        for (const p of contentArr as Array<Record<string, unknown>>) {
-          if (p.type === "text" && p.text) {
-            content.push({ type: "text", text: p.text });
-          }
-        }
-      }
-      if (content.length === 0) continue;
-      parentUuid = appendToJsonl(sessionPath, {
-        type: "user", parentUuid, sessionId, isSidechain: false,
-        promptId: randomUUID(),
-        message: { role: "user", content },
-        permissionMode: "default",
-        userType: "external", entrypoint: "sdk-cli", cwd,
-      });
-
-    } else if (msg.role === "assistant") {
-      // Build content array — text + tool_use blocks
-      const content: Array<Record<string, unknown>> = [];
-      if (typeof contentArr === "string") {
-        if (contentArr) content.push({ type: "text", text: contentArr });
-      } else if (Array.isArray(contentArr)) {
-        for (const p of contentArr as Array<Record<string, unknown>>) {
-          if (p.type === "text" && p.text) {
-            content.push({ type: "text", text: p.text });
-          } else if (p.type === "tool-call" && p.toolCallId && p.toolName) {
-            // Convert AI SDK tool-call to Anthropic tool_use
-            let input: unknown = {};
-            try { input = typeof p.input === "string" ? JSON.parse(p.input as string) : p.input; } catch {}
-            content.push({ type: "tool_use", id: p.toolCallId, name: p.toolName, input });
-          } else if (p.type === "reasoning" && p.text) {
-            content.push({ type: "thinking", thinking: p.text });
-          }
-        }
-      }
-      if (content.length === 0) content.push({ type: "text", text: "(no text response)" });
-      parentUuid = appendToJsonl(sessionPath, {
-        type: "assistant", parentUuid, sessionId, isSidechain: false,
-        requestId: `req_seed_${randomUUID().slice(0, 12)}`,
-        message: {
-          model: "seeded", id: `msg_seed_${randomUUID().slice(0, 12)}`,
-          type: "message", role: "assistant", content,
-          stop_reason: "end_turn", stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
-        },
-        userType: "external", entrypoint: "sdk-cli", cwd,
-      });
-
-    } else if (msg.role === "tool") {
-      // Tool results as user messages with tool_result content
-      const content: Array<Record<string, unknown>> = [];
-      if (Array.isArray(contentArr)) {
-        for (const p of contentArr as Array<Record<string, unknown>>) {
-          if (p.type === "tool-result" && p.toolCallId) {
-            const result = typeof p.result === "string" ? p.result : JSON.stringify(p.result ?? "");
-            content.push({ type: "tool_result", tool_use_id: p.toolCallId, content: result });
-          }
-        }
-      }
-      if (content.length === 0) continue;
-      parentUuid = appendToJsonl(sessionPath, {
-        type: "user", parentUuid, sessionId, isSidechain: false,
-        promptId: randomUUID(),
-        message: { role: "user", content },
-        userType: "external", entrypoint: "sdk-cli", cwd,
-      });
-    }
-  }
-}
 
 const SOCK = process.env.CLWND_SOCKET ?? defaultSocketPath();
 const HTTP = SOCK + ".http";
