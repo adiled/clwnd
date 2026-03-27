@@ -150,18 +150,18 @@ function consolidate(history: Array<{ role: string; content: unknown }>): Array<
     }
     if (!text) continue;
 
-    if (msg.role === "user") userParts.push(`User: ${text}`);
-    else if (msg.role === "assistant") assistantParts.push(`Assistant: ${text}`);
-    else if (msg.role === "tool") userParts.push(text); // tool results are user-side
+    if (msg.role === "user") userParts.push(text);
+    else if (msg.role === "assistant") assistantParts.push(text);
+    else if (msg.role === "tool") userParts.push(text);
   }
 
-  if (userParts.length === 0) return history; // nothing to consolidate
+  if (userParts.length === 0) return history;
 
   return [
-    { role: "user", content: `Previous conversation:\n\n${userParts.join("\n\n")}` },
+    { role: "user", content: userParts.join("\n\n") },
     { role: "assistant", content: assistantParts.length > 0
-      ? `Previous conversation summary:\n\n${assistantParts.join("\n\n")}`
-      : "I understand the previous context." },
+      ? assistantParts.join("\n\n")
+      : "Understood." },
   ];
 }
 

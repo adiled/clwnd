@@ -696,6 +696,35 @@ describe("e2e-serve: provider migration (#7)", () => {
     }
   }, TIMEOUT);
 
+  test("cold start: multi-turn after seed (opus) verifies no ghost corruption", async () => {
+    skipIfDead();
+    const sid = await createSession();
+    const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
+    const opusModel = { providerID: "opencode-clwnd", modelID: "claude-opus-4-6" };
+
+    await sendMessage(sid, "My code is TIGER. Remember this.", undefined, TIMEOUT, freeModel);
+
+    const r2 = await sendMessage(sid, "What is my code?", undefined, TIMEOUT, opusModel);
+    expect(extractResponseText(r2).toLowerCase()).toContain("tiger");
+
+    const r3 = await sendMessage(sid, "What was your last reply to me? Quote it briefly.", undefined, TIMEOUT, opusModel);
+    const t3 = extractResponseText(r3).toLowerCase();
+    expect(t3).toContain("tiger");
+    expect(t3).not.toContain("no response requested");
+
+    const r4 = await sendMessage(sid, "Say the word HAWK and nothing else.", undefined, TIMEOUT, opusModel);
+    expect(extractResponseText(r4).toLowerCase()).toContain("hawk");
+
+    // JSONL parity: zero ghosts
+    const state = await getSessionState(sid);
+    if (state?.claudeSessionPath && existsSync(state.claudeSessionPath)) {
+      const lines = readFileSync(state.claudeSessionPath, "utf-8").trim().split("\n")
+        .filter(Boolean).map((l: string) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      const ghosts = lines.filter((l: any) => l.message?.content?.[0]?.text?.includes("No response requested"));
+      expect(ghosts.length).toBe(0);
+    }
+  }, TIMEOUT);
+
   test("cold start: multi-turn free model history is preserved", async () => {
     skipIfDead();
     const sid = await createSession();
