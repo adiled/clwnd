@@ -124,15 +124,58 @@ export function readEntries(path: string): Entry[] {
 // Converts OC's LanguageModelV2Prompt messages into Claude CLI JSONL entries.
 // Entries match Claude CLI's exact structure for --resume to accept them.
 
+// Consolidate multi-turn history into a single user+assistant pair.
+// Claude CLI's --resume generates ghost entries for multi-pair JSOSNLs.
+// A single pair avoids this while preserving all conversation context.
+function consolidate(history: Array<{ role: string; content: unknown }>): Array<{ role: string; content: unknown }> {
+  const userParts: string[] = [];
+  const assistantParts: string[] = [];
+
+  for (const msg of history) {
+    const contentArr = msg.content;
+    let text = "";
+    if (typeof contentArr === "string") {
+      text = contentArr;
+    } else if (Array.isArray(contentArr)) {
+      const texts: string[] = [];
+      for (const p of contentArr as Array<Record<string, unknown>>) {
+        if (p.type === "text" && p.text) texts.push(p.text as string);
+        else if (p.type === "tool-call" && p.toolName) texts.push(`[Used tool: ${p.toolName}]`);
+        else if (p.type === "tool-result" && p.result) {
+          const r = typeof p.result === "string" ? p.result : JSON.stringify(p.result);
+          texts.push(`[Tool result: ${r.slice(0, 200)}]`);
+        }
+      }
+      text = texts.join("\n");
+    }
+    if (!text) continue;
+
+    if (msg.role === "user") userParts.push(`User: ${text}`);
+    else if (msg.role === "assistant") assistantParts.push(`Assistant: ${text}`);
+    else if (msg.role === "tool") userParts.push(text); // tool results are user-side
+  }
+
+  if (userParts.length === 0) return history; // nothing to consolidate
+
+  return [
+    { role: "user", content: `Previous conversation:\n\n${userParts.join("\n\n")}` },
+    { role: "assistant", content: assistantParts.length > 0
+      ? `Previous conversation summary:\n\n${assistantParts.join("\n\n")}`
+      : "I understand the previous context." },
+  ];
+}
+
 export function fromPrompt(
   sessionPath: string,
   sessionId: string,
   history: Array<{ role: string; content: unknown }>,
   cwd: string,
 ): void {
+  // Consolidate to single pair — avoids --resume ghost entries
+  const consolidated = consolidate(history);
   let parentUuid: string | null = lastUuid(sessionPath);
 
-  for (const msg of history) {
+  for (const msg of consolidated) {
     const contentArr = msg.content;
 
     if (msg.role === "user") {

@@ -677,7 +677,9 @@ export class ClwndModel implements LanguageModelV2 {
 
       if (sent === -1 && historyTurns > 0) {
         seedHistory = extractHistoryForExport(opts.prompt);
-        if (seedHistory) trace("seed.export", { sid, turns: historyTurns });
+        if (seedHistory) {
+          trace("seed.export", { sid, turns: historyTurns, promptLen: opts.prompt.length, roles: opts.prompt.map(m => m.role).join(","), seedLen: seedHistory.length });
+        }
       } else if (sent >= 0 && historyTurns > sent) {
         seedHistory = extractGapForExport(opts.prompt, sent);
         if (seedHistory) trace("seed.gap", { sid, from: sent, to: historyTurns });
