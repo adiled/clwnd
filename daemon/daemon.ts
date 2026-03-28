@@ -149,6 +149,7 @@ class ClaudeNest {
 
     const cmd = [
       this.cliPath, "-p",
+      "--bare",
       "--verbose",
       "--input-format", "stream-json",
       "--output-format", "stream-json",
