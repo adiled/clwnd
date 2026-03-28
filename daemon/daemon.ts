@@ -5,6 +5,7 @@ import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
 import { trace, info } from "../log.ts";
+import { loadConfig } from "../lib/config.ts";
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
 
@@ -47,9 +48,10 @@ interface Roost {
   activeSid: string | null;
 }
 
-const MAX_PROCS = parseInt(process.env.CLWND_MAX_PROCS ?? "4", 10);
-const IDLE_TIMEOUT = parseInt(process.env.CLWND_IDLE_TIMEOUT ?? "30000", 10); // ms
-const OC_COMPACTION = process.env.CLWND_OC_COMPACTION === "1";
+const cfg = loadConfig();
+const MAX_PROCS = cfg.maxProcs;
+const IDLE_TIMEOUT = cfg.idleTimeout;
+const OC_COMPACTION = cfg.ocCompaction;
 
 class ClaudeNest {
   private roosts = new Map<string, Roost>();

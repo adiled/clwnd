@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { createClwnd, setSharedClient, setLogClient, hum, trace, log, resetTurnsSent } from "./provider.ts";
+import { loadConfig } from "../../lib/config.ts";
 
 // ─── Small Model Discovery ──────────────────────────────────────────────────
 // Provider config lives in opencode.json (managed by install script).
@@ -66,9 +67,9 @@ export const clwndPlugin: Plugin = async (input) => {
       clwnd: provider,
     },
     event: async ({ event }) => {
-      // OC-handled compaction: opt-in via CLWND_OC_COMPACTION=1
+      // OC-handled compaction: opt-in via clwnd.json { "ocCompaction": true }
       // When off (default), Claude CLI handles its own context management.
-      if (process.env.CLWND_OC_COMPACTION === "1" && event.type === "session.compacted") {
+      if (loadConfig().ocCompaction && event.type === "session.compacted") {
         const sid = (event as any).properties?.sessionID;
         if (sid) {
           // Deduplicate — multiple plugin instances receive the same event
