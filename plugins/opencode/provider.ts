@@ -2,7 +2,7 @@ import { generateId } from "@ai-sdk/provider-utils";
 import { randomUUID } from "crypto";
 import * as session from "../../lib/session.ts";
 import { loadConfig } from "../../lib/config.ts";
-import { WaneTracker, duskIn } from "../../lib/hum.ts";
+import { sigil as makeSigil, WaneTracker, Drone, duskIn, type DroneAction } from "../../lib/hum.ts";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 // Three destinations: plugin log file (always), hum → daemon (when connected), OC debug (when client ready).
@@ -187,6 +187,8 @@ async function awakenHum(): Promise<void> {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line) as Record<string, unknown>;
+          // Drone observes all incoming tones
+          pluginDrone.heard(msg);
           // Echo: daemon acknowledges receipt of our tone
           if (msg.chi === "echo") {
             trace("hum.echo", { rid: msg.rid, ok: msg.ok });
@@ -214,10 +216,15 @@ async function awakenHum(): Promise<void> {
             const kind = msg.kind as string;
             const sid = msg.sid as string;
             trace("hum.pulse", { kind, sid });
-            if (kind === "roost-died" || kind === "roost-idle" || kind === "roost-evicted") {
-              // Process gone — clear any pending state for this session
-              // turnsSent preserved (restored via breath on reconnect)
-            }
+            continue;
+          }
+          // Drone retrofit: daemon swallowed a bad response, process killed + needsRespawn set.
+          // Next doStream call will re-seed and respawn automatically.
+          if (msg.chi === "drone-retrofit") {
+            const sid = msg.sid as string;
+            trace("drone.retrofit", { sid, reason: msg.reason });
+            // Reset turnsSent so next call does full re-seed from current prompt
+            turnsSent.delete(sid);
             continue;
           }
           if (humHearer) humHearer(msg);
@@ -261,6 +268,7 @@ export function hum(msg: Record<string, unknown>): void {
     const data = JSON.stringify(msg) + "\n";
     writeLog("trace", "hum.send", { chi: msg.chi as string, rid: msg.rid as string, len: data.length });
     humSocket.write(data);
+    pluginDrone.sent(msg);
   } catch (e) {
     writeLog("trace", "hum.send.failed", { err: String(e) });
   }
@@ -468,6 +476,33 @@ function extractText(prompt: LanguageModelV2Prompt, sessionId?: string): string 
 
 const turnsSent = new Map<string, number>();
 const localWane = new WaneTracker();
+
+// Plugin drone — observes hum I/O from the plugin side
+const pluginDrone = new Drone("plugin", (action: DroneAction) => {
+  switch (action.type) {
+    case "beat":
+      // Send drone beat to daemon
+      if (humSocket && humAlive) {
+        try { humSocket.write(JSON.stringify(action.beat) + "\n"); } catch {}
+      }
+      break;
+    case "retry":
+      trace("drone.retry", { rid: action.rid, chi: action.chi });
+      break;
+    case "lost":
+      trace("drone.lost", { rid: action.rid, chi: action.chi });
+      break;
+    case "drift":
+      trace("drone.drift", { local: action.local, remote: action.remote });
+      break;
+    case "dead":
+      trace("drone.dead", { missedBeats: action.missedBeats });
+      break;
+    case "swallow":
+      trace("drone.swallow", { reason: action.reason });
+      break;
+  }
+});
 
 /** Reset turn counter after compaction — forces full re-seed on next message */
 export function resetTurnsSent(sid: string): void {
@@ -802,6 +837,9 @@ export class ClwndModel implements LanguageModelV2 {
 
       // +1 because the current turn (being sent now) will be history on the next call
       turnsSent.set(sid, historyTurns + 1);
+      const s = makeSigil(sid);
+      localWane.tick(s);
+      pluginDrone.setWane(s, localWane.get(s));
     }
 
     // Brokered tool return — OpenCode executed the tool, sending result back.

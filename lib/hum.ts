@@ -364,13 +364,17 @@ export class Drone {
     this.resetSilence(s);
   }
 
+  // Tones that expect echo — everything else is fire-and-forget
+  private static TRACKED_CHI = new Set(["prompt", "seeded", "cancel", "release-permit"]);
+
   /** Wired into hum send path — observes outgoing tones (zero work, just track) */
   sent(tone: Record<string, unknown>): void {
     if (tone.chi === "drone" || tone.chi === "echo") return;
     const s = tone.sigil as string;
     if (!s) return;
     const state = this.getOrCreate(s);
-    if (tone.rid) {
+    // Only track tones that expect echo — one-way tones (chunks, pulse, finish) don't
+    if (tone.rid && Drone.TRACKED_CHI.has(tone.chi as string)) {
       state.pendingEchoes.set(tone.rid as string, {
         rid: tone.rid as string, chi: tone.chi as string, time: Date.now(), retries: 0,
       });
