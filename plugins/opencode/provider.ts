@@ -2,6 +2,7 @@ import { generateId } from "@ai-sdk/provider-utils";
 import { randomUUID } from "crypto";
 import { readFileSync } from "fs";
 import * as session from "../../lib/session.ts";
+import { loadConfig } from "../../lib/config.ts";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 // Three destinations: plugin log file (always), hum → daemon (when connected), OC debug (when client ready).
@@ -561,8 +562,8 @@ export class ClwndModel implements LanguageModelV2 {
     response: { id: string; timestamp: Date; modelId: string };
     providerMetadata: Record<string, unknown>;
   }> {
-    // Auxiliary call (title gen, compaction) — reject gracefully, see isAuxiliaryCall TSDoc
-    if (isAuxiliaryCall(opts)) {
+    // Auxiliary call (title gen, compaction) — reject gracefully unless ocCompaction is on
+    if (isAuxiliaryCall(opts) && !loadConfig().ocCompaction) {
       trace("auxiliary.reject", { method: "doGenerate" });
       return {
         content: [{ type: "text" as const, text: "" }],
@@ -677,8 +678,9 @@ export class ClwndModel implements LanguageModelV2 {
     rawCall: { raw: unknown; rawHeaders: unknown };
     warnings: LanguageModelV2CallWarning[];
   }> {
-    // Auxiliary call (title gen, compaction) — reject gracefully, see isAuxiliaryCall TSDoc
-    if (isAuxiliaryCall(opts)) {
+    // Auxiliary call (title gen, compaction) — reject gracefully unless ocCompaction is on.
+    // When ocCompaction is enabled, compaction calls come through us — let them proceed.
+    if (isAuxiliaryCall(opts) && !loadConfig().ocCompaction) {
       trace("auxiliary.reject", { method: "doStream" });
       const bloom = new ReadableStream<LanguageModelV2StreamPart>({
         start(controller) {
