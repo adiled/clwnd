@@ -47,8 +47,13 @@ interface Roost {
   activeSid: string | null;
 }
 
+const MAX_PROCS = parseInt(process.env.CLWND_MAX_PROCS ?? "4", 10);
+const IDLE_TIMEOUT = parseInt(process.env.CLWND_IDLE_TIMEOUT ?? "30000", 10); // ms
+const OC_COMPACTION = process.env.CLWND_OC_COMPACTION === "1";
+
 class ClaudeNest {
   private roosts = new Map<string, Roost>();
+  private idleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(private cliPath = "claude") {}
 
@@ -68,7 +73,29 @@ class ClaudeNest {
       saveSessions();
     }
 
+    // Cancel idle timer — session is active again
+    const idleTimer = this.idleTimers.get(poolKey);
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      this.idleTimers.delete(poolKey);
+    }
+
     if (!roost) {
+      // Evict oldest idle roost if at maxProcs limit
+      if (this.roosts.size >= MAX_PROCS) {
+        let evictKey: string | null = null;
+        for (const [key, r] of this.roosts) {
+          if (r.listeners.size === 0 && r.activeSid === null) { evictKey = key; break; }
+        }
+        if (evictKey) {
+          trace("nest.evicted", { poolKey: evictKey, reason: "maxProcs" });
+          try { this.roosts.get(evictKey)!.proc.kill(); } catch {}
+          this.roosts.delete(evictKey);
+          this.idleTimers.delete(evictKey);
+        } else {
+          trace("nest.rejected", { poolKey, reason: "maxProcs", active: this.roosts.size });
+        }
+      }
       roost = this.spawnProc(poolKey, modelId, claudeSessionId ?? session?.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, sessionCwd);
     } else {
       mcpSetPerms((permissions ?? []) as any);
@@ -101,6 +128,19 @@ class ClaudeNest {
       roost.listeners.delete(sessionId);
       if (roost.activeSid === sessionId) roost.activeSid = null;
       trace("nest.hushed", { sid: sessionId, poolKey });
+
+      // Start idle timer — kill process if no new messages within timeout
+      if (IDLE_TIMEOUT > 0 && roost.listeners.size === 0) {
+        this.idleTimers.set(poolKey, setTimeout(() => {
+          const r = this.roosts.get(poolKey);
+          if (r && r.listeners.size === 0) {
+            trace("nest.idle", { poolKey, pid: r.proc.pid, timeout: IDLE_TIMEOUT });
+            try { r.proc.kill(); } catch {}
+            this.roosts.delete(poolKey);
+          }
+          this.idleTimers.delete(poolKey);
+        }, IDLE_TIMEOUT));
+      }
     }
   }
 
@@ -113,6 +153,8 @@ class ClaudeNest {
         trace("nest.felled", { poolKey, pid: roost.proc.pid });
         try { roost.proc.kill(); } catch {}
         this.roosts.delete(poolKey);
+        const timer = this.idleTimers.get(poolKey);
+        if (timer) { clearTimeout(timer); this.idleTimers.delete(poolKey); }
       }
     }
   }
@@ -132,6 +174,8 @@ class ClaudeNest {
   silence(): void {
     for (const [, roost] of this.roosts) { try { roost.proc.kill(); } catch {} }
     this.roosts.clear();
+    for (const timer of this.idleTimers.values()) clearTimeout(timer);
+    this.idleTimers.clear();
   }
 
   private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[], sessionCwd?: string): Roost {
@@ -1021,7 +1065,7 @@ process.on("SIGTERM", () => { nest.silence(); process.exit(0); });
 process.on("uncaughtException",  e => info("process.uncaught", { err: String(e) }));
 process.on("unhandledRejection", e => info("process.unhandled", { err: String(e) }));
 
-info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid, version: CURRENT_VERSION });
+info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid, version: CURRENT_VERSION, maxProcs: MAX_PROCS, idleTimeout: IDLE_TIMEOUT, ocCompaction: OC_COMPACTION });
 
 // ─── Session Reaper ─────────────────────────────────────────────────────────
 // Remove stale sessions that haven't been accessed in a while.

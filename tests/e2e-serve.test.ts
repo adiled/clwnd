@@ -1184,3 +1184,31 @@ describe("e2e-serve: cancel kills turn", () => {
     expect(text).toContain("6");
   }, TIMEOUT);
 });
+
+describe("e2e-serve: resource governance", () => {
+  test("idle process is killed after timeout and session recovers", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Send a message to spawn a Claude CLI process
+    await sendMessage(sid, "Say hello briefly.");
+
+    // Verify process exists (poolKey = session ID, shows as "model" in status)
+    const statusBefore = await (await fetch("http://localhost/status", { unix: DAEMON_SOCK } as RequestInit)).json() as any;
+    const hasProcBefore = (statusBefore.procs ?? []).some((p: any) => p.model === sid);
+    expect(hasProcBefore).toBe(true);
+
+    // Wait for idle timeout (default 30s) + buffer
+    await Bun.sleep(35_000);
+
+    // Process should be gone — killed by idle timer
+    const statusAfter = await (await fetch("http://localhost/status", { unix: DAEMON_SOCK } as RequestInit)).json() as any;
+    const hasProcAfter = (statusAfter.procs ?? []).some((p: any) => p.model === sid);
+    expect(hasProcAfter).toBe(false);
+
+    // Session should recover — next message spawns a new process
+    const resp = await sendMessage(sid, "What is 5+5? Just the number.");
+    const text = extractResponseText(resp);
+    expect(text).toContain("10");
+  }, 120_000);
+});

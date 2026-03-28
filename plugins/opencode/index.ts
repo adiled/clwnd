@@ -66,7 +66,9 @@ export const clwndPlugin: Plugin = async (input) => {
       clwnd: provider,
     },
     event: async ({ event }) => {
-      if (event.type === "session.compacted") {
+      // OC-handled compaction: opt-in via CLWND_OC_COMPACTION=1
+      // When off (default), Claude CLI handles its own context management.
+      if (process.env.CLWND_OC_COMPACTION === "1" && event.type === "session.compacted") {
         const sid = (event as any).properties?.sessionID;
         if (sid) {
           // Deduplicate — multiple plugin instances receive the same event
