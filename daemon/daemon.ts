@@ -587,9 +587,19 @@ function hum(sessionId: string, msg: Record<string, unknown>): void {
   if (!msg.sid) msg.sid = sessionId;
   msg.from = "daemon";
   trace("hum.tone.sent", { chi: msg.chi as string, sid: sessionId, rid: msg.rid as string });
+  // Route to first client that owns this sigil — no duplicates
+  let sent = false;
   for (const [, client] of humClients) {
-    if (client.sigils.has(s) || client.sigils.size === 0) {
+    if (client.sigils.has(s)) {
       humTo(client, msg);
+      sent = true;
+      break;
+    }
+  }
+  // Fallback: if no client claimed this sigil, broadcast to unregistered clients
+  if (!sent) {
+    for (const [, client] of humClients) {
+      if (client.sigils.size === 0) humTo(client, msg);
     }
   }
 }
@@ -718,9 +728,17 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
                 batch = [];
                 pending = false;
                 const s = sigil(sid);
+                let chunkSent = false;
                 for (const [, client] of humClients) {
-                  if (client.sigils.has(s) || client.sigils.size === 0) {
+                  if (client.sigils.has(s)) {
                     try { client.socket.write(line); } catch {}
+                    chunkSent = true;
+                    break;
+                  }
+                }
+                if (!chunkSent) {
+                  for (const [, client] of humClients) {
+                    if (client.sigils.size === 0) try { client.socket.write(line); } catch {}
                   }
                 }
               });
