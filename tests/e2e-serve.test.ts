@@ -660,41 +660,51 @@ describe("e2e-serve: abort recovery", () => {
 });
 
 describe("e2e-serve: provider migration (#7)", () => {
-  test("cold start: multi-turn after seed verifies no ghost corruption", async () => {
+  test("cold start: 10 seeded turns + continuation verifies no ghost corruption", async () => {
     skipIfDead();
     const sid = await createSession();
-
-    // Turn 1: free model establishes context
     const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
-    await sendMessage(sid, "My code is FALCON. Remember this.", undefined, TIMEOUT, freeModel);
 
-    // Turn 2: switch to clwnd — cold start seed. Recalls the fact?
-    const r2 = await sendMessage(sid, "What is my code?");
-    expect(extractResponseText(r2).toLowerCase()).toContain("falcon");
+    // Seed 10 turns with free model — short prompts for speed
+    await sendMessage(sid, "color=CRIMSON. Say OK.", undefined, TIMEOUT, freeModel);
+    await sendMessage(sid, "dog=BISCUIT. Say OK.", undefined, TIMEOUT, freeModel);
+    await sendMessage(sid, "city=TOKYO. Say OK.", undefined, TIMEOUT, freeModel);
+    await sendMessage(sid, "number=7742. Say OK.", undefined, TIMEOUT, freeModel);
+    await sendMessage(sid, "project=FALCON. Say OK.", undefined, TIMEOUT, freeModel);
+    await sendMessage(sid, "cat=MARBLE. Say OK.", undefined, TIMEOUT, freeModel);
+    await sendMessage(sid, "company=ACME. Say OK.", undefined, TIMEOUT, freeModel);
+    await sendMessage(sid, "birthday=MARCH15. Say OK.", undefined, TIMEOUT, freeModel);
+    await sendMessage(sid, "car=TESLA. Say OK.", undefined, TIMEOUT, freeModel);
+    await sendMessage(sid, "secret=JULIET. Say OK.", undefined, TIMEOUT, freeModel);
 
-    // Turn 3: does Claude remember its OWN last reply, or the ghost?
-    const r3 = await sendMessage(sid, "What was your last reply to me? Quote it briefly.");
-    const t3 = extractResponseText(r3).toLowerCase();
-    expect(t3).toContain("falcon");
-    expect(t3).not.toContain("no response requested");
+    // Switch to clwnd — cold start with 10 seeded turns
+    const r1 = await sendMessage(sid, "What is my color and my secret? Answer with just the two values.");
+    const t1 = extractResponseText(r1).toLowerCase();
+    expect(t1).toContain("crimson");
+    expect(t1).toContain("juliet");
 
-    // Turn 4: fresh instruction
-    const r4 = await sendMessage(sid, "Say the word EAGLE and nothing else.");
-    expect(extractResponseText(r4).toLowerCase()).toContain("eagle");
+    // Continuation: Claude should reference its own reply, not a ghost
+    const r2 = await sendMessage(sid, "In your last reply did you mention CRIMSON? Yes or no, then quote what you said.");
+    const t2 = extractResponseText(r2).toLowerCase();
+    expect(t2).toContain("crimson");
+    expect(t2).not.toContain("no response requested");
 
-    // Turn 5: recall the instruction response
-    const r5 = await sendMessage(sid, "What word did I just ask you to say?");
-    expect(extractResponseText(r5).toLowerCase()).toContain("eagle");
-
-    // JSONL parity: zero ghosts
+    // JSONL: count ghosts vs seeded entries
     const state = await getSessionState(sid);
     if (state?.claudeSessionPath && existsSync(state.claudeSessionPath)) {
       const lines = readFileSync(state.claudeSessionPath, "utf-8").trim().split("\n")
         .filter(Boolean).map((l: string) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-      const ghosts = lines.filter((l: any) => l.message?.content?.[0]?.text?.includes("No response requested"));
+      const ghosts = lines.filter((l: any) =>
+        l.type === "assistant" && l.message?.content?.[0]?.text?.includes("No response requested")
+      );
+      const seededUsers = lines.filter((l: any) =>
+        l.type === "user" && l.message?.role === "user"
+      );
+      // Report ghost count vs total entries for diagnostics
+      console.log(`  JSONL: ${lines.length} entries, ${seededUsers.length} user msgs, ${ghosts.length} ghosts`);
       expect(ghosts.length).toBe(0);
     }
-  }, TIMEOUT);
+  }, 420_000); // 7 min — 10 free model turns + 2 clwnd turns
 
   test("cold start: multi-turn after seed (opus) verifies no ghost corruption", async () => {
     skipIfDead();

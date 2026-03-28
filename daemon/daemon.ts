@@ -57,11 +57,13 @@ class ClaudeNest {
 
     // Respawn if session was seeded with new history
     const session = sessions.get(poolKey);
-    if (roost && session?.needsRespawn) {
-      trace("nest.respawn", { poolKey, reason: "seed" });
-      try { roost.proc.kill(); } catch {}
-      this.roosts.delete(poolKey);
-      roost = undefined;
+    if (session?.needsRespawn) {
+      if (roost) {
+        trace("nest.respawn", { poolKey, reason: "seed" });
+        try { roost.proc.kill(); } catch {}
+        this.roosts.delete(poolKey);
+        roost = undefined;
+      }
       session.needsRespawn = false;
       saveSessions();
     }
@@ -581,6 +583,11 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
         trace("seed.fromPrompt", { sid, claudeId: session.claudeSessionId });
       }
 
+      // Capture prompt content for deferred murmur
+      const promptContent: Array<{ type: string; text: string }> | string | null =
+        !msg.listenOnly ? (msg.content as Array<{ type: string; text: string }> | undefined) ?? (msg.text as string ?? "") : null;
+      const isResume = !!(session.claudeSessionId && session.needsRespawn);
+
       const listener: BloomListener = {
         sessionId: sid,
         onRoost(claudeSessionId, model, tools) {
@@ -592,6 +599,10 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
           }
           saveSessions();
           hum(sid, { chi: "session-ready", sid, claudeSessionId, model, tools });
+          // Murmur after Claude CLI signals ready (new sessions only — resumed sessions don't emit init)
+          if (promptContent && !isResume) {
+            nest.murmur(sid, poolKey, promptContent);
+          }
         },
         onPetal: (() => {
           let batch: string[] = [];
@@ -631,9 +642,10 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
 
       nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd);
 
-      if (!msg.listenOnly) {
-        const content = msg.content as Array<{ type: string; text: string }> | undefined;
-        nest.murmur(sid, poolKey, content ?? msg.text as string ?? "");
+      // For resumed sessions: delay murmur to let Claude CLI load JSONL first.
+      // New sessions defer murmur to onRoost (system init).
+      if (promptContent && isResume) {
+        setTimeout(() => nest.murmur(sid, poolKey, promptContent), 500);
       }
       break;
     }

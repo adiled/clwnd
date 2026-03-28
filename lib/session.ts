@@ -90,7 +90,8 @@ export function createSession(cwd: string, id: string): string {
 
 export function appendEntry(path: string, record: Record<string, unknown>): string {
   const uuid = randomUUID();
-  const entry = { ...record, uuid, timestamp: new Date().toISOString() };
+  const entry = { uuid, timestamp: new Date().toISOString(), ...record };
+  if (!entry.uuid) entry.uuid = uuid; // ensure uuid even if record had one
   appendFileSync(path, JSON.stringify(entry) + "\n");
   return uuid;
 }
@@ -171,11 +172,14 @@ export function fromPrompt(
   history: Array<{ role: string; content: unknown }>,
   cwd: string,
 ): void {
-  // Consolidate to single pair — avoids --resume ghost entries
-  const consolidated = consolidate(history);
+  // True multi-entry — each turn as its own JSONL entry.
+  // Sequential timestamps + leafUuid prevent --resume ghost generation.
   let parentUuid: string | null = lastUuid(sessionPath);
+  const baseTime = Date.now() - history.length * 10_000;
+  let entryIdx = 0;
+  const ts = () => new Date(baseTime + (entryIdx++) * 10_000).toISOString();
 
-  for (const msg of consolidated) {
+  for (const msg of history) {
     const contentArr = msg.content;
 
     if (msg.role === "user") {
@@ -191,11 +195,11 @@ export function fromPrompt(
       }
       if (content.length === 0) continue;
       parentUuid = appendEntry(sessionPath, {
-        type: "user", parentUuid, sessionId, isSidechain: false,
+        type: "user", parentUuid, sessionId, isSidechain: false, timestamp: ts(),
         promptId: randomUUID(),
         message: { role: "user", content },
         permissionMode: "default",
-        userType: "external", entrypoint: "sdk-cli", cwd,
+        userType: "external", entrypoint: "sdk-cli", cwd, version: "2.1.80", gitBranch: "main",
       });
 
     } else if (msg.role === "assistant") {
@@ -217,15 +221,23 @@ export function fromPrompt(
       }
       if (content.length === 0) content.push({ type: "text", text: "(no text response)" });
       parentUuid = appendEntry(sessionPath, {
-        type: "assistant", parentUuid, sessionId, isSidechain: false,
-        requestId: `req_seed_${randomUUID().slice(0, 12)}`,
+        type: "assistant", parentUuid, sessionId, isSidechain: false, timestamp: ts(),
+        requestId: `req_01${randomUUID().replace(/-/g, "").slice(0, 20)}`,
         message: {
-          model: "seeded", id: `msg_seed_${randomUUID().slice(0, 12)}`,
+          model: "claude-sonnet-4-5-20250929", id: `msg_01${randomUUID().replace(/-/g, "").slice(0, 20)}`,
           type: "message", role: "assistant", content,
           stop_reason: "end_turn", stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
+          usage: {
+            input_tokens: 0, output_tokens: 0,
+            cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            server_tool_use: { web_search_requests: 0, web_fetch_requests: 0 },
+            service_tier: "standard",
+            cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 0 },
+            inference_geo: "", iterations: [], speed: "standard",
+          },
         },
-        userType: "external", entrypoint: "sdk-cli", cwd,
+        userType: "external", entrypoint: "sdk-cli", cwd, version: "2.1.80", gitBranch: "main",
+        version: "2.1.80", gitBranch: "main",
       });
 
     } else if (msg.role === "tool") {
@@ -240,11 +252,22 @@ export function fromPrompt(
       }
       if (content.length === 0) continue;
       parentUuid = appendEntry(sessionPath, {
-        type: "user", parentUuid, sessionId, isSidechain: false,
+        type: "user", parentUuid, sessionId, isSidechain: false, timestamp: ts(),
         promptId: randomUUID(),
         message: { role: "user", content },
-        userType: "external", entrypoint: "sdk-cli", cwd,
+        userType: "external", entrypoint: "sdk-cli", cwd, version: "2.1.80", gitBranch: "main",
       });
+    }
+  }
+
+  // Update summary leafUuid to point to last entry — tells --resume where the conversation ends
+  if (parentUuid) {
+    const entries = readFileSync(sessionPath, "utf-8").trim().split("\n");
+    if (entries.length > 0) {
+      const summary = JSON.parse(entries[0]);
+      summary.leafUuid = parentUuid;
+      entries[0] = JSON.stringify(summary);
+      writeFileSync(sessionPath, entries.join("\n") + "\n");
     }
   }
 }
