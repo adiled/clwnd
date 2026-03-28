@@ -239,7 +239,6 @@ export function fromPrompt(
           },
         },
         userType: "external", entrypoint: "sdk-cli", cwd, version: "2.1.80", gitBranch: "main",
-        version: "2.1.80", gitBranch: "main",
       });
 
     } else if (msg.role === "tool") {
