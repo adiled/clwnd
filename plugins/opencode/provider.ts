@@ -800,9 +800,11 @@ export class ClwndModel implements LanguageModelV2 {
         }
 
         opts.abortSignal?.addEventListener("abort", () => {
-          // Signal daemon to kill the Claude CLI process mid-turn.
-          // Session state preserved — next message respawns via --resume.
-          hum({ chi: "cancel", sid });
+          if (!done) {
+            // Mid-turn abort — kill the Claude CLI process.
+            // Session state preserved — next message respawns via --resume.
+            hum({ chi: "cancel", sid });
+          }
           wilt();
         });
 

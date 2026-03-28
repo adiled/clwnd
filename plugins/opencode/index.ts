@@ -69,10 +69,14 @@ export const clwndPlugin: Plugin = async (input) => {
       if (event.type === "session.compacted") {
         const sid = (event as any).properties?.sessionID;
         if (sid) {
+          // Deduplicate — multiple plugin instances receive the same event
+          const key = `compacted:${sid}`;
+          if ((globalThis as any)[key]) return;
+          (globalThis as any)[key] = true;
+          setTimeout(() => delete (globalThis as any)[key], 5000);
+
           trace("session.compacted", { sid });
-          // Reset turn counter so next message does a full re-seed from compacted prompt
           resetTurnsSent(sid);
-          // Kill Claude CLI process — respawn will load re-seeded JSONL
           hum({ chi: "cancel", sid });
         }
       }

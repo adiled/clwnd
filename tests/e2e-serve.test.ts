@@ -12,9 +12,13 @@ const HOME = process.env.HOME ?? "/tmp";
 const SUITE_DIR = join(HOME, ".clwnd-e2e-serve");
 const PROJECT_DIR = join(SUITE_DIR, "project");
 const TIMEOUT = 180_000;
+const SEED_FIXTURE = join(import.meta.dir, "fixtures", "seed-session.json");
 
 // Track sessions created during each test for cleanup
 const activeSessions: string[] = [];
+
+// Seed session ID — imported once in beforeAll
+let seedSessionId: string;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -30,6 +34,16 @@ async function createSession(): Promise<string> {
   const r = await api("/session", {
     method: "POST",
     body: JSON.stringify({ directory: PROJECT_DIR }),
+  });
+  const sid = (r as any).id;
+  if (sid) activeSessions.push(sid);
+  return sid;
+}
+
+async function forkSeedSession(): Promise<string> {
+  const r = await api(`/session/${seedSessionId}/fork`, {
+    method: "POST",
+    body: JSON.stringify({}),
   });
   const sid = (r as any).id;
   if (sid) activeSessions.push(sid);
@@ -259,6 +273,12 @@ beforeAll(async () => {
   await gitInit.exited;
   await Bun.write(join(PROJECT_DIR, "hello.txt"), "hello world\n");
 
+  // OpenCode project config — small_model for compaction
+  await Bun.write(join(PROJECT_DIR, "opencode.json"), JSON.stringify({
+    "$schema": "https://opencode.ai/config.json",
+    small_model: "opencode/gpt-5-nano",
+  }, null, 2));
+
   // Claude permissions for MCP tools
   mkdirSync(join(PROJECT_DIR, ".claude"), { recursive: true });
   await Bun.write(join(PROJECT_DIR, ".claude", "settings.json"), JSON.stringify({
@@ -295,7 +315,27 @@ beforeAll(async () => {
     await Bun.sleep(500);
   }
   if (!ready) throw new Error("opencode serve failed to start within 20s");
-}, 30_000);
+
+  // Import seed session fixture (6-turn clwnd conversation with free model)
+  if (existsSync(SEED_FIXTURE)) {
+    const importProc = spawn({
+      cmd: ["opencode", "import", SEED_FIXTURE],
+      cwd: PROJECT_DIR,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env },
+    });
+    const importOut = await new Response(importProc.stdout).text();
+    await importProc.exited;
+    const match = importOut.match(/ses_\w+/);
+    if (match) {
+      seedSessionId = match[0];
+      // Verify it's accessible via the test server
+      const check = await api(`/session/${seedSessionId}`);
+      if (!(check as any)?.id) seedSessionId = "";
+    }
+  }
+}, 45_000);
 
 afterAll(async () => {
   // Sweep any sessions that leaked during tests
@@ -660,33 +700,23 @@ describe("e2e-serve: abort recovery", () => {
 });
 
 describe("e2e-serve: provider migration (#7)", () => {
-  test("cold start: 10 seeded turns + continuation verifies no ghost corruption", async () => {
+  test("cold start: seeded session + continuation verifies no ghost corruption", async () => {
     skipIfDead();
-    const sid = await createSession();
-    const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
+    if (!seedSessionId) throw new Error("seed session not imported");
 
-    // Seed 10 turns with free model — short prompts for speed
-    await sendMessage(sid, "color=CRIMSON. Say OK.", undefined, TIMEOUT, freeModel);
-    await sendMessage(sid, "dog=BISCUIT. Say OK.", undefined, TIMEOUT, freeModel);
-    await sendMessage(sid, "city=TOKYO. Say OK.", undefined, TIMEOUT, freeModel);
-    await sendMessage(sid, "number=7742. Say OK.", undefined, TIMEOUT, freeModel);
-    await sendMessage(sid, "project=FALCON. Say OK.", undefined, TIMEOUT, freeModel);
-    await sendMessage(sid, "cat=MARBLE. Say OK.", undefined, TIMEOUT, freeModel);
-    await sendMessage(sid, "company=ACME. Say OK.", undefined, TIMEOUT, freeModel);
-    await sendMessage(sid, "birthday=MARCH15. Say OK.", undefined, TIMEOUT, freeModel);
-    await sendMessage(sid, "car=TESLA. Say OK.", undefined, TIMEOUT, freeModel);
-    await sendMessage(sid, "secret=JULIET. Say OK.", undefined, TIMEOUT, freeModel);
+    // Fork the seed session (6 turns about clwnd with free model)
+    const sid = await forkSeedSession();
 
-    // Switch to clwnd — cold start with 10 seeded turns
-    const r1 = await sendMessage(sid, "What is my color and my secret? Answer with just the two values.");
+    // Switch to clwnd — cold start with 6 seeded turns
+    const r1 = await sendMessage(sid, "What is the poetic name for sending a prompt and for killing a process? Just the two terms.");
     const t1 = extractResponseText(r1).toLowerCase();
-    expect(t1).toContain("crimson");
-    expect(t1).toContain("juliet");
+    expect(t1).toContain("murmur");
+    expect(t1).toContain("fell");
 
     // Continuation: Claude should reference its own reply, not a ghost
-    const r2 = await sendMessage(sid, "In your last reply did you mention CRIMSON? Yes or no, then quote what you said.");
+    const r2 = await sendMessage(sid, "In your last reply did you mention murmur? Yes or no.");
     const t2 = extractResponseText(r2).toLowerCase();
-    expect(t2).toContain("crimson");
+    expect(t2).toContain("yes");
     expect(t2).not.toContain("no response requested");
 
     // JSONL: count ghosts vs seeded entries
@@ -700,11 +730,10 @@ describe("e2e-serve: provider migration (#7)", () => {
       const seededUsers = lines.filter((l: any) =>
         l.type === "user" && l.message?.role === "user"
       );
-      // Report ghost count vs total entries for diagnostics
       console.log(`  JSONL: ${lines.length} entries, ${seededUsers.length} user msgs, ${ghosts.length} ghosts`);
       expect(ghosts.length).toBe(0);
     }
-  }, 420_000); // 7 min — 10 free model turns + 2 clwnd turns
+  }, TIMEOUT);
 
   test("cold start: multi-turn after seed (opus) verifies no ghost corruption", async () => {
     skipIfDead();
@@ -926,30 +955,72 @@ describe("e2e-serve: tool rendering metadata", () => {
 // needed. If they fail — that's how we know we need to handle something.
 
 describe("e2e-serve: compaction", () => {
-  test("session compaction preserves conversation context", async () => {
+  test("compaction re-seeds JSONL — context survives process kill", async () => {
     skipIfDead();
-    const sid = await createSession();
+    if (!seedSessionId) throw new Error("seed session not imported");
 
-    // Establish context across multiple turns
-    await sendMessage(sid, "My secret word is FLAMINGO. Acknowledge.");
-    await sendMessage(sid, "My lucky number is 42. Acknowledge.");
+    // Fork the seed session (6 turns about clwnd architecture)
+    const sid = await forkSeedSession();
 
-    // Trigger compaction via command endpoint
-    const compactResp = await api(`/session/${sid}/command`, {
-      method: "POST",
-      body: JSON.stringify({ command: "session.compact", arguments: "" }),
+    // Send one message via clwnd to establish a Claude CLI process + JSONL
+    await sendMessage(sid, "Quick recap: what is the naming convention we discussed? Just list the key terms.");
+    const stateBefore = await getSessionState(sid);
+    const claudeIdBefore = stateBefore?.claudeSessionId;
+    expect(claudeIdBefore).toBeTruthy();
+
+    // Subscribe to session.compacted event before triggering
+    const sseCtrl = new AbortController();
+    const compactedViaEvent = new Promise<void>((resolve) => {
+      fetch(`${BASE}/event`, { signal: sseCtrl.signal }).then(async (r) => {
+        const reader = r.body!.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          if (buf.includes("session.compacted")) { resolve(); return; }
+        }
+      }).catch(() => {});
     });
-    expect(compactResp).toBeDefined();
+    await Bun.sleep(300);
 
-    // Wait for compaction to settle
-    await Bun.sleep(3_000);
+    // Kill Claude CLI process first to free memory for compaction
+    try {
+      await fetch("http://localhost/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }),
+        unix: DAEMON_SOCK,
+      } as RequestInit);
+    } catch {}
+    await Bun.sleep(1_000);
 
-    // Context should survive compaction — Claude CLI process respawns with re-seeded JSONL
-    const resp = await sendMessage(sid, "What is my secret word and lucky number?");
+    // Trigger compaction via summarize endpoint (uses free model)
+    const summarizeReq = fetch(`${BASE}/session/${sid}/summarize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ providerID: "opencode", modelID: "gpt-5-nano", auto: false }),
+    });
+
+    // Wait for session.compacted event (timeout 120s — free model compaction is slow)
+    const compactTimeout = new Promise<void>((_, reject) =>
+      setTimeout(() => reject(new Error("compaction did not complete within 120s")), 120_000));
+    await Promise.race([compactedViaEvent, compactTimeout]);
+    sseCtrl.abort();
+    await summarizeReq.catch(() => {});
+
+    // Send message — triggers re-seed from compacted prompt + fresh respawn
+    const resp = await sendMessage(sid, "What was the poetic naming for sending a prompt to Claude CLI?");
     const text = extractResponseText(resp).toLowerCase();
-    expect(text).toContain("flamingo");
-    expect(text).toContain("42");
-  }, TIMEOUT);
+
+    // Must recall "murmur" from compacted context
+    expect(text).toContain("murmur");
+
+    // Claude session ID must have changed — proves JSONL was re-seeded
+    const stateAfter = await getSessionState(sid);
+    expect(stateAfter?.claudeSessionId).not.toBe(claudeIdBefore);
+  }, 300_000); // 5 min — free model compaction is slow
 });
 
 describe("e2e-serve: snapshots and revert", () => {
