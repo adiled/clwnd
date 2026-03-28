@@ -20,6 +20,24 @@ Needs git, bun, opencode, claude.
 
 Core workflow is operational (more coming). See [compatibility](https://github.com/adiled/clwnd/issues/8).
 
+**Config** `~/.config/clwnd/clwnd.json`
+
+```json
+{
+  "maxProcs": 4,
+  "idleTimeout": 30000,
+  "ocCompaction": false,
+  "smallModel": ""
+}
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `maxProcs` | `4` | Max concurrent Claude CLI processes |
+| `idleTimeout` | `30000` | Kill idle process after ms (0 = disabled) |
+| `ocCompaction` | `false` | Let OpenCode handle session compaction |
+| `smallModel` | `""` | Override small model (empty = auto-discover free model) |
+
 **Permissions**
 
 clwnd governs the file system operations.

@@ -5,12 +5,14 @@ export interface ClwndConfig {
   maxProcs: number;
   idleTimeout: number;
   ocCompaction: boolean;
+  smallModel: string;
 }
 
 const DEFAULTS: ClwndConfig = {
   maxProcs: 4,
   idleTimeout: 30000,
   ocCompaction: false,
+  smallModel: "",
 };
 
 const CONFIG_PATHS = [
@@ -29,6 +31,7 @@ export function loadConfig(): ClwndConfig {
         maxProcs: raw.maxProcs ?? DEFAULTS.maxProcs,
         idleTimeout: raw.idleTimeout ?? DEFAULTS.idleTimeout,
         ocCompaction: raw.ocCompaction ?? DEFAULTS.ocCompaction,
+        smallModel: raw.smallModel ?? DEFAULTS.smallModel,
       };
       return cached;
     } catch {}

@@ -4,18 +4,26 @@ import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { createClwnd, setSharedClient, setLogClient, hum, trace, log, resetTurnsSent } from "./provider.ts";
-import { loadConfig } from "../../lib/config.ts";
+import { loadConfig, type ClwndConfig } from "../../lib/config.ts";
 
 // ─── Small Model Discovery ──────────────────────────────────────────────────
 // Provider config lives in opencode.json (managed by install script).
 // Plugin only discovers a free model for small tasks at runtime.
 
-async function syncSmallModel(client: any): Promise<void> {
+async function syncSmallModel(client: any, cfg: ClwndConfig): Promise<void> {
   try {
     const current = await client.config.get();
     const currentSmall = (current?.data as any)?.small_model;
     if (currentSmall) return; // user or prior run already set it
 
+    // Use clwnd.json configured model if set
+    if (cfg.smallModel) {
+      await client.config.update({ body: { small_model: cfg.smallModel } });
+      log("small.synced", { model: cfg.smallModel, source: "config" });
+      return;
+    }
+
+    // Auto-discover a free model
     const providers = await client.provider.list();
     const all = (providers?.data as any)?.all ?? [];
     for (const p of all) {
@@ -24,7 +32,7 @@ async function syncSmallModel(client: any): Promise<void> {
         if (m.cost && m.cost.input === 0 && m.cost.output === 0 && m.tool_call) {
           const pick = `${p.id}/${mid}`;
           await client.config.update({ body: { small_model: pick } });
-          log("small.synced", { model: pick });
+          log("small.synced", { model: pick, source: "auto" });
           return;
         }
       }
@@ -60,7 +68,8 @@ export const clwndPlugin: Plugin = async (input) => {
   } catch {}
 
   // Delay to avoid config update triggering OC reload during startup
-  setTimeout(() => syncSmallModel(input.client).catch(() => {}), 10000);
+  const cfg = loadConfig();
+  setTimeout(() => syncSmallModel(input.client, cfg).catch(() => {}), 10000);
 
   return {
     models: {
