@@ -1,6 +1,5 @@
 import { generateId } from "@ai-sdk/provider-utils";
 import { randomUUID } from "crypto";
-import { readFileSync } from "fs";
 import * as session from "../../lib/session.ts";
 import { loadConfig } from "../../lib/config.ts";
 
@@ -179,6 +178,17 @@ async function awakenHum(): Promise<void> {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line) as Record<string, unknown>;
+          // Breath: daemon sends full state on connect — restore turnsSent
+          if (msg.chi === "breath") {
+            const sessions = (msg.sessions ?? []) as Array<{ sid: string; turnsSent: number }>;
+            for (const s of sessions) {
+              if (typeof s.turnsSent === "number" && s.turnsSent >= 0 && !turnsSent.has(s.sid)) {
+                turnsSent.set(s.sid, s.turnsSent);
+              }
+            }
+            trace("hum.breath.received", { sessions: sessions.length, restored: sessions.filter(s => s.turnsSent >= 0).length });
+            continue;
+          }
           if (humHearer) humHearer(msg);
         } catch {}
       }
@@ -425,21 +435,7 @@ export function resetTurnsSent(sid: string): void {
   turnsSent.delete(sid);
 }
 
-/** Restore turnsSent from daemon's persisted session state if not in memory */
-function restoreTurnsSent(sid: string): void {
-  if (turnsSent.has(sid)) return;
-  try {
-    const stateDir = process.env.XDG_STATE_HOME
-      ? `${process.env.XDG_STATE_HOME}/clwnd`
-      : `${process.env.HOME}/.local/state/clwnd`;
-    const data = JSON.parse(readFileSync(`${stateDir}/sessions.json`, "utf8"));
-    const session = data[sid];
-    if (session && typeof session.turnsSent === "number" && session.turnsSent >= 0) {
-      turnsSent.set(sid, session.turnsSent);
-      trace("turnsSent.restored", { sid, value: session.turnsSent });
-    }
-  } catch {}
-}
+// turnsSent restored via breath on hum connect — no filesystem IPC needed
 
 function countHistoryTurns(prompt: LanguageModelV2Prompt): number {
   let lastUserIdx = -1;
@@ -736,8 +732,7 @@ export class ClwndModel implements LanguageModelV2 {
     const allowedTools = deriveAllowedTools(sid, opts);
 
     // History seeding (#7) — plugin writes JSONL directly, signals daemon
-    // Restore turnsSent from daemon's persisted state if plugin was reloaded
-    restoreTurnsSent(sid);
+    // turnsSent restored via breath on hum connect
     const historyTurns = countHistoryTurns(opts.prompt);
     const sent = turnsSent.get(sid) ?? -1;
     let seedClaudeId: string | undefined;
@@ -902,14 +897,7 @@ export class ClwndModel implements LanguageModelV2 {
           const msg: Record<string, unknown> = { ...raw };
           if (raw.chi === "chunk") msg.action = "chunk";
           else if (raw.chi === "finish") msg.action = "finish";
-          else if (raw.chi === "session-ready") {
-            msg.action = "session_ready";
-            // Restore turnsSent from daemon's persisted state (survives plugin reload)
-            if (typeof raw.turnsSent === "number" && raw.turnsSent >= 0 && !turnsSent.has(sid)) {
-              turnsSent.set(sid, raw.turnsSent);
-              trace("turnsSent.restored", { sid, value: raw.turnsSent });
-            }
-          }
+          else if (raw.chi === "session-ready") msg.action = "session_ready";
           else if (raw.chi === "error") msg.action = "error";
           else if (raw.chi === "permission-ask") msg.action = "permission_ask";
           else msg.action = raw.chi;
