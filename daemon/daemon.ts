@@ -355,7 +355,7 @@ class ClaudeNest {
         trace("permission.hold.created", { id: askId, tool: toolName, path });
         drone.observed(sigil(poolKey), { type: "permission_ask" });
 
-        hum(roost.activeSid ?? "", { chi: "permission-ask", askId, tool: toolName, path, input: msg.input ?? {} });
+        hum(roost.activeSid ?? "", { chi: "permission-ask", askId, tool: toolName, path, input: msg.input ?? {}, dusk: Date.now() + cfg.permissionDusk });
 
         CLWND_PERMIT_HOLD.set(askId, {
           resolve: (decision) => {
@@ -1143,7 +1143,7 @@ const mcpServer = Bun.serve({
         const askId = randomUUID();
         trace("permission.hold.created", { id: askId, tool: toolName, path });
 
-        hum(ocSessionId ?? sessionId, { chi: "permission-ask", askId, tool: toolName, path, input: body.tool_input ?? {} });
+        hum(ocSessionId ?? sessionId, { chi: "permission-ask", askId, tool: toolName, path, input: body.tool_input ?? {}, dusk: Date.now() + cfg.permissionDusk });
 
         // Hold until /permission-respond resolves this, or timeout
         const decision = await new Promise<"allow" | "deny">((resolve) => {
@@ -1228,7 +1228,7 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>) =
   trace("permission.ask.hold", { id: askId, tool, path });
 
   // Send via hum — if no hum clients, permit hold times out and defaults to allow
-  hum("", { chi: "permission-ask", askId, tool, path, input });
+  hum("", { chi: "permission-ask", askId, tool, path, input, dusk: Date.now() + cfg.permissionDusk });
 
   return new Promise<{ decision: "allow" | "deny" }>((resolve) => {
     CLWND_PERMIT_HOLD.set(askId, {
