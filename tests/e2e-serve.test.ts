@@ -1085,31 +1085,22 @@ describe("e2e-serve: snapshots and revert", () => {
 });
 
 describe("e2e-serve: session forking", () => {
-  // Skipped: forked session = new process with no parent context.
-  // historyContext disabled. Needs cold-start seeding (#7).
-  test.skip("forked session creates independent conversation branch", async () => {
+  test("forked session retains parent context via cold-start seed", async () => {
     skipIfDead();
-    const sid = await createSession();
+    if (!seedSessionId) throw new Error("seed session not imported");
 
-    // Establish context in parent
-    await sendMessage(sid, "My favorite animal is a penguin. Acknowledge.");
+    // Fork the seed session (6 turns about clwnd)
+    const forkedSid = await forkSeedSession();
+    expect(forkedSid).toBeTruthy();
 
-    // Fork the session
-    const forkResp = await api(`/session/${sid}/fork`, { method: "POST", body: JSON.stringify({}) }) as any;
-    const forkedSid = forkResp.id;
+    // Send clwnd message on fork — should seed from parent history
+    const resp = await sendMessage(forkedSid, "What is the poetic name for the bidirectional socket? One word.");
+    const text = extractResponseText(resp).toLowerCase();
+    expect(text).toContain("hum");
 
-    if (forkedSid) {
-      activeSessions.push(forkedSid);
-      // Forked session should be independent
-      expect(forkedSid).not.toBe(sid);
-      // Send a message in forked session — should retain parent context
-      const resp = await sendMessage(forkedSid, "What is my favorite animal?");
-      const text = extractResponseText(resp).toLowerCase();
-      expect(text).toContain("penguin");
-    } else {
-      // Fork not supported or errored — that's a finding
-      expect(forkResp).toHaveProperty("id");
-    }
+    // Verify JSONL was created (cold-start seed happened)
+    const state = await getSessionState(forkedSid);
+    expect(state?.claudeSessionId).toBeTruthy();
   }, TIMEOUT);
 });
 
