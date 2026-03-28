@@ -1,5 +1,8 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import { createClwnd, setSharedClient, setLogClient, hum, trace, log } from "./provider.ts";
 
 // ─── Small Model Discovery ──────────────────────────────────────────────────
@@ -38,6 +41,22 @@ export const clwndPlugin: Plugin = async (input) => {
   const provider = createClwnd({ client: input.client, pluginInput: input });
 
   log("plugin.loaded", { directory: input.directory });
+
+  // Toast version update on first load after upgrade
+  try {
+    const pkgDir = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const version = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")).version ?? "unknown";
+    const stateDir = `${process.env.XDG_STATE_HOME || process.env.HOME + "/.local/state"}/clwnd`;
+    const versionFile = join(stateDir, "last-plugin-version");
+    let lastVersion = "";
+    try { lastVersion = readFileSync(versionFile, "utf8").trim(); } catch {}
+    if (lastVersion && lastVersion !== version) {
+      input.client.tui.showToast({
+        body: { title: "clwnd updated", message: `v${lastVersion} → v${version}`, variant: "success", duration: 5000 },
+      }).catch(() => {});
+    }
+    try { mkdirSync(stateDir, { recursive: true }); writeFileSync(versionFile, version); } catch {}
+  } catch {}
 
   // Delay to avoid config update triggering OC reload during startup
   setTimeout(() => syncSmallModel(input.client).catch(() => {}), 10000);
