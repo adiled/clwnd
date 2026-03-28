@@ -765,16 +765,8 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd);
 
       if (promptContent) {
-        if (hadRoost) {
-          // Process already alive — murmur immediately
-          nest.murmur(sid, poolKey, promptContent);
-        } else if (isResume) {
-          // Resumed session — delay to let Claude CLI load JSONL
-          setTimeout(() => nest.murmur(sid, poolKey, promptContent), 500);
-        } else {
-          // New session — murmur immediately (system init is unreliable)
-          nest.murmur(sid, poolKey, promptContent);
-        }
+        // Murmur immediately — stdin is buffered, Claude CLI processes when ready
+        nest.murmur(sid, poolKey, promptContent);
       }
       break;
     }
