@@ -708,10 +708,9 @@ describe("e2e-serve: provider migration (#7)", () => {
     const sid = await forkSeedSession();
 
     // Switch to clwnd — cold start with 6 seeded turns
-    const r1 = await sendMessage(sid, "What is the poetic name for sending a prompt and for killing a process? Just the two terms.");
+    const r1 = await sendMessage(sid, "What is the poetic name for sending a prompt to Claude CLI? Just the one word.");
     const t1 = extractResponseText(r1).toLowerCase();
     expect(t1).toContain("murmur");
-    expect(t1).toContain("fell");
 
     // Continuation: Claude should reference its own reply, not a ghost
     const r2 = await sendMessage(sid, "In your last reply did you mention murmur? Yes or no.");

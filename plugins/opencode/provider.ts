@@ -780,7 +780,7 @@ export class ClwndModel implements LanguageModelV2 {
         seedClaudePath = session.createSession(cwd, seedClaudeId);
         session.fromPrompt(seedClaudePath, seedClaudeId, seedHistory, cwd);
         log("seed.written", { sid, claudeId: seedClaudeId, path: seedClaudePath, turns: seedHistory.length });
-        // Lightweight signal to daemon — even if lost, prompt carries the info
+        // Signal daemon — echo confirms custody
         hum({ chi: "seeded", sid, claudeSessionId: seedClaudeId, claudeSessionPath: seedClaudePath, cwd });
       }
 
@@ -838,8 +838,6 @@ export class ClwndModel implements LanguageModelV2 {
         content, text, systemPrompt,
         permissions, allowedTools, listenOnly,
         turnsSent: turnsSent.get(sid) ?? -1,
-        // Carry seed info in prompt — daemon uses this even if chi:"seeded" was lost
-        ...(seedClaudeId ? { seedClaudeId, seedClaudePath } : {}),
       });
       promptSent = true;
     }

@@ -688,15 +688,6 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         saveSessions();
       }
 
-      // History seeding: plugin writes JSONL directly, carries seed info in prompt
-      if (msg.seedClaudeId && msg.seedClaudePath) {
-        session.claudeSessionId = msg.seedClaudeId as string;
-        session.claudeSessionPath = msg.seedClaudePath as string;
-        session.needsRespawn = true;
-        saveSessions();
-        trace("seed.fromPrompt", { sid, claudeId: session.claudeSessionId });
-      }
-
       // Capture prompt content for deferred murmur
       const promptContent: Array<Record<string, unknown>> | string | null =
         !msg.listenOnly ? (msg.content as Array<Record<string, unknown>> | undefined) ?? (msg.text as string ?? "") : null;
