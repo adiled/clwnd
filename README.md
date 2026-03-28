@@ -1,4 +1,10 @@
 <p align="center">
+  <strong>\_ clwnd _/</strong>
+  <br>
+  A sentinel for your multiplexed cross-harness AI bots.
+  <br>
+  <strong>Supported today:</strong> + OpenCode session governance + Claude Code providers in headless (compliant) mode  
+  <br><br>
   <img src="clwnd.gif" alt="clwnd" />
 </p>
 
