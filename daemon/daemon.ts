@@ -243,14 +243,20 @@ class ClaudeNest {
     this.readStderr(proc, poolKey);
 
     proc.exited.then(exit => {
-      trace("nest.exited", { poolKey, code: exit.exitCode });
-      humPulse("roost-died", poolKey, { pid: proc.pid, reason: `exit:${exit.exitCode}` });
-      for (const listener of roost.listeners.values()) {
-        try { listener.onThorn(`subprocess exited: code=${exit.exitCode}`); } catch {}
+      trace("nest.exited", { poolKey, code: exit.exitCode, pid: proc.pid });
+      // Only clean up if this roost is still the current one — a new spawn may have replaced it
+      const current = this.roosts.get(poolKey);
+      if (current === roost) {
+        humPulse("roost-died", poolKey, { pid: proc.pid, reason: `exit:${exit.exitCode}` });
+        for (const listener of roost.listeners.values()) {
+          try { listener.onThorn(`subprocess exited: code=${exit.exitCode}`); } catch {}
+        }
+        roost.listeners.clear();
+        roost.activeSid = null;
+        this.roosts.delete(poolKey);
+      } else {
+        trace("nest.exited.stale", { poolKey, pid: proc.pid, reason: "replaced by newer roost" });
       }
-      roost.listeners.clear();
-      roost.activeSid = null;
-      this.roosts.delete(poolKey);
     });
 
     this.readLoop(proc, poolKey, roost);
