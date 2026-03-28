@@ -13,6 +13,8 @@ const SUITE_DIR = join(HOME, ".clwnd-e2e-serve");
 const PROJECT_DIR = join(SUITE_DIR, "project");
 const TIMEOUT = 180_000;
 const SEED_FIXTURE = join(import.meta.dir, "fixtures", "seed-session.json");
+const DUMMY_PROVIDER = join(import.meta.dir, "fixtures", "dummy-provider.ts");
+const DUMMY_MODEL = { providerID: "dummy", modelID: "echo" };
 
 // Track sessions created during each test for cleanup
 const activeSessions: string[] = [];
