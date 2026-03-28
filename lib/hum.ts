@@ -364,7 +364,7 @@ export class Drone {
     this.resetSilence(s);
   }
 
-  /** Wired into hum send path — observes outgoing tones */
+  /** Wired into hum send path — observes outgoing tones (zero work, just track) */
   sent(tone: Record<string, unknown>): void {
     if (tone.chi === "drone" || tone.chi === "echo") return;
     const s = tone.sigil as string;
@@ -375,11 +375,10 @@ export class Drone {
         rid: tone.rid as string, chi: tone.chi as string, time: Date.now(), retries: 0,
       });
     }
-    rerhythm(state);
     this.resetSilence(s);
   }
 
-  /** Wired into hum receive path — observes incoming tones */
+  /** Wired into hum receive path — observes incoming tones (minimal work) */
   heard(tone: Record<string, unknown>): void {
     const chi = tone.chi as string;
 
@@ -388,7 +387,6 @@ export class Drone {
       for (const [s, state] of this.states) {
         if (state.pendingEchoes.has(echoRid)) {
           state.pendingEchoes.delete(echoRid);
-          rerhythm(state);
           this.resetSilence(s);
           break;
         }
@@ -403,7 +401,6 @@ export class Drone {
         state.lastBeatReceived = Date.now();
         state.missedBeats = 0;
         state.remoteWane = (tone.wane as number) ?? state.remoteWane;
-        rerhythm(state);
         this.resetSilence(s);
       }
       return;
@@ -415,7 +412,6 @@ export class Drone {
       if (chi === "pulse" && tone.kind === "roost-died") {
         state.inflightTools = 0;
       }
-      rerhythm(state);
       this.resetSilence(s);
     }
   }
@@ -435,13 +431,13 @@ export class Drone {
     } else if (event.type === "permission_resolved") {
       state.pendingPermissions = Math.max(0, state.pendingPermissions - 1);
     } else if (event.type === "text_delta" && event.text) {
-      // Accumulate response — the drone reads what the LLM says
+      // Just append — no assessment on hot path
       state.responseText += event.text;
-      // Heuristic engine: fast check on accumulated text
-      if (!state.suspicious && state.responseText.length > 20) {
+    } else if (event.type === "turn_end") {
+      // Deferred: assess accumulated text at turn boundary
+      if (state.responseText.length > 20) {
         state.suspicious = heuristicSuspicion(state.responseText);
       }
-    } else if (event.type === "turn_end") {
       // Turn complete — evaluate if suspicious, then reset
       if (state.suspicious && this.evaluate && !this.evaluating.has(s)) {
         this.evaluating.add(s);
