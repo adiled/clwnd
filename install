@@ -25,10 +25,41 @@ SOCK_PATH="$CLWND_RUNTIME/clwnd.sock"
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
+MIN_CLAUDE="2.1.81"
+MIN_OPENCODE="1.3.0"
+
+version_gte() {
+  # Returns 0 if $1 >= $2 (semver)
+  printf '%s\n%s\n' "$2" "$1" | sort -V -C
+}
+
 check_prereqs() {
   [ -x "$(command -v bun)" ]    || { echo "error: bun required"; exit 1; }
   [ -x "$(command -v claude)" ] || { echo "error: claude CLI required"; exit 1; }
   [ -x "$(command -v git)" ]    || { echo "error: git required"; exit 1; }
+
+  # Check Claude CLI version (minimum $MIN_CLAUDE for --bare support)
+  CLAUDE_VER=$(claude --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+  if [ -n "$CLAUDE_VER" ] && ! version_gte "$CLAUDE_VER" "$MIN_CLAUDE"; then
+    echo ""
+    echo "  Claude CLI $CLAUDE_VER is too old (minimum: $MIN_CLAUDE)"
+    echo "  Run: claude update"
+    echo ""
+    exit 1
+  fi
+
+  # Check OpenCode version (minimum $MIN_OPENCODE)
+  OC_BIN=$(command -v opencode 2>/dev/null || echo "")
+  if [ -n "$OC_BIN" ]; then
+    OC_VER=$($OC_BIN --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+    if [ -n "$OC_VER" ] && ! version_gte "$OC_VER" "$MIN_OPENCODE"; then
+      echo ""
+      echo "  OpenCode $OC_VER is too old (minimum: $MIN_OPENCODE)"
+      echo "  Run: opencode update"
+      echo ""
+      exit 1
+    fi
+  fi
 }
 
 ensure_dirs() {
