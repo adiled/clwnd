@@ -159,6 +159,14 @@ let humHearer: HumListener | null = null;
 let humAlive = false;
 let humReady: { resolve: () => void } | null = null;
 let humAwaken: Promise<void> = awakenHum();
+const HUM_TIMEOUT = 5000;
+
+async function awaitHum(): Promise<void> {
+  if (humAlive) return;
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error("hum not connected within 5s")), HUM_TIMEOUT));
+  await Promise.race([humAwaken, timeout]);
+}
 
 async function awakenHum(): Promise<void> {
   try {
@@ -260,7 +268,7 @@ async function humSpeak(msg: Record<string, unknown>, onMessage: HumListener): P
   // Wait for hum reconnect if it dropped (e.g., OC plugin reload on model switch)
   if (!humAlive) {
     writeLog("trace", "humSpeak.waiting", { chi: msg.chi as string });
-    await humAwaken;
+    await awaitHum();
   }
   return new Promise<void>((resolve, reject) => {
     humHearer = (incoming) => {
@@ -634,7 +642,7 @@ export class ClwndModel implements LanguageModelV2 {
     const toolCalls: LanguageModelV2Content[] = [];
     const sap = new Map<string, string>();
 
-    await humAwaken;
+    await awaitHum();
     if (!humAlive) throw new Error("clwndHum not connected");
 
     const result = await new Promise<{
@@ -879,7 +887,7 @@ export class ClwndModel implements LanguageModelV2 {
         });
 
         // Wait for hum connection (refreshable — survives plugin reload)
-        await humAwaken;
+        await awaitHum();
         if (!humAlive) {
           petal({ type: "error", error: new Error("clwndHum not connected") } as LanguageModelV2StreamPart);
           wilt();
