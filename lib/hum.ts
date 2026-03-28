@@ -460,14 +460,8 @@ export class Drone {
   /** Update local wane — called when wane tracker ticks */
   setWane(s: string, w: number): void {
     const state = this.getOrCreate(s);
-    const firstTime = state.lastBeatSent === 0;
     state.localWane = w;
-    // First beat on connect — don't wait for silence
-    if (firstTime) {
-      rerhythm(state);
-      this.emitBeat(s, state);
-      this.resetSilence(s);
-    }
+    // Don't arm silence timer from setWane alone — only active tones should start monitoring
   }
 
   private emitBeat(s: string, state: DroneState): void {

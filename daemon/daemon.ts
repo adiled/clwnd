@@ -640,16 +640,11 @@ const drone = DRONED ? new Drone("daemon", (action: DroneAction) => {
       }
       break;
     case "dead":
-      info("drone.dead", { sigil: action.sigil, missedBeats: action.missedBeats });
-      // Dead client — remove from humClients, clean up sigil ownership
-      for (const [clientId, client] of humClients) {
+      trace("drone.dead", { sigil: action.sigil, missedBeats: action.missedBeats });
+      // Clean up stale sigil — but don't disconnect the client (it may own active sessions too)
+      for (const [, client] of humClients) {
         if (client.sigils.has(action.sigil)) {
           client.sigils.delete(action.sigil);
-          if (client.sigils.size === 0) {
-            try { client.socket.end(); } catch {}
-            humClients.delete(clientId);
-            trace("drone.dead.disconnected", { clientId: clientId.slice(0, 8) });
-          }
           break;
         }
       }
