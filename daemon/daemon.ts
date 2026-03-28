@@ -640,12 +640,18 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
         },
       };
 
+      const hadRoost = !!nest.roost(poolKey);
       nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd);
 
-      // For resumed sessions: delay murmur to let Claude CLI load JSONL first.
-      // New sessions defer murmur to onRoost (system init).
-      if (promptContent && isResume) {
-        setTimeout(() => nest.murmur(sid, poolKey, promptContent), 500);
+      if (promptContent) {
+        if (hadRoost) {
+          // Process already alive — murmur immediately
+          nest.murmur(sid, poolKey, promptContent);
+        } else if (isResume) {
+          // Resumed session — delay to let Claude CLI load JSONL
+          setTimeout(() => nest.murmur(sid, poolKey, promptContent), 500);
+        }
+        // New session (no roost, no resume) — murmur deferred to onRoost
       }
       break;
     }
