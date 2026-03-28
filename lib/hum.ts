@@ -156,3 +156,251 @@ export interface Reach {
   sigils: Set<string>;    // session pairings this client cares about
   socket: any;            // the underlying socket
 }
+
+// ─── Drone ─────────────────────────────────────────────────────────────────
+// The sentinel's awareness. Not called, not invoked — it observes every tone
+// that flows through the hum and acts on what it sees. The drone is never
+// manual. If you have to call it, it's not a drone.
+//
+// The drone watches the hum. Every tone that passes through updates the
+// assessment. The rhythm adapts. Retries fire. Resyncs happen. The user
+// never sees a failure because the drone already handled it.
+
+export type Assessment = "serene" | "alert" | "tense" | "critical";
+
+const RHYTHM: Record<Assessment, number> = {
+  serene: 30_000,
+  alert: 5_000,
+  tense: 1_000,
+  critical: 500,
+};
+
+export interface DroneState {
+  sigil: string;
+  assessment: Assessment;
+  rhythm: number;              // current beat interval in ms
+  localWane: number;
+  remoteWane: number;
+  pendingEchoes: Map<string, { rid: string; chi: string; time: number; retries: number }>;
+  lastBeatSent: number;
+  lastBeatReceived: number;
+  missedBeats: number;
+  inflightTools: number;
+  pendingPermissions: number;
+  tokensBurned: number;
+}
+
+export interface DroneBeat {
+  chi: "drone";
+  sigil: string;
+  wane: number;
+  assessment: Assessment;
+  rhythm: number;
+  pendingEchoes: string[];     // rids we sent but haven't heard back
+  load: {
+    activeSessions: number;
+    pendingPermissions: number;
+    inflightTools: number;
+    tokensBurned: number;
+  };
+}
+
+export function createDroneState(s: string): DroneState {
+  return {
+    sigil: s,
+    assessment: "serene",
+    rhythm: RHYTHM.serene,
+    localWane: 0,
+    remoteWane: 0,
+    pendingEchoes: new Map(),
+    lastBeatSent: 0,
+    lastBeatReceived: 0,
+    missedBeats: 0,
+    inflightTools: 0,
+    pendingPermissions: 0,
+    tokensBurned: 0,
+  };
+}
+
+/** Derive assessment from observable state — no external calls */
+export function assess(state: DroneState): Assessment {
+  // Critical: missed beats, unacknowledged tones for too long
+  if (state.missedBeats >= 3) return "critical";
+  const now = Date.now();
+  for (const [, pending] of state.pendingEchoes) {
+    if (now - pending.time > state.rhythm * 2) return "critical";
+  }
+  if (state.localWane !== state.remoteWane && state.lastBeatReceived > 0) return "critical";
+
+  // Tense: permissions pending, many in-flight tools, high token burn
+  if (state.pendingPermissions > 0) return "tense";
+  if (state.inflightTools > 3) return "tense";
+  if (state.pendingEchoes.size > 0) return "tense";
+
+  // Alert: any activity
+  if (state.inflightTools > 0) return "alert";
+  if (state.tokensBurned > 0) return "alert";
+
+  return "serene";
+}
+
+/** Update rhythm from assessment */
+export function rerhythm(state: DroneState): void {
+  state.assessment = assess(state);
+  state.rhythm = RHYTHM[state.assessment];
+}
+
+/**
+ * Drone: self-governing observer of a hum channel.
+ *
+ * The drone wraps the hum's I/O. It sees every tone that flows in either
+ * direction. Nobody calls the drone — it intercepts naturally.
+ *
+ * Usage: wrap your hum send/receive with drone.observe() and the drone
+ * runs itself. The onAction callback fires when the drone needs the
+ * channel to do something (send a beat, retry a tone, resync state).
+ */
+export class Drone {
+  private states = new Map<string, DroneState>();
+  private timer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(
+    private side: string,  // "daemon" or "plugin"
+    private onAction: (action: DroneAction) => void,
+  ) {
+    this.timer = setInterval(() => this.tick(), 1000);
+  }
+
+  private getOrCreate(s: string): DroneState {
+    let state = this.states.get(s);
+    if (!state) { state = createDroneState(s); this.states.set(s, state); }
+    return state;
+  }
+
+  /** Called automatically when a tone is about to be sent */
+  sent(tone: Record<string, unknown>): void {
+    if (tone.chi === "drone" || tone.chi === "echo") return;
+    const s = tone.sigil as string;
+    if (!s) return;
+    const state = this.getOrCreate(s);
+    if (tone.rid) {
+      state.pendingEchoes.set(tone.rid as string, {
+        rid: tone.rid as string, chi: tone.chi as string, time: Date.now(), retries: 0,
+      });
+    }
+    rerhythm(state);
+  }
+
+  /** Called automatically when a tone is received */
+  heard(tone: Record<string, unknown>): void {
+    const chi = tone.chi as string;
+
+    if (chi === "echo") {
+      const echoRid = tone.rid as string;
+      for (const [, state] of this.states) {
+        if (state.pendingEchoes.has(echoRid)) {
+          state.pendingEchoes.delete(echoRid);
+          rerhythm(state);
+          break;
+        }
+      }
+      return;
+    }
+
+    if (chi === "drone") {
+      const s = tone.sigil as string;
+      if (s) {
+        const state = this.getOrCreate(s);
+        state.lastBeatReceived = Date.now();
+        state.missedBeats = 0;
+        state.remoteWane = (tone.wane as number) ?? state.remoteWane;
+        rerhythm(state);
+      }
+      return;
+    }
+
+    // Any other tone — update activity
+    const s = tone.sigil as string;
+    if (s) {
+      const state = this.getOrCreate(s);
+      if (chi === "pulse" && tone.kind === "roost-died") {
+        state.inflightTools = 0;
+      }
+      rerhythm(state);
+    }
+  }
+
+  /** Internal tick — fires every 1s, checks all states */
+  private tick(): void {
+    const now = Date.now();
+    for (const [s, state] of this.states) {
+      // Check for missed beats
+      if (state.lastBeatReceived > 0 && now - state.lastBeatReceived > state.rhythm * 2) {
+        state.missedBeats++;
+        rerhythm(state);
+      }
+
+      // Emit beat if rhythm says so
+      if (now - state.lastBeatSent >= state.rhythm) {
+        state.lastBeatSent = now;
+        const beat: DroneBeat = {
+          chi: "drone",
+          sigil: s,
+          wane: state.localWane,
+          assessment: state.assessment,
+          rhythm: state.rhythm,
+          pendingEchoes: [...state.pendingEchoes.keys()],
+          load: {
+            activeSessions: this.states.size,
+            pendingPermissions: state.pendingPermissions,
+            inflightTools: state.inflightTools,
+            tokensBurned: state.tokensBurned,
+          },
+        };
+        this.onAction({ type: "beat", sigil: s, beat });
+      }
+
+      // Check for stale echoes — retry
+      for (const [rid, pending] of state.pendingEchoes) {
+        if (now - pending.time > state.rhythm * 2 && pending.retries < 3) {
+          pending.retries++;
+          this.onAction({ type: "retry", sigil: s, rid, chi: pending.chi });
+        }
+        if (pending.retries >= 3) {
+          state.pendingEchoes.delete(rid);
+          this.onAction({ type: "lost", sigil: s, rid, chi: pending.chi });
+        }
+      }
+
+      // Check for wane drift
+      if (state.localWane !== state.remoteWane && state.lastBeatReceived > 0) {
+        this.onAction({ type: "drift", sigil: s, local: state.localWane, remote: state.remoteWane });
+      }
+
+      // Dead connection
+      if (state.missedBeats >= 3) {
+        this.onAction({ type: "dead", sigil: s, missedBeats: state.missedBeats });
+      }
+    }
+  }
+
+  /** Get state for inspection (observability) */
+  inspect(): Map<string, DroneState> { return this.states; }
+
+  /** Update local wane — called when wane tracker ticks */
+  setWane(s: string, w: number): void {
+    this.getOrCreate(s).localWane = w;
+  }
+
+  /** Clean up */
+  stop(): void {
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+  }
+}
+
+export type DroneAction =
+  | { type: "beat"; sigil: string; beat: DroneBeat }
+  | { type: "retry"; sigil: string; rid: string; chi: string }
+  | { type: "lost"; sigil: string; rid: string; chi: string }
+  | { type: "drift"; sigil: string; local: number; remote: number }
+  | { type: "dead"; sigil: string; missedBeats: number };
