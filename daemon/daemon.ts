@@ -845,6 +845,9 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
 
       const poolKey = sid;
 
+      // Update model from prompt — session-event may have created with unknown
+      if (msg.modelId) session.modelId = msg.modelId as string;
+
       // Persist turnsSent from plugin — survives daemon/plugin restarts
       if (typeof msg.turnsSent === "number") {
         session.turnsSent = msg.turnsSent;
