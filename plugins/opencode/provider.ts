@@ -2,6 +2,7 @@ import { generateId } from "@ai-sdk/provider-utils";
 import { randomUUID } from "crypto";
 import * as session from "../../lib/session.ts";
 import { loadConfig } from "../../lib/config.ts";
+import { WaneTracker } from "../../lib/hum.ts";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 // Three destinations: plugin log file (always), hum → daemon (when connected), OC debug (when client ready).
@@ -191,15 +192,21 @@ async function awakenHum(): Promise<void> {
             trace("hum.echo", { rid: msg.rid, ok: msg.ok });
             continue;
           }
-          // Breath: daemon sends full state on connect — restore turnsSent
+          // Breath: daemon sends full state on connect — resync stale sessions via wane
           if (msg.chi === "breath") {
-            const sessions = (msg.sessions ?? []) as Array<{ sid: string; turnsSent: number }>;
+            const sessions = (msg.sessions ?? []) as Array<{ sid: string; sigil: string; turnsSent: number; wane: number }>;
+            let synced = 0;
             for (const s of sessions) {
-              if (typeof s.turnsSent === "number" && s.turnsSent >= 0 && !turnsSent.has(s.sid)) {
-                turnsSent.set(s.sid, s.turnsSent);
+              // Only resync if daemon's wane is ahead of ours
+              if (localWane.behind(s.sigil, s.wane)) {
+                if (typeof s.turnsSent === "number" && s.turnsSent >= 0) {
+                  turnsSent.set(s.sid, s.turnsSent);
+                }
+                localWane.set(s.sigil, s.wane);
+                synced++;
               }
             }
-            trace("hum.breath.received", { sessions: sessions.length, restored: sessions.filter(s => s.turnsSent >= 0).length });
+            trace("hum.breath.received", { sessions: sessions.length, synced });
             continue;
           }
           // Pulse: lifecycle events from the sentinel
@@ -460,13 +467,14 @@ function extractText(prompt: LanguageModelV2Prompt, sessionId?: string): string 
 // Two paths: cold start (JSONL export) and gap fill (content injection).
 
 const turnsSent = new Map<string, number>();
+const localWane = new WaneTracker();
 
 /** Reset turn counter after compaction — forces full re-seed on next message */
 export function resetTurnsSent(sid: string): void {
   turnsSent.delete(sid);
 }
 
-// turnsSent restored via breath on hum connect — no filesystem IPC needed
+// turnsSent restored via breath on hum connect — wane guards against stale data
 
 function countHistoryTurns(prompt: LanguageModelV2Prompt): number {
   let lastUserIdx = -1;
