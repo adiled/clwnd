@@ -262,14 +262,12 @@ export function rerhythm(state: DroneState): void {
  */
 export class Drone {
   private states = new Map<string, DroneState>();
-  private timer: ReturnType<typeof setInterval> | null = null;
+  private timers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(
     private side: string,  // "daemon" or "plugin"
     private onAction: (action: DroneAction) => void,
-  ) {
-    this.timer = setInterval(() => this.tick(), 1000);
-  }
+  ) {}
 
   private getOrCreate(s: string): DroneState {
     let state = this.states.get(s);
@@ -277,7 +275,70 @@ export class Drone {
     return state;
   }
 
-  /** Called automatically when a tone is about to be sent */
+  /** Reset the silence timer for a sigil — fires when the hum goes quiet */
+  private resetSilence(s: string): void {
+    const existing = this.timers.get(s);
+    if (existing) clearTimeout(existing);
+    const state = this.getOrCreate(s);
+    this.timers.set(s, setTimeout(() => this.onSilence(s), state.rhythm));
+  }
+
+  /** Silence detected — the hum went quiet for one rhythm interval */
+  private onSilence(s: string): void {
+    const state = this.getOrCreate(s);
+    const now = Date.now();
+
+    // Missed beat detection
+    if (state.lastBeatReceived > 0 && now - state.lastBeatReceived > state.rhythm * 2) {
+      state.missedBeats++;
+      rerhythm(state);
+    }
+
+    // Emit beat — silence is when we speak
+    state.lastBeatSent = now;
+    const beat: DroneBeat = {
+      chi: "drone",
+      sigil: s,
+      wane: state.localWane,
+      assessment: state.assessment,
+      rhythm: state.rhythm,
+      pendingEchoes: [...state.pendingEchoes.keys()],
+      load: {
+        activeSessions: this.states.size,
+        pendingPermissions: state.pendingPermissions,
+        inflightTools: state.inflightTools,
+        tokensBurned: state.tokensBurned,
+      },
+    };
+    this.onAction({ type: "beat", sigil: s, beat });
+
+    // Stale echoes — retry
+    for (const [rid, pending] of state.pendingEchoes) {
+      if (now - pending.time > state.rhythm * 2 && pending.retries < 3) {
+        pending.retries++;
+        this.onAction({ type: "retry", sigil: s, rid, chi: pending.chi });
+      }
+      if (pending.retries >= 3) {
+        state.pendingEchoes.delete(rid);
+        this.onAction({ type: "lost", sigil: s, rid, chi: pending.chi });
+      }
+    }
+
+    // Wane drift
+    if (state.localWane !== state.remoteWane && state.lastBeatReceived > 0) {
+      this.onAction({ type: "drift", sigil: s, local: state.localWane, remote: state.remoteWane });
+    }
+
+    // Dead connection
+    if (state.missedBeats >= 3) {
+      this.onAction({ type: "dead", sigil: s, missedBeats: state.missedBeats });
+    }
+
+    // Re-arm — silence detection is recursive
+    this.resetSilence(s);
+  }
+
+  /** Wired into hum send path — observes outgoing tones */
   sent(tone: Record<string, unknown>): void {
     if (tone.chi === "drone" || tone.chi === "echo") return;
     const s = tone.sigil as string;
@@ -289,18 +350,20 @@ export class Drone {
       });
     }
     rerhythm(state);
+    this.resetSilence(s);
   }
 
-  /** Called automatically when a tone is received */
+  /** Wired into hum receive path — observes incoming tones */
   heard(tone: Record<string, unknown>): void {
     const chi = tone.chi as string;
 
     if (chi === "echo") {
       const echoRid = tone.rid as string;
-      for (const [, state] of this.states) {
+      for (const [s, state] of this.states) {
         if (state.pendingEchoes.has(echoRid)) {
           state.pendingEchoes.delete(echoRid);
           rerhythm(state);
+          this.resetSilence(s);
           break;
         }
       }
@@ -315,11 +378,11 @@ export class Drone {
         state.missedBeats = 0;
         state.remoteWane = (tone.wane as number) ?? state.remoteWane;
         rerhythm(state);
+        this.resetSilence(s);
       }
       return;
     }
 
-    // Any other tone — update activity
     const s = tone.sigil as string;
     if (s) {
       const state = this.getOrCreate(s);
@@ -327,61 +390,28 @@ export class Drone {
         state.inflightTools = 0;
       }
       rerhythm(state);
+      this.resetSilence(s);
     }
   }
 
-  /** Internal tick — fires every 1s, checks all states */
-  private tick(): void {
-    const now = Date.now();
-    for (const [s, state] of this.states) {
-      // Check for missed beats
-      if (state.lastBeatReceived > 0 && now - state.lastBeatReceived > state.rhythm * 2) {
-        state.missedBeats++;
-        rerhythm(state);
-      }
+  /** Wired into Claude CLI stream — observes what the LLM is doing */
+  observed(s: string, event: { type: string; toolName?: string; tokensDelta?: number; text?: string }): void {
+    const state = this.getOrCreate(s);
 
-      // Emit beat if rhythm says so
-      if (now - state.lastBeatSent >= state.rhythm) {
-        state.lastBeatSent = now;
-        const beat: DroneBeat = {
-          chi: "drone",
-          sigil: s,
-          wane: state.localWane,
-          assessment: state.assessment,
-          rhythm: state.rhythm,
-          pendingEchoes: [...state.pendingEchoes.keys()],
-          load: {
-            activeSessions: this.states.size,
-            pendingPermissions: state.pendingPermissions,
-            inflightTools: state.inflightTools,
-            tokensBurned: state.tokensBurned,
-          },
-        };
-        this.onAction({ type: "beat", sigil: s, beat });
-      }
-
-      // Check for stale echoes — retry
-      for (const [rid, pending] of state.pendingEchoes) {
-        if (now - pending.time > state.rhythm * 2 && pending.retries < 3) {
-          pending.retries++;
-          this.onAction({ type: "retry", sigil: s, rid, chi: pending.chi });
-        }
-        if (pending.retries >= 3) {
-          state.pendingEchoes.delete(rid);
-          this.onAction({ type: "lost", sigil: s, rid, chi: pending.chi });
-        }
-      }
-
-      // Check for wane drift
-      if (state.localWane !== state.remoteWane && state.lastBeatReceived > 0) {
-        this.onAction({ type: "drift", sigil: s, local: state.localWane, remote: state.remoteWane });
-      }
-
-      // Dead connection
-      if (state.missedBeats >= 3) {
-        this.onAction({ type: "dead", sigil: s, missedBeats: state.missedBeats });
-      }
+    if (event.type === "tool_start") {
+      state.inflightTools++;
+    } else if (event.type === "tool_end") {
+      state.inflightTools = Math.max(0, state.inflightTools - 1);
+    } else if (event.type === "tokens") {
+      state.tokensBurned += event.tokensDelta ?? 0;
+    } else if (event.type === "permission_ask") {
+      state.pendingPermissions++;
+    } else if (event.type === "permission_resolved") {
+      state.pendingPermissions = Math.max(0, state.pendingPermissions - 1);
     }
+
+    rerhythm(state);
+    this.resetSilence(s);
   }
 
   /** Get state for inspection (observability) */
@@ -394,7 +424,8 @@ export class Drone {
 
   /** Clean up */
   stop(): void {
-    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    for (const timer of this.timers.values()) clearTimeout(timer);
+    this.timers.clear();
   }
 }
 

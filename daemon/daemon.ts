@@ -352,6 +352,7 @@ class ClaudeNest {
       } else if (action === "ask") {
         const askId = requestId;
         trace("permission.hold.created", { id: askId, tool: toolName, path });
+        drone.observed(sigil(poolKey), { type: "permission_ask" });
 
         hum(roost.activeSid ?? "", { chi: "permission-ask", askId, tool: toolName, path, input: msg.input ?? {} });
 
@@ -402,7 +403,10 @@ class ClaudeNest {
       const block = (msg.content_block ?? {}) as Record<string, unknown>;
       if (block.type === "thinking") petal("reasoning_start", { id: msg.index });
       if (block.type === "text") petal("text_start", { id: msg.index });
-      if (block.type === "tool_use") petal("tool_input_start", { toolCallId: block.id as string, toolName: block.name as string });
+      if (block.type === "tool_use") {
+        petal("tool_input_start", { toolCallId: block.id as string, toolName: block.name as string });
+        drone.observed(sigil(poolKey), { type: "tool_start", toolName: block.name as string });
+      }
       return;
     }
 
@@ -417,6 +421,7 @@ class ClaudeNest {
 
     if (msg.type === "content_block_stop") {
       petal("content_block_stop", { blockIdx: msg.index });
+      drone.observed(sigil(poolKey), { type: "tool_end" });
       return;
     }
 
@@ -840,6 +845,9 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         CLWND_PERMIT_HOLD.delete(askId);
         hold.resolve(decision);
         trace("hum.permit.released", { askId, decision });
+        // Drone observes permission resolution — find the session
+        const permitSid = hold.sessionId;
+        if (permitSid) drone.observed(sigil(permitSid), { type: "permission_resolved" });
       }
       break;
     }
