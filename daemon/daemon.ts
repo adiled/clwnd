@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 
 import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
-import { sigil, rid as makeRid, echo, pulse, WaneTracker, type Tone, type Breath, type BreathSession, type Reach } from "../lib/hum.ts";
+import { sigil, rid as makeRid, echo, pulse, isDusk, WaneTracker, type Tone, type Breath, type BreathSession, type Reach } from "../lib/hum.ts";
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
 
@@ -644,6 +644,13 @@ function humPulse(kind: string, sid: string, extra?: Record<string, unknown>): v
 function humHear(clientId: string, msg: Record<string, unknown>): void {
   const chi = msg.chi as string;
   trace("hum.tone.received", { chi, clientId: clientId.slice(0, 8), rid: msg.rid as string });
+
+  // Dusk: discard tones past their expiry
+  if (isDusk(msg)) {
+    trace("hum.tone.dusk", { chi, rid: msg.rid as string, dusk: msg.dusk });
+    humEcho(clientId, msg, false, "past dusk");
+    return;
+  }
 
   // Echo: acknowledge receipt
   if (chi !== "echo" && chi !== "log" && msg.rid) {

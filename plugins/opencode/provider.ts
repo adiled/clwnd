@@ -2,7 +2,7 @@ import { generateId } from "@ai-sdk/provider-utils";
 import { randomUUID } from "crypto";
 import * as session from "../../lib/session.ts";
 import { loadConfig } from "../../lib/config.ts";
-import { WaneTracker } from "../../lib/hum.ts";
+import { WaneTracker, duskIn } from "../../lib/hum.ts";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 // Three destinations: plugin log file (always), hum → daemon (when connected), OC debug (when client ready).
@@ -797,7 +797,7 @@ export class ClwndModel implements LanguageModelV2 {
         session.fromPrompt(seedClaudePath, seedClaudeId, seedHistory, cwd);
         log("seed.written", { sid, claudeId: seedClaudeId, path: seedClaudePath, turns: seedHistory.length });
         // Signal daemon — echo confirms custody
-        hum({ chi: "seeded", sid, claudeSessionId: seedClaudeId, claudeSessionPath: seedClaudePath, cwd });
+        hum({ chi: "seeded", sid, claudeSessionId: seedClaudeId, claudeSessionPath: seedClaudePath, cwd, dusk: duskIn(10_000) });
       }
 
       // +1 because the current turn (being sent now) will be history on the next call
@@ -854,6 +854,7 @@ export class ClwndModel implements LanguageModelV2 {
         content, text, systemPrompt,
         permissions, allowedTools, listenOnly,
         turnsSent: turnsSent.get(sid) ?? -1,
+        dusk: duskIn(30_000),
       });
       promptSent = true;
     }
@@ -889,7 +890,7 @@ export class ClwndModel implements LanguageModelV2 {
           if (!done) {
             // Mid-turn abort — kill the Claude CLI process.
             // Session state preserved — next message respawns via --resume.
-            hum({ chi: "cancel", sid });
+            hum({ chi: "cancel", sid, dusk: duskIn(5_000) });
           }
           wilt();
         });
@@ -915,6 +916,7 @@ export class ClwndModel implements LanguageModelV2 {
             permissions, allowedTools, listenOnly,
             turnsSent: turnsSent.get(sid) ?? -1,
             ...(seedClaudeId ? { seedClaudeId, seedClaudePath } : {}),
+            dusk: duskIn(30_000),
           });
         }
 

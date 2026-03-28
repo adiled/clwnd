@@ -5,6 +5,7 @@ import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { createClwnd, setSharedClient, setLogClient, hum, trace, log, resetTurnsSent } from "./provider.ts";
 import { loadConfig, type ClwndConfig } from "../../lib/config.ts";
+import { duskIn } from "../../lib/hum.ts";
 
 // ─── Small Model Discovery ──────────────────────────────────────────────────
 // Provider config lives in opencode.json (managed by install script).
@@ -89,7 +90,7 @@ export const clwndPlugin: Plugin = async (input) => {
 
           trace("session.compacted", { sid });
           resetTurnsSent(sid);
-          hum({ chi: "cancel", sid });
+          hum({ chi: "cancel", sid, dusk: duskIn(5_000) });
         }
       }
     },
