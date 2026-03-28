@@ -929,6 +929,12 @@ export class ClwndModel implements LanguageModelV2 {
             try { controller.enqueue(part); } catch { done = true; }
             return;
           }
+          // Tool-first response — no text, no context-loss risk. Skip buffering.
+          if (heldPetals.length === 0 && (part as any).type === "tool-input-start") {
+            heldCleared = true;
+            try { controller.enqueue(part); } catch { done = true; }
+            return;
+          }
           // Accumulate text
           if ((part as any).type === "text-delta" && (part as any).delta) {
             heldText += (part as any).delta;
