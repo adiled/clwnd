@@ -1,61 +1,61 @@
 ## Tool Calls
 
-Tool | CC | clwnd | Brokered | OC | Cov | Status
----|---|---|---|---|---|---
-Read | Disallowed | ✓ | — | ✓ | e2e-serve | ❌
-Edit | Disallowed | ✓ | — | ✓ | e2e-serve | ❌
-Write | Disallowed | ✓ | — | ✓ | e2e-serve | ❌
-Bash | Disallowed | ✓ | — | ✓ | e2e-serve | ❌
-Glob | Disallowed | ✓ | — | ✓ | — | 🔇
-Grep | Disallowed | ✓ | — | ✓ | — | 🔇
-WebFetch | Built-in | — | ✓ | ✓ | e2e-serve | ❌
-TodoWrite | Built-in | — | ✓ | ✓ | e2e-serve | ❌
-WebSearch | Built-in | — | ✓ | ✓ | — | 🔇
-Task | Built-in | — | — | ✓ | — | 🔇
-Skill | Built-in | — | — | ✓ | — | 🔇
-TodoRead | Built-in | — | — | ✓ | — | 🔇
-TaskOutput/TaskStop | Built-in | — | — | ✓ | — | 🔇
-CronCreate/Delete/List | Built-in | — | — | — | — | 🔇
+| Tool | CC | clwnd | Brokered | OC | Cov | Status |
+|------|-----|-------|----------|-----|-----|--------|
+| Read | Disallowed | ✓ | — | ✓ | e2e-serve | ✅ Working |
+| Edit | Disallowed | ✓ | — | ✓ | e2e-serve | ✅ Working |
+| Write | Disallowed | ✓ | — | ✓ | e2e-serve | ✅ Working |
+| Bash | Disallowed | ✓ | — | ✓ | e2e-serve | ✅ Working |
+| Glob | Disallowed | ✓ | — | ✓ | — | 🔇 Untested |
+| Grep | Disallowed | ✓ | — | ✓ | — | 🔇 Untested |
+| WebFetch | Built-in | — | ✓ | ✓ | e2e-serve | ✅ Working |
+| WebSearch | Built-in | — | ✓ | ✓ | — | 🔇 Untested |
+| TodoWrite | Built-in | — | ✓ | ✓ | e2e-serve | ✅ Working |
+| Task | Built-in | — | — | ✓ | — | 🔇 Untested |
+| Skill | Built-in | — | — | ✓ | — | 🔇 Untested |
+| TodoRead | Built-in | — | — | ✓ | — | 🔇 Untested |
+| TaskOutput/TaskStop | Built-in | — | — | ✓ | — | 🔇 Untested |
+| CronCreate/Delete/List | Built-in | — | — | ✓ | — | 🔇 Untested |
 
 ## OpenCode Feature Compatibility
 
-Feature | OC | CC | Cov | Status
----|---|---|---|---
-Agent switching | `--agent` | `--agent` | e2e-serve, e2e-human | ❌
-Plan mode | agent type | agent type | e2e-serve | ❌
-Permissions (session) | permission system | `--permission-mode` | e2e-human | 🔇
-Permissions (agent) | agent config | agent config | e2e-serve | ❌
-System prompt | `--prompt` | `--system-prompt` | e2e-serve | ❌
-Session continuity | `--continue` | `--continue` | e2e-serve | ❌
-CWD/directory | `[project]` | working directory | e2e-serve | ❌
-Compaction | `session.compact` | — | e2e-serve | ❌
-Snapshots/Revert | snapshot system | — | e2e-serve | ❌
-Model variants | `--model` | `--model` | e2e-serve | ❌
-File attachments | file API | `--file` | e2e-human | 🔇
-Cost tracking | `stats` | token tracking | e2e-serve | ❌
-Session forking | `--fork` | `--fork-session` | e2e-serve | ❌
-Title generation | automatic | automatic | e2e-serve, e2e-human | ❌
+| Feature | OC | CC | Cov | Status |
+|---------|-----|-----|-----|--------|
+| Agent switching | `--agent` | `--agent` | e2e-serve | ✅ Working |
+| Plan mode | agent permission mode | `--permission-mode plan` | e2e-serve | ✅ Working |
+| Permissions (session) | session permissions | `--permission-mode` | e2e-human | 🔇 Untested |
+| Permissions (agent) | agent permissions | agent definition | e2e-serve | ✅ Working |
+| System prompt | `--prompt` | `--system-prompt` | e2e-serve | ✅ Working |
+| Session continuity | `--continue` | `--continue` | e2e-serve | ⚠️ Partial |
+| CWD/directory | `[project]` | working directory | e2e-serve | ✅ Working |
+| Compaction | `session.compact` | automatic | e2e-serve | ❌ Failing |
+| Snapshots/Revert | snapshot system | — | e2e-serve | ✅ Working |
+| Model variants | `--model` | `--model` | e2e-serve | ✅ Working |
+| File attachments | attachment API | `--file` | e2e-serve, e2e-human | ⚠️ Partial |
+| Cost tracking | `stats` | `--max-budget-usd` | e2e-serve | ✅ Working |
+| Session forking | `--fork` | `--fork-session` | e2e-serve | ✅ Working |
+| Title generation | automatic | automatic | e2e-serve | ✅ Working |
 
 ## Test Summary
 
-Suite | Pass | Fail | Skip | Total | Duration
----|---|---|---|---|---
-e2e-serve | 0 | 41 | 0 | 41 | 10.90s
-e2e-human | 0 | 0 | 7 | 7 | 6.00ms
+| Suite | Pass | Fail | Skip | Total | Duration |
+|-------|------|------|------|-------|----------|
+| e2e-serve | 37 | 4 | 0 | 41 | 1026.92s |
+| e2e-human | 0 | 0 | 7 | 7 | 0.01s |
 
 ## Environment
 
-Component | Version
----|---
-clwnd | v0.10.3 (03d75f0)
-claude | 2.1.86 (Claude Code)
-opencode | 1.3.3
-bun | 1.3.11
+| Component | Version |
+|-----------|---------|
+| clwnd | v0.10.3 (e344ca1) |
+| claude | 2.1.86 |
+| opencode | 1.3.3 |
+| bun | 1.3.11 |
 
 ## Potentially Uncovered
 
 - `agent.cycle` — cycle through available agents
-- `session.list` — list available sessions
+- `session.list` — list all sessions
 - `session.share` — share session data
 
-Last updated: 2026-03-28 14:01 UTC
+Last updated: 2026-03-28 14:22 UTC
