@@ -293,6 +293,7 @@ export class Drone {
     private onAction: (action: DroneAction) => void,
     private evaluate?: DroneEvaluator,
     private swallowThreshold = 0.7,
+    private llmAssess?: (sigil: string, state: DroneState) => void,
   ) {}
 
   private getOrCreate(s: string): DroneState {
@@ -317,7 +318,14 @@ export class Drone {
     // Missed beat detection
     if (state.lastBeatReceived > 0 && now - state.lastBeatReceived > state.rhythm * 2) {
       state.missedBeats++;
-      rerhythm(state);
+    }
+
+    // Reassess on silence — rules first
+    rerhythm(state);
+
+    // LLM assessment on silence — only when non-trivial
+    if (this.llmAssess && state.assessment !== "serene" && state.responseText.length > 0) {
+      this.llmAssess(s, state);
     }
 
     // Emit beat — silence is when we speak

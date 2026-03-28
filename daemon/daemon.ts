@@ -7,6 +7,7 @@ import { fileURLToPath } from "url";
 import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
 import { sigil, rid as makeRid, echo, pulse, isDusk, heuristicSuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type Breath, type BreathSession, type Reach, type DroneAction } from "../lib/hum.ts";
+import { droneThink } from "../lib/drone-llm.ts";
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
 
@@ -574,12 +575,32 @@ const nest = new ClaudeNest(process.env.CLAUDE_CLI_PATH ?? "claude");
 const wane = new WaneTracker();
 
 // Drone: self-governing observer — wired into hum I/O, never called from business logic
-// Evaluator: the neural layer. Called when heuristics flag suspicion.
-// TODO: wire to small model via OC client for probabilistic evaluation
+// Evaluator: the neural layer. Heuristics gate, LLM confirms.
 const droneEvaluator = async (text: string): Promise<number> => {
-  // For now: heuristic confidence. If patterns match, high probability.
-  // Replace with small model call when available.
-  return heuristicSuspicion(text) ? 0.85 : 0.1;
+  // Fast gate: if heuristics don't flag, skip LLM
+  if (!heuristicSuspicion(text)) return 0.1;
+
+  // Slow path: ask the LLM
+  try {
+    const judgment = await droneThink({
+      responseText: text,
+      inflightTools: 0,
+      pendingPermissions: 0,
+      tokensBurned: 0,
+      turnCount: 0,
+      localWane: 0,
+      remoteWane: 0,
+      missedBeats: 0,
+      pendingEchoes: 0,
+      toolNames: [],
+    });
+    trace("drone.llm.judgment", { assessment: judgment.assessment, action: judgment.action, reason: judgment.reason });
+    return judgment.action === "swallow" ? 0.9 : judgment.action === "none" ? 0.2 : 0.6;
+  } catch (e) {
+    trace("drone.llm.failed", { err: String(e) });
+    // Fallback to heuristic confidence
+    return 0.85;
+  }
 };
 
 const drone = new Drone("daemon", (action: DroneAction) => {
@@ -649,7 +670,41 @@ const drone = new Drone("daemon", (action: DroneAction) => {
       }
       break;
   }
-}, droneEvaluator);
+}, droneEvaluator, 0.7, (s, state) => {
+  // LLM assessment on silence — full state evaluation
+  droneThink({
+    responseText: state.responseText,
+    inflightTools: state.inflightTools,
+    pendingPermissions: state.pendingPermissions,
+    tokensBurned: state.tokensBurned,
+    turnCount: 0,
+    localWane: state.localWane,
+    remoteWane: state.remoteWane,
+    missedBeats: state.missedBeats,
+    pendingEchoes: state.pendingEchoes.size,
+    toolNames: [],
+  }).then(judgment => {
+    trace("drone.llm.assess", { sigil: s, assessment: judgment.assessment, action: judgment.action, reason: judgment.reason });
+    // Act on LLM judgment
+    if (judgment.action === "respawn") {
+      for (const [sid, session] of sessions) {
+        if (sigil(sid) === s) { nest.fell(sid, sid); break; }
+      }
+    } else if (judgment.action === "reseed") {
+      for (const [sid, session] of sessions) {
+        if (sigil(sid) === s) { session.needsRespawn = true; saveSessions(sid); break; }
+      }
+    } else if (judgment.action === "swallow") {
+      for (const [sid] of sessions) {
+        if (sigil(sid) === s) {
+          nest.fell(sid, sid);
+          hum(sid, { chi: "drone-retrofit", sid, reason: judgment.reason });
+          break;
+        }
+      }
+    }
+  }).catch(e => trace("drone.llm.assess.failed", { sigil: s, err: String(e) }));
+});
 
 const HUM = SOCK + ".hum";
 
