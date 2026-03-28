@@ -400,6 +400,7 @@ cmd_update() {
   stop_daemon
 
   do_build
+  configure_opencode
 
   echo "[service] re-registering..."
   register_service
