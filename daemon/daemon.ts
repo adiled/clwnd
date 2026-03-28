@@ -787,7 +787,7 @@ function humPulse(kind: string, sid: string, extra?: Record<string, unknown>): v
 
 function humHear(clientId: string, msg: Record<string, unknown>): void {
   const chi = msg.chi as string;
-  trace("hum.tone.received", { chi, clientId: clientId.slice(0, 8), rid: msg.rid as string });
+  if (chi !== "log") trace("hum.tone.received", { chi, clientId: clientId.slice(0, 8), rid: msg.rid as string });
 
   // Drone observes incoming tones
   drone.heard(msg);

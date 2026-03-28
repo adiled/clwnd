@@ -737,7 +737,7 @@ describe("e2e-serve: provider migration (#7)", () => {
   test("cold start: multi-turn after seed (opus) verifies no ghost corruption", async () => {
     skipIfDead();
     const sid = await createSession();
-    const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
+    const freeModel = { providerID: "opencode", modelID: "minimax-m2.5-free" };
     const opusModel = { providerID: "opencode-clwnd", modelID: "claude-opus-4-6" };
 
     await sendMessage(sid, "My code is TIGER. Remember this.", undefined, TIMEOUT, freeModel);
@@ -766,7 +766,7 @@ describe("e2e-serve: provider migration (#7)", () => {
   test("cold start: multi-turn free model history is preserved", async () => {
     skipIfDead();
     const sid = await createSession();
-    const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
+    const freeModel = { providerID: "opencode", modelID: "minimax-m2.5-free" };
 
     // Multiple turns with free model
     await sendMessage(sid, "My dog's name is BISCUIT. Acknowledge.", undefined, TIMEOUT, freeModel);
@@ -798,7 +798,7 @@ describe("e2e-serve: provider migration (#7)", () => {
   test("cold start seeding does not double tokens on subsequent turns", async () => {
     skipIfDead();
     const sid = await createSession();
-    const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
+    const freeModel = { providerID: "opencode", modelID: "minimax-m2.5-free" };
 
     // Establish context with free model
     await sendMessage(sid, "Remember: ALPHA BETA GAMMA.", undefined, TIMEOUT, freeModel);
@@ -826,7 +826,7 @@ describe("e2e-serve: model switch history (#7)", () => {
   test("gap fill: clwnd → free → clwnd retains context from free model turn", async () => {
     skipIfDead();
     const sid = await createSession();
-    const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
+    const freeModel = { providerID: "opencode", modelID: "minimax-m2.5-free" };
 
     // Turn 1: clwnd establishes context
     await sendMessage(sid, "My secret animal is PENGUIN. Acknowledge.");
@@ -843,7 +843,7 @@ describe("e2e-serve: model switch history (#7)", () => {
   test("gap fill does not re-inject on same-provider continuation", async () => {
     skipIfDead();
     const sid = await createSession();
-    const freeModel = { providerID: "opencode", modelID: "gpt-5-nano" };
+    const freeModel = { providerID: "opencode", modelID: "minimax-m2.5-free" };
 
     // clwnd → free → clwnd (gap fill happens here)
     await sendMessage(sid, "Remember DELTA.", undefined, TIMEOUT);

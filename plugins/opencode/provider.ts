@@ -262,7 +262,8 @@ export function hum(msg: Record<string, unknown>): void {
     writeLog("trace", "hum.send.skipped", { chi: msg.chi as string, alive: humAlive, socket: !!humSocket });
     return;
   }
-  if (!msg.rid) msg.rid = makeRid();
+  // Log tones are fire-and-forget — no rid, no echo, no tracking
+  if (msg.chi !== "log" && !msg.rid) msg.rid = makeRid();
   msg.from = "plugin";
   try {
     const data = JSON.stringify(msg) + "\n";
