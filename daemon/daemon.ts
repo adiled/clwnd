@@ -618,7 +618,19 @@ const drone = new Drone("daemon", (action: DroneAction) => {
       }
       break;
     case "dead":
-      trace("drone.dead", { sigil: action.sigil, missedBeats: action.missedBeats });
+      info("drone.dead", { sigil: action.sigil, missedBeats: action.missedBeats });
+      // Dead client — remove from humClients, clean up sigil ownership
+      for (const [clientId, client] of humClients) {
+        if (client.sigils.has(action.sigil)) {
+          client.sigils.delete(action.sigil);
+          if (client.sigils.size === 0) {
+            try { client.socket.end(); } catch {}
+            humClients.delete(clientId);
+            trace("drone.dead.disconnected", { clientId: clientId.slice(0, 8) });
+          }
+          break;
+        }
+      }
       break;
     case "swallow":
       // Context loss detected — the LLM said "I don't remember" or equivalent.
@@ -969,8 +981,26 @@ Bun.serve({
     const url = new URL(req.url);
 
     if (req.method === "GET" && url.pathname === "/status") {
-      return new Response(JSON.stringify({ pid: process.pid, procs: nest.survey(), sessions: sessions.size }), {
-        headers: { "Content-Type": "application/json" },
+      // Drone state — the post-mortem you never need
+      const droneStates: Record<string, unknown> = {};
+      for (const [s, state] of drone.inspect()) {
+        droneStates[s] = {
+          assessment: state.assessment,
+          rhythm: state.rhythm,
+          localWane: state.localWane,
+          remoteWane: state.remoteWane,
+          missedBeats: state.missedBeats,
+          pendingEchoes: state.pendingEchoes.size,
+          inflightTools: state.inflightTools,
+          pendingPermissions: state.pendingPermissions,
+          suspicious: state.suspicious,
+        };
+      }
+      return Response.json({
+        pid: process.pid,
+        procs: nest.survey(),
+        sessions: sessions.size,
+        drone: droneStates,
       });
     }
 
