@@ -7,6 +7,7 @@ export interface ClwndConfig {
   ocCompaction: boolean;
   smallModel: string;
   permissionDusk: number;
+  droned: boolean;
 }
 
 const DEFAULTS: ClwndConfig = {
@@ -15,6 +16,7 @@ const DEFAULTS: ClwndConfig = {
   ocCompaction: false,
   smallModel: "",
   permissionDusk: 60_000,
+  droned: false,
 };
 
 const CONFIG_PATHS = [
@@ -35,6 +37,7 @@ export function loadConfig(): ClwndConfig {
         ocCompaction: raw.ocCompaction ?? DEFAULTS.ocCompaction,
         smallModel: raw.smallModel ?? DEFAULTS.smallModel,
         permissionDusk: raw.permissionDusk ?? DEFAULTS.permissionDusk,
+        droned: raw.droned ?? DEFAULTS.droned,
       };
       return cached;
     } catch {}

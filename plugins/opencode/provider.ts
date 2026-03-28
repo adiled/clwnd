@@ -481,8 +481,9 @@ function extractText(prompt: LanguageModelV2Prompt, sessionId?: string): string 
 const turnsSent = new Map<string, number>();
 const localWane = new WaneTracker();
 
-// Plugin drone — observes hum I/O from the plugin side
-const pluginDrone = new Drone("plugin", (action: DroneAction) => {
+// Plugin drone — observes hum I/O from the plugin side (opt-in via droned:true)
+const DRONED = loadConfig().droned;
+const pluginDrone = DRONED ? new Drone("plugin", (action: DroneAction) => {
   switch (action.type) {
     case "beat":
       // Send drone beat to daemon
@@ -506,7 +507,7 @@ const pluginDrone = new Drone("plugin", (action: DroneAction) => {
       trace("drone.swallow", { reason: action.reason });
       break;
   }
-});
+}) : { sent() {}, heard() {}, observed() {}, setWane() {}, inspect() { return new Map(); }, stop() {} } as unknown as Drone;
 
 /** Reset turn counter after compaction — forces full re-seed on next message */
 export function resetTurnsSent(sid: string): void {
@@ -919,7 +920,7 @@ export class ClwndModel implements LanguageModelV2 {
         // Petals held: buffer early response to detect context loss before user sees it
         const heldPetals: LanguageModelV2StreamPart[] = [];
         let heldText = "";
-        let heldCleared = false; // once cleared, petals flow directly
+        let heldCleared = !DRONED; // drone off = always flow directly
         let heldSuspicious = false;
         const HELD_THRESHOLD = 200; // chars before heuristic check
 

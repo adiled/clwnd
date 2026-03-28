@@ -574,8 +574,9 @@ const HTTP = SOCK + ".http";
 const nest = new ClaudeNest(process.env.CLAUDE_CLI_PATH ?? "claude");
 const wane = new WaneTracker();
 
-// Drone: self-governing observer — wired into hum I/O, never called from business logic
-// Evaluator: the neural layer. Heuristics gate, LLM confirms.
+// Drone: self-governing observer — opt-in via droned:true in clwnd.json
+// When off, the hum is a raw pipe. When on, the sentinel watches everything.
+const DRONED = cfg.droned;
 const droneEvaluator = async (text: string): Promise<number> => {
   // Fast gate: if heuristics don't flag, skip LLM
   if (!heuristicSuspicion(text)) return 0.1;
@@ -603,7 +604,7 @@ const droneEvaluator = async (text: string): Promise<number> => {
   }
 };
 
-const drone = new Drone("daemon", (action: DroneAction) => {
+const drone = DRONED ? new Drone("daemon", (action: DroneAction) => {
   switch (action.type) {
     case "beat":
       // Send drone beat to the sigil's client
@@ -704,7 +705,7 @@ const drone = new Drone("daemon", (action: DroneAction) => {
       }
     }
   }).catch(e => trace("drone.llm.assess.failed", { sigil: s, err: String(e) }));
-});
+}) : { sent() {}, heard() {}, observed() {}, setWane() {}, inspect() { return new Map(); }, stop() {} } as unknown as Drone;
 
 const HUM = SOCK + ".hum";
 
@@ -1313,7 +1314,7 @@ process.on("SIGTERM", () => { nest.silence(); process.exit(0); });
 process.on("uncaughtException",  e => info("process.uncaught", { err: String(e) }));
 process.on("unhandledRejection", e => info("process.unhandled", { err: String(e) }));
 
-info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid, version: CURRENT_VERSION, maxProcs: MAX_PROCS, idleTimeout: IDLE_TIMEOUT, ocCompaction: OC_COMPACTION });
+info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid, version: CURRENT_VERSION, maxProcs: MAX_PROCS, idleTimeout: IDLE_TIMEOUT, ocCompaction: OC_COMPACTION, droned: DRONED });
 
 // ─── Session Reaper ─────────────────────────────────────────────────────────
 // Remove stale sessions that haven't been accessed in a while.

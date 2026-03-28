@@ -45,6 +45,7 @@ Core workflow is operational (more coming). See [compatibility](https://github.c
 | `ocCompaction` | `false` | Let OpenCode handle session compaction |
 | `smallModel` | `""` | Override small model (empty = auto-discover free model) |
 | `permissionDusk` | `60000` | Permission prompt timeout in ms before auto-deny |
+| `droned` | `false` | Enable the drone — LLM-driven session health monitoring + auto-recovery |
 
 **Permissions**
 
