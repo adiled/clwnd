@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 
 import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
+import { sigil, rid as makeRid, echo, pulse, type Tone, type Breath, type BreathSession, type Reach } from "../lib/hum.ts";
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
 
@@ -91,6 +92,7 @@ class ClaudeNest {
         }
         if (evictKey) {
           trace("nest.evicted", { poolKey: evictKey, reason: "maxProcs" });
+          humPulse("roost-evicted", evictKey, { reason: "maxProcs" });
           try { this.roosts.get(evictKey)!.proc.kill(); } catch {}
           this.roosts.delete(evictKey);
           this.idleTimers.delete(evictKey);
@@ -137,6 +139,7 @@ class ClaudeNest {
           const r = this.roosts.get(poolKey);
           if (r && r.listeners.size === 0) {
             trace("nest.idle", { poolKey, pid: r.proc.pid, timeout: IDLE_TIMEOUT });
+            humPulse("roost-idle", poolKey, { pid: r.proc.pid });
             try { r.proc.kill(); } catch {}
             this.roosts.delete(poolKey);
           }
@@ -234,11 +237,13 @@ class ClaudeNest {
     const roost: Roost = { proc, listeners: new Map(), activeSid: null };
     this.roosts.set(poolKey, roost);
     info("nest.awakened", { poolKey, model: modelId, pid: proc.pid, resume: claudeSessionId ?? "none" });
+    humPulse("roost-spawned", poolKey, { pid: proc.pid });
 
     this.readStderr(proc, poolKey);
 
     proc.exited.then(exit => {
       trace("nest.exited", { poolKey, code: exit.exitCode });
+      humPulse("roost-died", poolKey, { pid: proc.pid, reason: `exit:${exit.exitCode}` });
       for (const listener of roost.listeners.values()) {
         try { listener.onThorn(`subprocess exited: code=${exit.exitCode}`); } catch {}
       }
@@ -564,36 +569,77 @@ for (const p of [SOCK, HTTP, HUM]) {
 // One persistent connection per provider instance. Both sides push typed
 // JSON messages (chi = message type). Replaces HTTP request/response dance.
 
-type HumSocket = ReturnType<typeof Bun.connect> extends Promise<infer T> ? T : never;
-const humRoots = new Map<string, { socket: any; sessionId: string | null }>();
+const humClients = new Map<string, Reach>();
 
-function humChorus(msg: Record<string, unknown>): void {
-  trace("hum.chorus.sent", { chi: msg.chi as string, clients: humRoots.size });
-  const line = JSON.stringify(msg) + "\n";
-  for (const [, client] of humRoots) {
-    try { client.socket.write(line); } catch {}
-  }
+function humTo(client: Reach, msg: Record<string, unknown>): void {
+  try { client.socket.write(JSON.stringify(msg) + "\n"); } catch {}
+}
+
+function humAll(msg: Record<string, unknown>): void {
+  trace("hum.all", { chi: msg.chi as string, clients: humClients.size });
+  for (const [, client] of humClients) humTo(client, msg);
 }
 
 function hum(sessionId: string, msg: Record<string, unknown>): void {
-  trace("hum.whisper.sent", { chi: msg.chi as string, sid: sessionId });
-  const line = JSON.stringify(msg) + "\n";
-  for (const [, client] of humRoots) {
-    if (client.sessionId === sessionId || client.sessionId === null) {
-      try { client.socket.write(line); } catch {}
+  const s = sigil(sessionId);
+  if (!msg.rid) msg.rid = makeRid();
+  if (!msg.sigil) msg.sigil = s;
+  if (!msg.sid) msg.sid = sessionId;
+  msg.from = "daemon";
+  trace("hum.tone.sent", { chi: msg.chi as string, sid: sessionId, rid: msg.rid as string });
+  for (const [, client] of humClients) {
+    if (client.sigils.has(s) || client.sigils.size === 0) {
+      humTo(client, msg);
     }
   }
 }
 
-function humReceive(clientId: string, msg: Record<string, unknown>): void {
+function humBreath(client: Reach): void {
+  const sessionList: BreathSession[] = [];
+  for (const [sid, session] of sessions) {
+    const s = sigil(sid);
+    sessionList.push({
+      sigil: s,
+      sid,
+      claudeSessionId: session.claudeSessionId,
+      claudeSessionPath: session.claudeSessionPath,
+      turnsSent: session.turnsSent ?? -1,
+      modelId: session.modelId,
+      cwd: session.cwd,
+      roostAlive: !!nest.roost(sid),
+      roostPid: nest.roost(sid)?.proc.pid,
+    });
+  }
+  const msg: Breath = { chi: "breath", from: "daemon", sessions: sessionList };
+  humTo(client, msg);
+  trace("hum.breath.sent", { clientId: client.clientId.slice(0, 8), sessions: sessionList.length });
+}
+
+function humEcho(clientId: string, tone: Record<string, unknown>, ok = true, error?: string): void {
+  const client = humClients.get(clientId);
+  if (!client) return;
+  humSend(client, { chi: "echo", rid: tone.rid, ok, error });
+}
+
+function humPulse(kind: string, sid: string, extra?: Record<string, unknown>): void {
+  const p = pulse(kind as any, sigil(sid), sid, extra as any);
+  hum(sid, p as unknown as Record<string, unknown>);
+}
+
+function humHear(clientId: string, msg: Record<string, unknown>): void {
   const chi = msg.chi as string;
-  trace("hum.msg.received", { chi, clientId: clientId.slice(0, 8) });
+  trace("hum.tone.received", { chi, clientId: clientId.slice(0, 8), rid: msg.rid as string });
+
+  // Echo: acknowledge receipt
+  if (chi !== "echo" && chi !== "log" && msg.rid) {
+    humEcho(clientId, msg);
+  }
 
   switch (chi) {
     case "prompt": {
       const sid = msg.sid as string;
-      const client = humRoots.get(clientId);
-      if (client) client.sessionId = sid;
+      const client = humClients.get(clientId);
+      if (client) client.sigils.add(sigil(sid));
 
       // Get or create session
       let session = sessions.get(sid);
@@ -655,6 +701,7 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
           }
           saveSessions();
           hum(sid, { chi: "session-ready", sid, claudeSessionId, model, tools, turnsSent: session.turnsSent ?? -1 });
+          humPulse("roost-ready", sid, { pid: nest.roost(poolKey)?.proc.pid });
         },
         onPetal: (() => {
           let batch: string[] = [];
@@ -668,8 +715,9 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
                 const line = batch.join("\n") + "\n";
                 batch = [];
                 pending = false;
-                for (const [, client] of humRoots) {
-                  if (client.sessionId === sid || client.sessionId === null) {
+                const s = sigil(sid);
+                for (const [, client] of humClients) {
+                  if (client.sigils.has(s) || client.sigils.size === 0) {
                     try { client.socket.write(line); } catch {}
                   }
                 }
@@ -778,8 +826,12 @@ import { createServer, type Socket } from "net";
 
 const humServer = createServer((socket: Socket) => {
   const clientId = randomUUID();
-  humRoots.set(clientId, { socket, sessionId: null });
-  info("hum.connected", { clientId: clientId.slice(0, 8), total: humRoots.size });
+  const client: Reach = { clientId, sigils: new Set(), socket };
+  humClients.set(clientId, client);
+  info("hum.connected", { clientId: clientId.slice(0, 8), total: humClients.size });
+
+  // Breath: send full state on connect
+  humBreath(client);
 
   let buf = "";
   socket.on("data", (data) => {
@@ -789,7 +841,7 @@ const humServer = createServer((socket: Socket) => {
     for (const line of lines) {
       if (!line) continue;
       try {
-        humReceive(clientId, JSON.parse(line));
+        humHear(clientId, JSON.parse(line));
       } catch (e) {
         trace("hum.parse.failed", { err: String(e) });
       }
@@ -797,8 +849,8 @@ const humServer = createServer((socket: Socket) => {
   });
 
   socket.on("close", () => {
-    humRoots.delete(clientId);
-    info("hum.disconnected", { clientId: clientId.slice(0, 8), total: humRoots.size });
+    humClients.delete(clientId);
+    info("hum.disconnected", { clientId: clientId.slice(0, 8), total: humClients.size });
   });
 
   socket.on("error", (err) => {
