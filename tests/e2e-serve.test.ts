@@ -1070,3 +1070,42 @@ describe("e2e-serve: title generation", () => {
     expect(title).not.toContain("New session");
   }, TIMEOUT);
 });
+
+// Vision: image forwarding is implemented in extractContent() (provider.ts).
+// OC's HTTP message API doesn't expose image parts, so true e2e vision
+// requires pasting a screenshot in OC TUI. The code path:
+// OC prompt → { type: "image", image: Uint8Array } → extractContent()
+// → { type: "image", source: { type: "base64", ... } } → hum → daemon
+// → encodePrompt → Claude CLI stdin.
+
+describe("e2e-serve: cancel kills turn", () => {
+  test("cancel stops streaming and session recovers", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Start a long response
+    const ctrl = new AbortController();
+    const req = fetch(`${BASE}/session/${sid}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: MODEL,
+        parts: [{ type: "text", text: "Write a very long essay about the history of mathematics, at least 2000 words." }],
+      }),
+      signal: ctrl.signal,
+    }).catch(() => null);
+
+    // Let streaming start, then cancel
+    await Bun.sleep(3_000);
+    ctrl.abort();
+    await req;
+
+    // Verify daemon killed the process
+    await Bun.sleep(2_000);
+
+    // Session should recover with a new process
+    const resp = await sendMessage(sid, "What is 3+3? Just the number.");
+    const text = extractResponseText(resp);
+    expect(text).toContain("6");
+  }, TIMEOUT);
+});

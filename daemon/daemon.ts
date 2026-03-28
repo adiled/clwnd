@@ -18,7 +18,7 @@ interface BloomListener {
 
 // ─── Protocol ────────────────────────────────────────────────────────────────
 
-function encodePrompt(content: Array<{ type: string; text: string }> | string): string {
+function encodePrompt(content: Array<Record<string, unknown>> | string): string {
   const parts = typeof content === "string"
     ? [{ type: "text", text: content }]
     : content;
@@ -78,11 +78,11 @@ class ClaudeNest {
     roost.listeners.set(listener.sessionId, listener);
   }
 
-  murmur(sessionId: string, poolKey: string, content: Array<{ type: string; text: string }> | string): void {
+  murmur(sessionId: string, poolKey: string, content: Array<Record<string, unknown>> | string): void {
     const roost = this.roosts.get(poolKey);
     if (!roost?.proc.stdin) return;
     roost.activeSid = sessionId;
-    const len = typeof content === "string" ? content.length : content.reduce((s, p) => s + (p.text?.length ?? 0), 0);
+    const len = typeof content === "string" ? content.length : content.reduce((s, p) => s + ((p.text as string)?.length ?? 0), 0);
     trace("nest.murmured", { sid: sessionId, poolKey, len, parts: typeof content === "string" ? 1 : content.length });
     roost.proc.stdin.write(encodePrompt(content) + "\n");
   }
@@ -587,8 +587,8 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
       }
 
       // Capture prompt content for deferred murmur
-      const promptContent: Array<{ type: string; text: string }> | string | null =
-        !msg.listenOnly ? (msg.content as Array<{ type: string; text: string }> | undefined) ?? (msg.text as string ?? "") : null;
+      const promptContent: Array<Record<string, unknown>> | string | null =
+        !msg.listenOnly ? (msg.content as Array<Record<string, unknown>> | undefined) ?? (msg.text as string ?? "") : null;
       const isResume = !!(session.claudeSessionId && session.needsRespawn);
 
       const listener: BloomListener = {
@@ -653,6 +653,16 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
           // New session — murmur immediately (system init is unreliable)
           nest.murmur(sid, poolKey, promptContent);
         }
+      }
+      break;
+    }
+
+    case "cancel": {
+      const sid = msg.sid as string;
+      const session = sessions.get(sid);
+      if (session) {
+        trace("nest.cancelled", { sid });
+        nest.fell(sid, sid);
       }
       break;
     }

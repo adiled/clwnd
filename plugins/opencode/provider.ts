@@ -333,7 +333,9 @@ function deriveAllowedTools(sid: string, opts: { tools?: Array<{ name: string }>
 
 const lastReminder = new Map<string, string>();
 
-type ContentPart = { type: string; text: string };
+type ContentPart =
+  | { type: "text"; text: string }
+  | { type: "image"; source: { type: "base64"; media_type: string; data: string } };
 
 function extractContent(prompt: LanguageModelV2Prompt, sessionId?: string): ContentPart[] {
   for (let i = prompt.length - 1; i >= 0; i--) {
@@ -342,8 +344,17 @@ function extractContent(prompt: LanguageModelV2Prompt, sessionId?: string): Cont
       if (typeof m.content === "string") return [{ type: "text", text: m.content }];
       if (Array.isArray(m.content)) {
         const parts: ContentPart[] = [];
-        for (const p of m.content as Array<{ type: string; text?: string }>) {
+        for (const p of m.content as Array<{ type: string; text?: string; image?: Uint8Array | URL; mimeType?: string }>) {
           if (p.type === "text" && p.text) parts.push({ type: "text", text: p.text });
+          if (p.type === "image" && p.image) {
+            const data = p.image instanceof Uint8Array
+              ? Buffer.from(p.image).toString("base64")
+              : p.image.toString();
+            parts.push({
+              type: "image",
+              source: { type: "base64", media_type: p.mimeType ?? "image/png", data },
+            });
+          }
         }
         if (parts.length === 0) continue;
         // Strip repeated system reminders — only send when changed
@@ -374,7 +385,9 @@ function extractContent(prompt: LanguageModelV2Prompt, sessionId?: string): Cont
 
 // Flatten content parts to string — used where a single string is needed
 function extractText(prompt: LanguageModelV2Prompt, sessionId?: string): string {
-  return extractContent(prompt, sessionId).map(p => p.text).join("\n\n");
+  return extractContent(prompt, sessionId)
+    .filter((p): p is { type: "text"; text: string } => p.type === "text")
+    .map(p => p.text).join("\n\n");
 }
 
 // ─── History Seeding (#7) ────────────────────────────────────────────────────
@@ -782,8 +795,9 @@ export class ClwndModel implements LanguageModelV2 {
         }
 
         opts.abortSignal?.addEventListener("abort", () => {
-          // Don't send destroy — the daemon manages session lifecycle.
-          // Sending destroy here would nuke the session map entry needed for --resume.
+          // Signal daemon to kill the Claude CLI process mid-turn.
+          // Session state preserved — next message respawns via --resume.
+          hum({ chi: "cancel", sid });
           wilt();
         });
 
