@@ -321,22 +321,7 @@ export class Drone {
     }
 
     // Emit beat — silence is when we speak
-    state.lastBeatSent = now;
-    const beat: DroneBeat = {
-      chi: "drone",
-      sigil: s,
-      wane: state.localWane,
-      assessment: state.assessment,
-      rhythm: state.rhythm,
-      pendingEchoes: [...state.pendingEchoes.keys()],
-      load: {
-        activeSessions: this.states.size,
-        pendingPermissions: state.pendingPermissions,
-        inflightTools: state.inflightTools,
-        tokensBurned: state.tokensBurned,
-      },
-    };
-    this.onAction({ type: "beat", sigil: s, beat });
+    this.emitBeat(s, state);
 
     // Stale echoes — retry
     for (const [rid, pending] of state.pendingEchoes) {
@@ -466,7 +451,34 @@ export class Drone {
 
   /** Update local wane — called when wane tracker ticks */
   setWane(s: string, w: number): void {
-    this.getOrCreate(s).localWane = w;
+    const state = this.getOrCreate(s);
+    const firstTime = state.lastBeatSent === 0;
+    state.localWane = w;
+    // First beat on connect — don't wait for silence
+    if (firstTime) {
+      rerhythm(state);
+      this.emitBeat(s, state);
+      this.resetSilence(s);
+    }
+  }
+
+  private emitBeat(s: string, state: DroneState): void {
+    state.lastBeatSent = Date.now();
+    const beat: DroneBeat = {
+      chi: "drone",
+      sigil: s,
+      wane: state.localWane,
+      assessment: state.assessment,
+      rhythm: state.rhythm,
+      pendingEchoes: [...state.pendingEchoes.keys()],
+      load: {
+        activeSessions: this.states.size,
+        pendingPermissions: state.pendingPermissions,
+        inflightTools: state.inflightTools,
+        tokensBurned: state.tokensBurned,
+      },
+    };
+    this.onAction({ type: "beat", sigil: s, beat });
   }
 
   /** Clean up */

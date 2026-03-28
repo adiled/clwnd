@@ -984,6 +984,8 @@ Bun.serve({
       // Drone state — the post-mortem you never need
       const droneStates: Record<string, unknown> = {};
       for (const [s, state] of drone.inspect()) {
+        // Only show active drone states
+        if (state.localWane === 0 && state.remoteWane === 0 && state.missedBeats === 0) continue;
         droneStates[s] = {
           assessment: state.assessment,
           rhythm: state.rhythm,
