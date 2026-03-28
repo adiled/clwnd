@@ -845,7 +845,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
 
       const poolKey = sid;
 
-      // Update model from prompt — session-event may have created with unknown
+      // Update model — prompt always carries the current model
       if (msg.modelId) session.modelId = msg.modelId as string;
 
       // Persist turnsSent from plugin — survives daemon/plugin restarts
@@ -993,9 +993,9 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       // The sentinel's ears — track all OC session activity across all providers
       const sid = msg.sid as string;
       const role = msg.role as string;
+      const model = msg.model as string;
       const provider = msg.provider as string;
-      trace("session.event", { sid, event: msg.event, role, provider });
-      // Track turn count from all providers — daemon knows the full picture
+      trace("session.event", { sid, event: msg.event, role, model, provider });
       let session = sessions.get(sid);
       if (!session) {
         session = {
@@ -1003,7 +1003,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           claudeSessionId: null,
           claudeSessionPath: null,
           cwd: process.env.HOME ?? "/",
-          modelId: "unknown",
+          modelId: model ?? "sonnet",
           turnsSent: -1,
         };
         sessions.set(sid, session);
