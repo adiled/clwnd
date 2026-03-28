@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 
 import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
-import { sigil, rid as makeRid, echo, pulse, type Tone, type Breath, type BreathSession, type Reach } from "../lib/hum.ts";
+import { sigil, rid as makeRid, echo, pulse, WaneTracker, type Tone, type Breath, type BreathSession, type Reach } from "../lib/hum.ts";
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
 
@@ -73,7 +73,7 @@ class ClaudeNest {
         roost = undefined;
       }
       session.needsRespawn = false;
-      saveSessions();
+      saveSessions(poolKey);
     }
 
     // Cancel idle timer — session is active again
@@ -524,7 +524,8 @@ function loadSessions(): Map<string, Session> {
   }
 }
 
-function saveSessions(): void {
+function saveSessions(mutatedSid?: string): void {
+  if (mutatedSid) wane.tick(sigil(mutatedSid));
   try {
     mkdirSync(STATE_DIR, { recursive: true });
     const obj: Record<string, Session> = {};
@@ -557,6 +558,7 @@ const HTTP = SOCK + ".http";
 
 
 const nest = new ClaudeNest(process.env.CLAUDE_CLI_PATH ?? "claude");
+const wane = new WaneTracker();
 
 const HUM = SOCK + ".hum";
 
@@ -616,6 +618,7 @@ function humBreath(client: Reach): void {
       claudeSessionId: session.claudeSessionId,
       claudeSessionPath: session.claudeSessionPath,
       turnsSent: session.turnsSent ?? -1,
+      wane: wane.get(s),
       modelId: session.modelId,
       cwd: session.cwd,
       roostAlive: !!nest.roost(sid),
@@ -665,7 +668,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           turnsSent: -1,
         };
         sessions.set(sid, session);
-        saveSessions();
+        saveSessions(sid);
         trace("session.created", { sid, model: session.modelId });
       }
       session.lastAccessed = Date.now();
@@ -685,7 +688,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       // Persist turnsSent from plugin — survives daemon/plugin restarts
       if (typeof msg.turnsSent === "number") {
         session.turnsSent = msg.turnsSent;
-        saveSessions();
+        saveSessions(sid);
       }
 
       // Capture prompt content for deferred murmur
@@ -702,7 +705,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
             try { mkdirSync(dir, { recursive: true }); } catch {}
             session.claudeSessionPath = getSessionPath(session.cwd, claudeSessionId);
           }
-          saveSessions();
+          saveSessions(sid);
           hum(sid, { chi: "session-ready", sid, claudeSessionId, model, tools, turnsSent: session.turnsSent ?? -1 });
           humPulse("roost-ready", sid, { pid: nest.roost(poolKey)?.proc.pid });
         },
@@ -797,7 +800,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       if (session) {
         nest.fell(sid, session.modelId);
         sessions.delete(sid);
-        saveSessions();
+        saveSessions(sid);
         trace("hum.session.cleaned", { sid });
       }
       break;
@@ -814,7 +817,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       if (msg.claudeSessionId) session.claudeSessionId = msg.claudeSessionId as string;
       if (msg.claudeSessionPath) session.claudeSessionPath = msg.claudeSessionPath as string;
       session.needsRespawn = true;
-      saveSessions();
+      saveSessions(sid);
       trace("seed.received", { sid, claudeId: session.claudeSessionId, needsRespawn: true });
       break;
     }
@@ -899,7 +902,7 @@ Bun.serve({
           if (session) {
             nest.fell(body.opencodeSessionId, session.modelId);
             sessions.delete(body.opencodeSessionId);
-            saveSessions();
+            saveSessions(body.opencodeSessionId);
             trace("session.cleaned", { sid: body.opencodeSessionId });
           }
         }
