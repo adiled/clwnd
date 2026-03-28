@@ -77,10 +77,24 @@ export const clwndPlugin: Plugin = async (input) => {
       clwnd: provider,
     },
     event: async ({ event }) => {
-      // OC-handled compaction: opt-in via clwnd.json { "ocCompaction": true }
-      // When off (default), Claude CLI handles its own context management.
-      if (loadConfig().ocCompaction && event.type === "session.compacted") {
-        const sid = (event as any).properties?.sessionID;
+      // The sentinel's ears — hum every session event to the daemon
+      const etype = event.type;
+      const props = (event as any).properties ?? {};
+
+      // Message events — daemon tracks full conversation across all providers
+      if (etype === "message.updated" && props.info) {
+        const sid = props.info.sessionID;
+        const role = props.info.role;
+        const model = props.info.modelID;
+        const provider = props.info.providerID;
+        if (sid && role) {
+          hum({ chi: "session-event", sid, event: etype, role, model, provider });
+        }
+      }
+
+      // OC-handled compaction: opt-in via clwnd.json
+      if (loadConfig().ocCompaction && etype === "session.compacted") {
+        const sid = props.sessionID;
         if (sid) {
           // Deduplicate — multiple plugin instances receive the same event
           const key = `compacted:${sid}`;

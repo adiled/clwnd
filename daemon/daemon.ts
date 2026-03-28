@@ -986,6 +986,29 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       break;
     }
 
+    case "session-event": {
+      // The sentinel's ears — track all OC session activity across all providers
+      const sid = msg.sid as string;
+      const role = msg.role as string;
+      const provider = msg.provider as string;
+      trace("session.event", { sid, event: msg.event, role, provider });
+      // Track turn count from all providers — daemon knows the full picture
+      let session = sessions.get(sid);
+      if (!session) {
+        session = {
+          opencodeSessionId: sid,
+          claudeSessionId: null,
+          claudeSessionPath: null,
+          cwd: process.env.HOME ?? "/",
+          modelId: "unknown",
+          turnsSent: -1,
+        };
+        sessions.set(sid, session);
+      }
+      session.lastAccessed = Date.now();
+      break;
+    }
+
     case "drone":
       // Plugin drone beat — handled by drone.heard() above
       break;

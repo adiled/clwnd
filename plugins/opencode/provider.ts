@@ -817,14 +817,12 @@ export class ClwndModel implements LanguageModelV2 {
     if (!isAuxiliaryCall(opts) && !isBrokeredToolReturn(opts.prompt)) {
       let seedHistory: Array<{ role: string; content: unknown }> | null = null;
 
-      if (sent === -1 && historyTurns > 0) {
+      if (historyTurns > 0 && historyTurns !== sent) {
+        // Always full re-seed — gap fill breaks with multi-model hops
         seedHistory = extractHistoryForExport(opts.prompt);
         if (seedHistory) {
-          trace("seed.export", { sid, turns: historyTurns, promptLen: opts.prompt.length, roles: opts.prompt.map(m => m.role).join(","), seedLen: seedHistory.length });
+          trace("seed.export", { sid, turns: historyTurns, sent, seedLen: seedHistory.length });
         }
-      } else if (sent >= 0 && historyTurns > sent) {
-        seedHistory = extractGapForExport(opts.prompt, sent);
-        if (seedHistory) trace("seed.gap", { sid, from: sent, to: historyTurns });
       }
 
       if (seedHistory) {
