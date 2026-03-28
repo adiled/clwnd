@@ -980,6 +980,10 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       break;
     }
 
+    case "drone":
+      // Plugin drone beat — handled by drone.heard() above
+      break;
+
     default:
       trace("hum.msg.unknown", { chi });
   }

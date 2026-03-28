@@ -348,9 +348,12 @@ export class Drone {
       this.onAction({ type: "drift", sigil: s, local: state.localWane, remote: state.remoteWane });
     }
 
-    // Dead connection
+    // Dead connection — only fire once, then stop monitoring
     if (state.missedBeats >= 3) {
       this.onAction({ type: "dead", sigil: s, missedBeats: state.missedBeats });
+      this.states.delete(s);
+      this.timers.delete(s);
+      return; // don't re-arm
     }
 
     // Re-arm — silence detection is recursive
