@@ -8,6 +8,7 @@ export interface ClwndConfig {
   smallModel: string;
   permissionDusk: number;
   droned: boolean;
+  droneModel: { providerID: string; modelID: string };
 }
 
 const DEFAULTS: ClwndConfig = {
@@ -17,6 +18,7 @@ const DEFAULTS: ClwndConfig = {
   smallModel: "",
   permissionDusk: 60_000,
   droned: false,
+  droneModel: { providerID: "opencode-clwnd", modelID: "claude-haiku-4-5" },
 };
 
 const CONFIG_PATHS = [
@@ -38,6 +40,7 @@ export function loadConfig(): ClwndConfig {
         smallModel: raw.smallModel ?? DEFAULTS.smallModel,
         permissionDusk: raw.permissionDusk ?? DEFAULTS.permissionDusk,
         droned: raw.droned ?? DEFAULTS.droned,
+        droneModel: raw.droneModel ?? DEFAULTS.droneModel,
       };
       return cached;
     } catch {}

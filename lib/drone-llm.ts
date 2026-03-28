@@ -4,6 +4,7 @@
 
 import { TRIAGE_PROMPT, buildTriagePrompt, buildTreatPrompt, type DroneContext, type TriageCategory } from "./drone-prompts.ts";
 import type { Assessment } from "./hum.ts";
+import { loadConfig } from "./config.ts";
 
 export interface DroneJudgment {
   assessment: Assessment;
@@ -21,13 +22,16 @@ const CATEGORY_TO_ASSESSMENT: Record<TriageCategory, Assessment> = {
   "duplicate": "alert",
 };
 
-const MODEL = { providerID: "opencode", modelID: "gpt-5-nano" };
+function droneModel() {
+  const cfg = loadConfig();
+  return cfg.droneModel;
+}
 
 async function ocMessage(base: string, sessionId: string, text: string, timeout = 10000): Promise<string> {
   const resp = await fetch(`${base}/session/${sessionId}/message`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: MODEL, parts: [{ type: "text", text }] }),
+    body: JSON.stringify({ model: droneModel(), parts: [{ type: "text", text }] }),
     signal: AbortSignal.timeout(timeout),
   });
   if (!resp.ok) throw new Error(`drone: message ${resp.status}`);
