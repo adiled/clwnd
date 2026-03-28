@@ -57,7 +57,30 @@ export async function droneThink(
   } catch (e) {
     return { assessment: "serene", action: "none", reason: `evaluation failed: ${e}` };
   } finally {
-    // Clean up the temporary session
-    fetch(`${base}/session/${session.id}`, { method: "DELETE" }).catch(() => {});
+    // Archive thinking then delete — async, don't block
+    (async () => {
+      try {
+        // Export the session's thinking
+        const exportResp = await fetch(`${base}/session/${session.id}/message`);
+        if (exportResp.ok) {
+          const messages = await exportResp.json() as Array<{ info: { role: string }; parts: Array<{ type: string; text?: string }> }>;
+          const thinking = messages
+            .filter(m => m.info.role === "assistant")
+            .flatMap(m => m.parts.filter(p => p.type === "text").map(p => p.text ?? ""))
+            .join("\n");
+          if (thinking) {
+            const stateDir = process.env.XDG_STATE_HOME
+              ? `${process.env.XDG_STATE_HOME}/clwnd`
+              : `${process.env.HOME}/.local/state/clwnd`;
+            const { mkdirSync, appendFileSync } = await import("fs");
+            mkdirSync(`${stateDir}`, { recursive: true });
+            appendFileSync(`${stateDir}/drone-thinking.log`,
+              `${new Date().toISOString()} session=${session.id}\n${thinking}\n---\n`);
+          }
+        }
+      } catch {}
+      // Delete the throwaway session
+      fetch(`${base}/session/${session.id}`, { method: "DELETE" }).catch(() => {});
+    })();
   }
 }
