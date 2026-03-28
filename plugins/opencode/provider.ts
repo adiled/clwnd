@@ -194,6 +194,17 @@ async function awakenHum(): Promise<void> {
             trace("hum.breath.received", { sessions: sessions.length, restored: sessions.filter(s => s.turnsSent >= 0).length });
             continue;
           }
+          // Pulse: lifecycle events from the sentinel
+          if (msg.chi === "pulse") {
+            const kind = msg.kind as string;
+            const sid = msg.sid as string;
+            trace("hum.pulse", { kind, sid });
+            if (kind === "roost-died" || kind === "roost-idle" || kind === "roost-evicted") {
+              // Process gone — clear any pending state for this session
+              // turnsSent preserved (restored via breath on reconnect)
+            }
+            continue;
+          }
           if (humHearer) humHearer(msg);
         } catch {}
       }
