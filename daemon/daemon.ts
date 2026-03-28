@@ -385,7 +385,7 @@ class ClaudeNest {
             hold.resolve("deny");
             trace("permission.hold.timeout", { id: askId });
           }
-        }, 300_000);
+        }, cfg.permissionDusk);
       } else {
         trace("permission.allowed", { requestId, tool: toolName, path });
         roost.proc.stdin?.write(JSON.stringify({
@@ -980,7 +980,7 @@ const mcpServer = Bun.serve({
               trace("permission.hold.timeout", { id: askId });
               resolve("deny");
             }
-          }, 300_000); // 5 min — PreToolUse hook timeout is 600s
+          }, cfg.permissionDusk);
         });
 
         trace("permission.hold.resolved", { id: askId, decision });

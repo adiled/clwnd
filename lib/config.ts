@@ -6,6 +6,7 @@ export interface ClwndConfig {
   idleTimeout: number;
   ocCompaction: boolean;
   smallModel: string;
+  permissionDusk: number;
 }
 
 const DEFAULTS: ClwndConfig = {
@@ -13,6 +14,7 @@ const DEFAULTS: ClwndConfig = {
   idleTimeout: 30000,
   ocCompaction: false,
   smallModel: "",
+  permissionDusk: 60_000,
 };
 
 const CONFIG_PATHS = [
@@ -32,6 +34,7 @@ export function loadConfig(): ClwndConfig {
         idleTimeout: raw.idleTimeout ?? DEFAULTS.idleTimeout,
         ocCompaction: raw.ocCompaction ?? DEFAULTS.ocCompaction,
         smallModel: raw.smallModel ?? DEFAULTS.smallModel,
+        permissionDusk: raw.permissionDusk ?? DEFAULTS.permissionDusk,
       };
       return cached;
     } catch {}

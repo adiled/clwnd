@@ -33,7 +33,8 @@ Core workflow is operational (more coming). See [compatibility](https://github.c
   "maxProcs": 4,
   "idleTimeout": 30000,
   "ocCompaction": false,
-  "smallModel": ""
+  "smallModel": "",
+  "permissionDusk": 60000
 }
 ```
 
@@ -43,6 +44,7 @@ Core workflow is operational (more coming). See [compatibility](https://github.c
 | `idleTimeout` | `30000` | Kill idle process after ms (0 = disabled) |
 | `ocCompaction` | `false` | Let OpenCode handle session compaction |
 | `smallModel` | `""` | Override small model (empty = auto-discover free model) |
+| `permissionDusk` | `60000` | Permission prompt timeout in ms before auto-deny |
 
 **Permissions**
 
