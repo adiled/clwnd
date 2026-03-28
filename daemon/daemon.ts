@@ -604,6 +604,7 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
           claudeSessionPath: null,
           cwd: (msg.cwd as string) ?? "/root",
           modelId: (msg.modelId as string) ?? "sonnet",
+          turnsSent: -1,
         };
         sessions.set(sid, session);
         saveSessions();
@@ -622,6 +623,12 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
       }
 
       const poolKey = sid;
+
+      // Persist turnsSent from plugin — survives daemon/plugin restarts
+      if (typeof msg.turnsSent === "number") {
+        session.turnsSent = msg.turnsSent;
+        saveSessions();
+      }
 
       // History seeding: plugin writes JSONL directly, carries seed info in prompt
       if (msg.seedClaudeId && msg.seedClaudePath) {
@@ -647,7 +654,7 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
             session.claudeSessionPath = getSessionPath(session.cwd, claudeSessionId);
           }
           saveSessions();
-          hum(sid, { chi: "session-ready", sid, claudeSessionId, model, tools });
+          hum(sid, { chi: "session-ready", sid, claudeSessionId, model, tools, turnsSent: session.turnsSent ?? -1 });
         },
         onPetal: (() => {
           let batch: string[] = [];
