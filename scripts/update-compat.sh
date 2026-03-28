@@ -135,7 +135,8 @@ Then a line: \`Last updated: YYYY-MM-DD HH:MM UTC\` using the timestamp provided
 
 ## Rules
 - CRITICAL: Output ONLY the raw markdown. No preamble, no "Here is...", no "I'll generate...", no explanation. Start directly with "## Tool Calls".
-- Derive status ONLY from test results. If a test passes, it works. If it fails, use ❌ status.
+- Status is PER ROW, not global. Read each test name carefully and match it to the specific tool or feature it tests. A passing test for "read produces tool part" means Read is ✅. A failing test for "concurrent sessions" means only concurrent-related rows get ❌. Do NOT spread a failure across unrelated rows.
+- (pass) = ✅, (fail) = ❌, test.skip = 🔇, no matching test = 🔇.
 - For CC Equivalent, use actual CLI flag/command names from the reference, not "Yes"/"No"/"Not applicable".
 - CRITICAL: Test Coverage column must ONLY contain comma-separated suite names from this exact set: \`e2e\`, \`e2e-serve\`, \`e2e-human\`. Nothing else. No test names, no descriptions, no qualifiers. Examples: "smoke, e2e-serve" or "e2e" or "—". Any other format is wrong.
 SYSEOF
