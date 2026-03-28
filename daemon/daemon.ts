@@ -597,6 +597,8 @@ function hum(sessionId: string, msg: Record<string, unknown>): void {
 function humBreath(client: Reach): void {
   const sessionList: BreathSession[] = [];
   for (const [sid, session] of sessions) {
+    // Only sync sessions with meaningful state
+    if ((session.turnsSent ?? -1) < 0 && !session.claudeSessionId) continue;
     const s = sigil(sid);
     sessionList.push({
       sigil: s,
@@ -618,7 +620,7 @@ function humBreath(client: Reach): void {
 function humEcho(clientId: string, tone: Record<string, unknown>, ok = true, error?: string): void {
   const client = humClients.get(clientId);
   if (!client) return;
-  humSend(client, { chi: "echo", rid: tone.rid, ok, error });
+  humTo(client, { chi: "echo", rid: tone.rid, ok, error });
 }
 
 function humPulse(kind: string, sid: string, extra?: Record<string, unknown>): void {

@@ -178,6 +178,11 @@ async function awakenHum(): Promise<void> {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line) as Record<string, unknown>;
+          // Echo: daemon acknowledges receipt of our tone
+          if (msg.chi === "echo") {
+            trace("hum.echo", { rid: msg.rid, ok: msg.ok });
+            continue;
+          }
           // Breath: daemon sends full state on connect — restore turnsSent
           if (msg.chi === "breath") {
             const sessions = (msg.sessions ?? []) as Array<{ sid: string; turnsSent: number }>;
@@ -214,14 +219,21 @@ async function awakenHum(): Promise<void> {
   }
 }
 
+let ridCounter = 0;
+function makeRid(): string {
+  return `p-${Date.now().toString(36)}-${(ridCounter++).toString(36)}`;
+}
+
 export function hum(msg: Record<string, unknown>): void {
   if (!humSocket || !humAlive) {
     writeLog("trace", "hum.send.skipped", { chi: msg.chi as string, alive: humAlive, socket: !!humSocket });
     return;
   }
+  if (!msg.rid) msg.rid = makeRid();
+  msg.from = "plugin";
   try {
     const data = JSON.stringify(msg) + "\n";
-    writeLog("trace", "hum.send", { chi: msg.chi as string, len: data.length });
+    writeLog("trace", "hum.send", { chi: msg.chi as string, rid: msg.rid as string, len: data.length });
     humSocket.write(data);
   } catch (e) {
     writeLog("trace", "hum.send.failed", { err: String(e) });
@@ -867,19 +879,18 @@ export class ClwndModel implements LanguageModelV2 {
 
         petal({ type: "stream-start", warnings } as LanguageModelV2StreamPart);
 
-        // Listen for responses, then send prompt
-        // Prompt was already sent synchronously before the ReadableStream (see below)
+        // Listen for responses — prompt already sent before stream creation
         const humFade = humHear(onHummin);
         if (!promptSent) {
-          // Fallback: send prompt here if it wasn't sent synchronously
+          // Hum was dead during sync send — send now that we've reconnected
           hum({
             chi: "prompt", sid, cwd,
             modelId: self.modelId,
             content, text, systemPrompt,
             permissions, allowedTools, listenOnly,
             turnsSent: turnsSent.get(sid) ?? -1,
+            ...(seedClaudeId ? { seedClaudeId, seedClaudePath } : {}),
           });
-          promptSent = true;
         }
 
         // Out-of-band tool metadata queue — daemon hums meta before Claude CLI streams the result
