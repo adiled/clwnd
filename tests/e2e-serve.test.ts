@@ -930,21 +930,25 @@ describe("e2e-serve: compaction", () => {
     skipIfDead();
     const sid = await createSession();
 
-    // Establish context
+    // Establish context across multiple turns
     await sendMessage(sid, "My secret word is FLAMINGO. Acknowledge.");
+    await sendMessage(sid, "My lucky number is 42. Acknowledge.");
 
     // Trigger compaction via command endpoint
     const compactResp = await api(`/session/${sid}/command`, {
       method: "POST",
       body: JSON.stringify({ command: "session.compact", arguments: "" }),
     });
-    // Compaction should not error
     expect(compactResp).toBeDefined();
 
-    // Context should survive compaction
-    const resp = await sendMessage(sid, "What is my secret word?");
+    // Wait for compaction to settle
+    await Bun.sleep(3_000);
+
+    // Context should survive compaction — Claude CLI process respawns with re-seeded JSONL
+    const resp = await sendMessage(sid, "What is my secret word and lucky number?");
     const text = extractResponseText(resp).toLowerCase();
     expect(text).toContain("flamingo");
+    expect(text).toContain("42");
   }, TIMEOUT);
 });
 

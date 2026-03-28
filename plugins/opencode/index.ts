@@ -3,7 +3,7 @@ import { tool } from "@opencode-ai/plugin";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
-import { createClwnd, setSharedClient, setLogClient, hum, trace, log } from "./provider.ts";
+import { createClwnd, setSharedClient, setLogClient, hum, trace, log, resetTurnsSent } from "./provider.ts";
 
 // ─── Small Model Discovery ──────────────────────────────────────────────────
 // Provider config lives in opencode.json (managed by install script).
@@ -64,6 +64,18 @@ export const clwndPlugin: Plugin = async (input) => {
   return {
     models: {
       clwnd: provider,
+    },
+    event: async ({ event }) => {
+      if (event.type === "session.compacted") {
+        const sid = (event as any).properties?.sessionID;
+        if (sid) {
+          trace("session.compacted", { sid });
+          // Reset turn counter so next message does a full re-seed from compacted prompt
+          resetTurnsSent(sid);
+          // Kill Claude CLI process — respawn will load re-seeded JSONL
+          hum({ chi: "cancel", sid });
+        }
+      }
     },
     "chat.headers": async (ctx, output) => {
       output.headers["x-clwnd-agent"] = typeof ctx.agent === "string"

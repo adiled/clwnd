@@ -395,6 +395,11 @@ function extractText(prompt: LanguageModelV2Prompt, sessionId?: string): string 
 
 const turnsSent = new Map<string, number>();
 
+/** Reset turn counter after compaction — forces full re-seed on next message */
+export function resetTurnsSent(sid: string): void {
+  turnsSent.delete(sid);
+}
+
 function countHistoryTurns(prompt: LanguageModelV2Prompt): number {
   let lastUserIdx = -1;
   for (let i = prompt.length - 1; i >= 0; i--) {
