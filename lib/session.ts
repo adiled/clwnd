@@ -215,7 +215,9 @@ export function fromPrompt(
             try { input = typeof p.input === "string" ? JSON.parse(p.input as string) : p.input; } catch {}
             content.push({ type: "tool_use", id: p.toolCallId, name: p.toolName, input });
           } else if (p.type === "reasoning" && p.text) {
-            content.push({ type: "thinking", thinking: p.text });
+            // Skip thinking blocks — they require a cryptographic signature
+            // from the original API response which we can't forge.
+            continue;
           }
         }
       }
