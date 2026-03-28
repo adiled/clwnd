@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 
 import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
-import { sigil, rid as makeRid, echo, pulse, isDusk, WaneTracker, Drone, type Tone, type DroneBeat, type Breath, type BreathSession, type Reach, type DroneAction } from "../lib/hum.ts";
+import { sigil, rid as makeRid, echo, pulse, isDusk, heuristicSuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type Breath, type BreathSession, type Reach, type DroneAction } from "../lib/hum.ts";
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
 
@@ -414,7 +414,10 @@ class ClaudeNest {
       this.streamedTurn = true;
       const delta = (msg.delta ?? {}) as Record<string, unknown>;
       if (delta.type === "thinking_delta") petal("reasoning_delta", { delta: delta.thinking as string });
-      if (delta.type === "text_delta") petal("text_delta", { delta: delta.text as string });
+      if (delta.type === "text_delta") {
+        petal("text_delta", { delta: delta.text as string });
+        drone.observed(sigil(poolKey), { type: "text_delta", text: delta.text as string });
+      }
       if (delta.type === "input_json_delta") petal("tool_input_delta", { partialJson: delta.partial_json as string });
       return;
     }
@@ -451,6 +454,7 @@ class ClaudeNest {
 
     if (msg.type === "result") {
       this.streamedTurn = false;
+      drone.observed(sigil(poolKey), { type: "turn_end" });
       if (msg.subtype === "error_during_execution" || msg.is_error) {
         trace("stream.result.error", { raw: JSON.stringify(msg).slice(0, 500) });
       }
@@ -570,6 +574,14 @@ const nest = new ClaudeNest(process.env.CLAUDE_CLI_PATH ?? "claude");
 const wane = new WaneTracker();
 
 // Drone: self-governing observer — wired into hum I/O, never called from business logic
+// Evaluator: the neural layer. Called when heuristics flag suspicion.
+// TODO: wire to small model via OC client for probabilistic evaluation
+const droneEvaluator = async (text: string): Promise<number> => {
+  // For now: heuristic confidence. If patterns match, high probability.
+  // Replace with small model call when available.
+  return heuristicSuspicion(text) ? 0.85 : 0.1;
+};
+
 const drone = new Drone("daemon", (action: DroneAction) => {
   switch (action.type) {
     case "beat":
@@ -608,8 +620,24 @@ const drone = new Drone("daemon", (action: DroneAction) => {
     case "dead":
       trace("drone.dead", { sigil: action.sigil, missedBeats: action.missedBeats });
       break;
+    case "swallow":
+      // Context loss detected — the LLM said "I don't remember" or equivalent.
+      // Kill process, re-seed, re-murmur. User never sees the broken response.
+      info("drone.swallow", { sigil: action.sigil, reason: action.reason });
+      // Find the session by sigil and trigger retrofit
+      for (const [sid, session] of sessions) {
+        if (sigil(sid) === action.sigil) {
+          nest.fell(sid, sid);
+          session.needsRespawn = true;
+          saveSessions(sid);
+          // Signal plugin to retry — the next prompt will re-seed and respawn
+          hum(sid, { chi: "drone-retrofit", sid, reason: action.reason });
+          break;
+        }
+      }
+      break;
   }
-});
+}, droneEvaluator);
 
 const HUM = SOCK + ".hum";
 

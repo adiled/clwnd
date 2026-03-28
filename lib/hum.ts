@@ -188,6 +188,9 @@ export interface DroneState {
   inflightTools: number;
   pendingPermissions: number;
   tokensBurned: number;
+  // Response accumulation — drone reads what the LLM says
+  responseText: string;
+  suspicious: boolean;         // heuristic engine flagged this response
 }
 
 export interface DroneBeat {
@@ -219,7 +222,27 @@ export function createDroneState(s: string): DroneState {
     inflightTools: 0,
     pendingPermissions: 0,
     tokensBurned: 0,
+    responseText: "",
+    suspicious: false,
   };
+}
+
+// ─── Heuristic Engine ────────────────────────────────────────────────────
+// Fast, deterministic first gate. Flags suspicion — doesn't decide.
+
+const CONTEXT_LOSS_PATTERNS = [
+  /\bi don'?t (have|see|recall|remember) (any )?(previous|prior|earlier|context|history|conversation)/i,
+  /\bno (previous|prior) (context|history|conversation|messages?)/i,
+  /\b(new|fresh|blank) (session|conversation|chat)\b/i,
+  /\bthere'?s nothing (before|prior|earlier)/i,
+  /\byour (first|very first) message/i,
+  /\bno (history|context) (available|found|stored|present)/i,
+  /\bI (can'?t|cannot) (access|see|view|read) (any )?(previous|prior|earlier)/i,
+  /\bthis (is|appears to be) (a |the )?(start|beginning) of (our|a|the) conversation/i,
+];
+
+export function heuristicSuspicion(text: string): boolean {
+  return CONTEXT_LOSS_PATTERNS.some(p => p.test(text));
 }
 
 /** Derive assessment from observable state — no external calls */
@@ -263,10 +286,13 @@ export function rerhythm(state: DroneState): void {
 export class Drone {
   private states = new Map<string, DroneState>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private evaluating = new Set<string>(); // sigils currently being evaluated
 
   constructor(
     private side: string,  // "daemon" or "plugin"
     private onAction: (action: DroneAction) => void,
+    private evaluate?: DroneEvaluator,
+    private swallowThreshold = 0.7,
   ) {}
 
   private getOrCreate(s: string): DroneState {
@@ -408,6 +434,27 @@ export class Drone {
       state.pendingPermissions++;
     } else if (event.type === "permission_resolved") {
       state.pendingPermissions = Math.max(0, state.pendingPermissions - 1);
+    } else if (event.type === "text_delta" && event.text) {
+      // Accumulate response — the drone reads what the LLM says
+      state.responseText += event.text;
+      // Heuristic engine: fast check on accumulated text
+      if (!state.suspicious && state.responseText.length > 20) {
+        state.suspicious = heuristicSuspicion(state.responseText);
+      }
+    } else if (event.type === "turn_end") {
+      // Turn complete — evaluate if suspicious, then reset
+      if (state.suspicious && this.evaluate && !this.evaluating.has(s)) {
+        this.evaluating.add(s);
+        const text = state.responseText;
+        this.evaluate(text).then(probability => {
+          this.evaluating.delete(s);
+          if (probability >= this.swallowThreshold) {
+            this.onAction({ type: "swallow", sigil: s, reason: `context loss probability ${probability.toFixed(2)}`, text });
+          }
+        }).catch(() => { this.evaluating.delete(s); });
+      }
+      state.responseText = "";
+      state.suspicious = false;
     }
 
     rerhythm(state);
@@ -434,4 +481,8 @@ export type DroneAction =
   | { type: "retry"; sigil: string; rid: string; chi: string }
   | { type: "lost"; sigil: string; rid: string; chi: string }
   | { type: "drift"; sigil: string; local: number; remote: number }
-  | { type: "dead"; sigil: string; missedBeats: number };
+  | { type: "dead"; sigil: string; missedBeats: number }
+  | { type: "swallow"; sigil: string; reason: string; text: string };
+
+/** Neural evaluation callback — injected at creation, called when heuristics flag suspicion */
+export type DroneEvaluator = (text: string) => Promise<number>; // returns probability 0-1
