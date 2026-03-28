@@ -346,23 +346,46 @@ function extractContent(prompt: LanguageModelV2Prompt, sessionId?: string): Cont
       if (typeof m.content === "string") return [{ type: "text", text: m.content }];
       if (Array.isArray(m.content)) {
         const parts: ContentPart[] = [];
-        for (const p of m.content as Array<{ type: string; text?: string; image?: Uint8Array | URL; mimeType?: string }>) {
+        for (const p of m.content as Array<{ type: string; text?: string; image?: Uint8Array | URL; mimeType?: string; data?: Uint8Array | string | URL; mediaType?: string; url?: string }>) {
           if (p.type === "text" && p.text) parts.push({ type: "text", text: p.text });
+          // V1 ImagePart: { type: "image", image: Uint8Array | URL, mimeType }
           if (p.type === "image" && p.image) {
-            const data = p.image instanceof Uint8Array
+            const b64 = p.image instanceof Uint8Array
               ? Buffer.from(p.image).toString("base64")
               : p.image.toString();
             parts.push({
               type: "image",
-              source: { type: "base64", media_type: p.mimeType ?? "image/png", data },
+              source: { type: "base64", media_type: p.mimeType ?? "image/png", data: b64 },
             });
+          }
+          // V2 FilePart: { type: "file", data: Uint8Array | string | URL, mediaType }
+          // Also handles OC's format: { type: "file", url: "data:...", mediaType }
+          if (p.type === "file" && (p.mediaType ?? "").startsWith("image/")) {
+            let b64: string | undefined;
+            const raw = p.data ?? p.url;
+            if (raw instanceof Uint8Array) {
+              b64 = Buffer.from(raw).toString("base64");
+            } else if (typeof raw === "string") {
+              const match = raw.match(/^data:[^;]+;base64,(.+)/);
+              b64 = match ? match[1] : raw;
+            } else if (raw instanceof URL) {
+              const match = raw.toString().match(/^data:[^;]+;base64,(.+)/);
+              b64 = match ? match[1] : undefined;
+            }
+            if (b64) {
+              parts.push({
+                type: "image",
+                source: { type: "base64", media_type: p.mediaType ?? "image/png", data: b64 },
+              });
+            }
           }
         }
         if (parts.length === 0) continue;
         // Strip repeated system reminders — only send when changed
         if (sessionId) {
           for (let j = parts.length - 1; j >= 0; j--) {
-            const reminder = parts[j].text.match(/<system-reminder>[\s\S]*?<\/system-reminder>/)?.[0];
+            if (parts[j].type !== "text") continue;
+            const reminder = (parts[j] as { text: string }).text.match(/<system-reminder>[\s\S]*?<\/system-reminder>/)?.[0];
             if (reminder) {
               const prev = lastReminder.get(sessionId);
               if (prev === reminder) {
@@ -542,7 +565,9 @@ export class ClwndModel implements LanguageModelV2 {
   readonly specificationVersion = "v2";
   readonly modelId: string;
   readonly provider = "clwnd";
-  readonly supportedUrls: Record<string, RegExp[]> = {};
+  readonly supportedUrls: Record<string, RegExp[]> = {
+    "image/*": [],  // accept all image types (data URLs handled inline)
+  };
 
   constructor(
     modelId: string,
@@ -678,6 +703,13 @@ export class ClwndModel implements LanguageModelV2 {
     rawCall: { raw: unknown; rawHeaders: unknown };
     warnings: LanguageModelV2CallWarning[];
   }> {
+    // Debug: log prompt content types
+    for (const m of opts.prompt) {
+      if (m.role === "user" && Array.isArray(m.content)) {
+        for (const p of m.content) {
+        }
+      }
+    }
     // Auxiliary call (title gen, compaction) — reject gracefully unless ocCompaction is on.
     // When ocCompaction is enabled, compaction calls come through us — let them proceed.
     if (isAuxiliaryCall(opts) && !loadConfig().ocCompaction) {

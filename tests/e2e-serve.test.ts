@@ -1146,12 +1146,37 @@ describe("e2e-serve: title generation", () => {
   }, TIMEOUT);
 });
 
-// Vision: image forwarding is implemented in extractContent() (provider.ts).
-// OC's HTTP message API doesn't expose image parts, so true e2e vision
-// requires pasting a screenshot in OC TUI. The code path:
-// OC prompt → { type: "image", image: Uint8Array } → extractContent()
-// → { type: "image", source: { type: "base64", ... } } → hum → daemon
-// → encodePrompt → Claude CLI stdin.
+describe("e2e-serve: vision", () => {
+  test("48x48 red image is identified via OC message API", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Read 48x48 red PNG fixture as data URL
+    const pngPath = join(import.meta.dir, "fixtures", "red-48x48.png");
+    const pngData = readFileSync(pngPath);
+    const dataUrl = `data:image/png;base64,${pngData.toString("base64")}`;
+
+    // Send image as FilePart via OC message API
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 60_000);
+    const r = await fetch(`${BASE}/session/${sid}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: MODEL,
+        parts: [
+          { type: "file", mime: "image/png", url: dataUrl },
+          { type: "text", text: "What solid color is this image? Just say the single color word." },
+        ],
+      }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    const resp = await r.json() as any;
+    const text = extractResponseText(resp).toLowerCase();
+    expect(text).toContain("red");
+  }, TIMEOUT);
+});
 
 describe("e2e-serve: cancel kills turn", () => {
   test("cancel stops streaming and session recovers", async () => {
