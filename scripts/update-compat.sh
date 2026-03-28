@@ -12,6 +12,9 @@ for f in tests/e2e-serve.test.ts tests/e2e-human.test.ts; do
   cp "$f" "$CLWND_SRC/$f"
   chown "$CLWND_USER:$CLWND_USER" "$CLWND_SRC/$f"
 done
+mkdir -p "$CLWND_SRC/tests/fixtures"
+cp tests/fixtures/* "$CLWND_SRC/tests/fixtures/" 2>/dev/null
+chown -R "$CLWND_USER:$CLWND_USER" "$CLWND_SRC/tests/fixtures" 2>/dev/null
 
 # ─── Run all test suites as clwnd user ───────────────────────────────────────
 
@@ -160,6 +163,10 @@ echo "Generating compatibility index..."
 SYSTEM_PROMPT=$(cat "$PROMPT_DIR/system.txt")
 USER_PROMPT=$(cat "$PROMPT_DIR/user.txt")
 BODY=$(claude -p --model claude-sonnet-4-5 --output-format text --system-prompt "$SYSTEM_PROMPT" "$USER_PROMPT")
+
+REPORT_FILE="$(dirname "$0")/../reports/compat-v${CLWND_VERSION}.md"
+echo "$BODY" > "$REPORT_FILE"
+echo "Saved report to $REPORT_FILE"
 
 echo "Updating issue #8..."
 gh issue edit 8 --repo adiled/clwnd --body "$BODY"

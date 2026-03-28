@@ -7,4 +7,5 @@ bun.lock
 !README.md
 !HUMAN2HUMAN.md
 !OC_WORKSPACE_DISCOVERY.md
+!reports/*.md
 dev
