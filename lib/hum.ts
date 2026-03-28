@@ -35,6 +35,8 @@ export interface Tone {
   to?: string;           // recipient identity (omit = broadcast to session)
   sigil?: string;        // session pairing hash
   sid?: string;          // OC session id (legacy compat, derived from sigil)
+  wane?: number;         // sender's wane for this sigil at send time
+  dusk?: number;         // absolute timestamp — tone expires after this
   [key: string]: unknown; // payload fields
 }
 
@@ -66,6 +68,7 @@ export interface BreathSession {
   claudeSessionId: string | null;
   claudeSessionPath: string | null;
   turnsSent: number;
+  wane: number;
   modelId: string;
   cwd: string;
   roostAlive: boolean;
@@ -100,6 +103,49 @@ export interface Pulse {
 
 export function pulse(kind: PulseKind, sigil: string, sid: string, extra?: Partial<Pulse>): Pulse {
   return { chi: "pulse", kind, sigil, sid, rid: rid(), ...extra };
+}
+
+// ─── Wane ──────────────────────────────────────────────────────────────────
+// Drift detection. Monotonic counter per sigil. Incremented on every state
+// mutation. Both sides track their own wane. When wanes diverge, drift is
+// visible — the stale side resyncs.
+
+export class WaneTracker {
+  private counters = new Map<string, number>();
+
+  /** Get current wane for a sigil */
+  get(s: string): number {
+    return this.counters.get(s) ?? 0;
+  }
+
+  /** Increment wane — call on every state mutation */
+  tick(s: string): number {
+    const next = (this.counters.get(s) ?? 0) + 1;
+    this.counters.set(s, next);
+    return next;
+  }
+
+  /** Set wane to a known value (from breath or persistence) */
+  set(s: string, value: number): void {
+    this.counters.set(s, value);
+  }
+
+  /** Check if remote wane is ahead of local — drift detected */
+  behind(s: string, remote: number): boolean {
+    return remote > this.get(s);
+  }
+}
+
+// ─── Dusk ──────────────────────────────────────────────────────────────────
+// Temporal value. A tone's dusk is when its value expires. Past dusk,
+// the tone is dead on arrival — discard, don't process.
+
+export function duskIn(ms: number): number {
+  return Date.now() + ms;
+}
+
+export function isDusk(tone: { dusk?: number }): boolean {
+  return typeof tone.dusk === "number" && Date.now() > tone.dusk;
 }
 
 // ─── Reach ─────────────────────────────────────────────────────────────────
