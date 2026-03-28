@@ -209,10 +209,6 @@ async function awakenHum(): Promise<void> {
               }
             }
             trace("hum.breath.received", { sessions: sessions.length, synced });
-            // First beat on connect — report wane immediately for short-lived sessions
-            for (const s of sessions) {
-              pluginDrone.setWane(s.sigil, localWane.get(s.sigil));
-            }
             continue;
           }
           // Pulse: lifecycle events from the sentinel
