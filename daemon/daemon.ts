@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 
 import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
-import { sigil, rid as makeRid, echo, pulse, isDusk, WaneTracker, type Tone, type Breath, type BreathSession, type Reach } from "../lib/hum.ts";
+import { sigil, rid as makeRid, echo, pulse, isDusk, WaneTracker, Drone, type Tone, type DroneBeat, type Breath, type BreathSession, type Reach, type DroneAction } from "../lib/hum.ts";
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
 
@@ -525,7 +525,11 @@ function loadSessions(): Map<string, Session> {
 }
 
 function saveSessions(mutatedSid?: string): void {
-  if (mutatedSid) wane.tick(sigil(mutatedSid));
+  if (mutatedSid) {
+    const s = sigil(mutatedSid);
+    const w = wane.tick(s);
+    drone.setWane(s, w);
+  }
   try {
     mkdirSync(STATE_DIR, { recursive: true });
     const obj: Record<string, Session> = {};
@@ -559,6 +563,48 @@ const HTTP = SOCK + ".http";
 
 const nest = new ClaudeNest(process.env.CLAUDE_CLI_PATH ?? "claude");
 const wane = new WaneTracker();
+
+// Drone: self-governing observer — wired into hum I/O, never called from business logic
+const drone = new Drone("daemon", (action: DroneAction) => {
+  switch (action.type) {
+    case "beat":
+      // Send drone beat to the sigil's client
+      for (const [, client] of humClients) {
+        if (client.sigils.has(action.sigil) || client.sigils.size === 0) {
+          humTo(client, action.beat as unknown as Record<string, unknown>);
+          break;
+        }
+      }
+      break;
+    case "retry":
+      trace("drone.retry", { sigil: action.sigil, rid: action.rid, chi: action.chi });
+      // Retry is handled by re-acking — the original tone was already processed,
+      // the echo was lost. Re-send echo.
+      for (const [, client] of humClients) {
+        if (client.sigils.has(action.sigil)) {
+          humTo(client, { chi: "echo", rid: action.rid, ok: true, retried: true });
+          break;
+        }
+      }
+      break;
+    case "lost":
+      trace("drone.lost", { sigil: action.sigil, rid: action.rid, chi: action.chi });
+      break;
+    case "drift":
+      trace("drone.drift", { sigil: action.sigil, local: action.local, remote: action.remote });
+      // Trigger breath resync to the drifted client
+      for (const [, client] of humClients) {
+        if (client.sigils.has(action.sigil)) {
+          humBreath(client);
+          break;
+        }
+      }
+      break;
+    case "dead":
+      trace("drone.dead", { sigil: action.sigil, missedBeats: action.missedBeats });
+      break;
+  }
+});
 
 const HUM = SOCK + ".hum";
 
@@ -604,6 +650,8 @@ function hum(sessionId: string, msg: Record<string, unknown>): void {
       if (client.sigils.size === 0) humTo(client, msg);
     }
   }
+  // Drone observes outgoing tones
+  drone.sent(msg);
 }
 
 function humBreath(client: Reach): void {
@@ -644,6 +692,9 @@ function humPulse(kind: string, sid: string, extra?: Record<string, unknown>): v
 function humHear(clientId: string, msg: Record<string, unknown>): void {
   const chi = msg.chi as string;
   trace("hum.tone.received", { chi, clientId: clientId.slice(0, 8), rid: msg.rid as string });
+
+  // Drone observes incoming tones
+  drone.heard(msg);
 
   // Dusk: discard tones past their expiry
   if (isDusk(msg)) {
