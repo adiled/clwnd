@@ -1259,3 +1259,43 @@ describe("e2e-serve: resource governance", () => {
     expect(text).toContain("10");
   }, 120_000);
 });
+
+describe("e2e-serve: drone swallow + retrofit", () => {
+  test("drone catches context loss, swallows, retries — user gets correct response", async () => {
+    skipIfDead();
+    if (!seedSessionId) throw new Error("seed session not imported");
+
+    // Fork the seed session (6 turns about clwnd)
+    const sid = await forkSeedSession();
+
+    // Send one clwnd message to establish a Claude CLI process + JSONL
+    await sendMessage(sid, "What is the poetic name for the socket? One word.");
+
+    // Get the JSONL path and corrupt it — delete the file so --resume fails
+    const state = await getSessionState(sid);
+    if (state?.claudeSessionPath) {
+      const { unlinkSync } = await import("fs");
+      try { unlinkSync(state.claudeSessionPath); } catch {}
+    }
+
+    // Kill the process — next message will respawn with broken seed
+    try {
+      await fetch("http://localhost/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }),
+        unix: DAEMON_SOCK,
+      } as RequestInit);
+    } catch {}
+    await Bun.sleep(2_000);
+
+    // Send message — Claude CLI has no JSONL, will lose context.
+    // Drone should catch the context-loss response, swallow it,
+    // re-seed from OC's prompt, and retry. User gets the real answer.
+    const resp = await sendMessage(sid, "What is the poetic name for the socket? One word.", undefined, 60_000);
+    const text = extractResponseText(resp).toLowerCase();
+
+    // The drone should have re-seeded and retried — response should have context
+    expect(text).toContain("hum");
+  }, TIMEOUT);
+});
