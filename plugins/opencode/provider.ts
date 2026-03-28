@@ -2,7 +2,7 @@ import { generateId } from "@ai-sdk/provider-utils";
 import { randomUUID } from "crypto";
 import * as session from "../../lib/session.ts";
 import { loadConfig } from "../../lib/config.ts";
-import { sigil as makeSigil, WaneTracker, Drone, duskIn, type DroneAction } from "../../lib/hum.ts";
+import { sigil as makeSigil, heuristicSuspicion, WaneTracker, Drone, duskIn, type DroneAction } from "../../lib/hum.ts";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 // Three destinations: plugin log file (always), hum → daemon (when connected), OC debug (when client ready).
@@ -912,6 +912,57 @@ export class ClwndModel implements LanguageModelV2 {
           buds.length = 0;
         }
 
+        // Petals held: buffer early response to detect context loss before user sees it
+        const heldPetals: LanguageModelV2StreamPart[] = [];
+        let heldText = "";
+        let heldCleared = false; // once cleared, petals flow directly
+        let heldSuspicious = false;
+        const HELD_THRESHOLD = 200; // chars before heuristic check
+
+        function petalOrHold(part: LanguageModelV2StreamPart) {
+          if (done) return;
+          if (heldCleared) {
+            try { controller.enqueue(part); } catch { done = true; }
+            return;
+          }
+          // Accumulate text
+          if ((part as any).type === "text-delta" && (part as any).delta) {
+            heldText += (part as any).delta;
+          }
+          heldPetals.push(part);
+          // Check at threshold
+          if (!heldSuspicious && heldText.length >= HELD_THRESHOLD) {
+            if (heuristicSuspicion(heldText)) {
+              heldSuspicious = true;
+              trace("drone.held.suspicious", { sid, len: heldText.length });
+            } else {
+              // Clear — flush all held petals
+              heldCleared = true;
+              for (const p of heldPetals) {
+                try { controller.enqueue(p); } catch { done = true; }
+              }
+              heldPetals.length = 0;
+            }
+          }
+        }
+
+        function flushHeld() {
+          if (heldCleared) return;
+          heldCleared = true;
+          for (const p of heldPetals) {
+            try { controller.enqueue(p); } catch { done = true; }
+          }
+          heldPetals.length = 0;
+        }
+
+        function discardHeld(): boolean {
+          if (heldCleared) return false;
+          if (!heldSuspicious) return false;
+          heldPetals.length = 0;
+          heldText = "";
+          return true;
+        }
+
         function petal(part: LanguageModelV2StreamPart) {
           if (done) return;
           try { controller.enqueue(part); } catch { done = true; }
@@ -982,11 +1033,11 @@ export class ClwndModel implements LanguageModelV2 {
                 if (ct === "text_start" || (ct === "text_delta" && !textStarted)) {
                   if (!textStarted) {
                     textStarted = true;
-                    petal({ type: "text-start", id: textId } as LanguageModelV2StreamPart);
+                    petalOrHold({ type: "text-start", id: textId } as LanguageModelV2StreamPart);
                   }
                 }
                 if (ct === "text_delta" && msg.delta) {
-                  petal({ type: "text-delta", id: textId, delta: msg.delta } as LanguageModelV2StreamPart);
+                  petalOrHold({ type: "text-delta", id: textId, delta: msg.delta } as LanguageModelV2StreamPart);
                 }
                 if (ct === "reasoning_start" || (ct === "reasoning_delta" && !reasoningStarted)) {
                   if (!reasoningStarted) {
@@ -1087,6 +1138,37 @@ export class ClwndModel implements LanguageModelV2 {
               }
 
               if (msg.action === "finish") {
+                // Drone swallow: if held petals are suspicious, discard and retrofit
+                if (discardHeld()) {
+                  trace("drone.swallow.plugin", { sid, heldLen: heldText.length });
+                  // Kill process, re-seed on next call
+                  hum({ chi: "cancel", sid, dusk: duskIn(5_000) });
+                  turnsSent.delete(sid);
+                  // Toast the user
+                  if (self.config.client) {
+                    self.config.client.tui.showToast({
+                      body: { title: "Revitalizing your session", message: "Hold on tight!", variant: "info", duration: 3000 },
+                    }).catch(() => {});
+                  }
+                  // Re-send the same prompt — will trigger re-seed + respawn
+                  hum({
+                    chi: "prompt", sid, cwd,
+                    modelId: self.modelId,
+                    content, text, systemPrompt,
+                    permissions, allowedTools, listenOnly,
+                    turnsSent: turnsSent.get(sid) ?? -1,
+                    dusk: duskIn(30_000),
+                  });
+                  // Reset stream state for the new response
+                  textStarted = false;
+                  reasoningStarted = false;
+                  heldCleared = false;
+                  heldSuspicious = false;
+                  heldText = "";
+                  return; // don't wilt — wait for the new response
+                }
+                // Normal path: flush held petals if any
+                flushHeld();
                 // Flush any buffered tool events (no permission_ask came)
                 shed();
                 // Emit text-end / reasoning-end before finish
