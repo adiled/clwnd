@@ -283,7 +283,7 @@ beforeAll(async () => {
     cmd: ["opencode", "serve", "--port", String(PORT), "--hostname", "127.0.0.1"],
     cwd: PROJECT_DIR,
     stdout: "pipe",
-    stderr: "pipe",
+    stderr: "inherit",
     env: { ...process.env },
   });
 

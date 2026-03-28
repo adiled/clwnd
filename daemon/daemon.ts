@@ -149,7 +149,6 @@ class ClaudeNest {
 
     const cmd = [
       this.cliPath, "-p",
-      "--bare",
       "--verbose",
       "--input-format", "stream-json",
       "--output-format", "stream-json",
@@ -162,8 +161,11 @@ class ClaudeNest {
       // Disable built-in tools — our MCP server replaces file/bash tools,
       // and interactive tools would hang in -p mode
       "--disallowedTools", "Read,Edit,Write,Bash,Glob,Grep,ToolSearch,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree,AskUserQuestion",
-      // Register our MCP server
+      // Register our MCP server — strict mode prevents ambient .mcp.json discovery
       "--mcp-config", mcpConfig,
+      "--strict-mcp-config",
+      // Kill skills — OC controls the session, Claude CLI skills not needed
+      "--disable-slash-commands",
     ];
     // System prompt set once at spawn — persistent process keeps it
     if (systemPrompt) {
@@ -600,10 +602,6 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
           }
           saveSessions();
           hum(sid, { chi: "session-ready", sid, claudeSessionId, model, tools });
-          // Murmur after Claude CLI signals ready (new sessions only — resumed sessions don't emit init)
-          if (promptContent && !isResume) {
-            nest.murmur(sid, poolKey, promptContent);
-          }
         },
         onPetal: (() => {
           let batch: string[] = [];
@@ -651,8 +649,10 @@ function humReceive(clientId: string, msg: Record<string, unknown>): void {
         } else if (isResume) {
           // Resumed session — delay to let Claude CLI load JSONL
           setTimeout(() => nest.murmur(sid, poolKey, promptContent), 500);
+        } else {
+          // New session — murmur immediately (system init is unreliable)
+          nest.murmur(sid, poolKey, promptContent);
         }
-        // New session (no roost, no resume) — murmur deferred to onRoost
       }
       break;
     }
