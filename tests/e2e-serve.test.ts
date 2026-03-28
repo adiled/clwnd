@@ -1156,14 +1156,14 @@ describe("e2e-serve: vision", () => {
     const pngData = readFileSync(pngPath);
     const dataUrl = `data:image/png;base64,${pngData.toString("base64")}`;
 
-    // Send image as FilePart via OC message API
+    // Send image as FilePart via OC message API (use opus for vision support)
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 60_000);
     const r = await fetch(`${BASE}/session/${sid}/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: MODEL,
+        model: { providerID: "opencode-clwnd", modelID: "claude-opus-4-6" },
         parts: [
           { type: "file", mime: "image/png", url: dataUrl },
           { type: "text", text: "What solid color is this image? Just say the single color word." },
@@ -1173,6 +1173,21 @@ describe("e2e-serve: vision", () => {
     });
     clearTimeout(timer);
     const resp = await r.json() as any;
+
+    // Assert the JSONL contains an image part in Claude CLI format
+    const state = await getSessionState(sid);
+    expect(state?.claudeSessionPath).toBeTruthy();
+    const lines = readFileSync(state.claudeSessionPath, "utf-8").trim().split("\n")
+      .filter(Boolean).map((l: string) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const userMsgs = lines.filter((l: any) => l.type === "user" && l.message?.role === "user");
+    const imageParts = userMsgs.flatMap((l: any) =>
+      (l.message.content ?? []).filter((p: any) => p.type === "image" && p.source?.type === "base64")
+    );
+    expect(imageParts.length).toBeGreaterThan(0);
+    expect(imageParts[0].source.media_type).toBe("image/png");
+    expect(imageParts[0].source.data.length).toBeGreaterThan(0);
+
+    // Claude should identify the color
     const text = extractResponseText(resp).toLowerCase();
     expect(text).toContain("red");
   }, TIMEOUT);
