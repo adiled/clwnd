@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -e
 
-# Usage: ./scripts/version.sh [patch|minor|major]
-# Bumps version in all package.json files, commits, and tags.
+# Usage: ./scripts/version.sh [patch|minor|major] ["release message"]
+# Bumps version in all package.json files, commits, tags with message.
 
 BUMP="${1:-patch}"
+MSG="${2:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Read current version from root package.json
@@ -37,11 +38,14 @@ done
 
 git add -A
 git commit -m "v$NEXT"
-git tag "v$NEXT"
+
+if [ -n "$MSG" ]; then
+  git tag -a "v$NEXT" -m "$MSG"
+else
+  git tag "v$NEXT"
+fi
+
 git push
 git push --tags
 
 echo "released v$NEXT"
-
-# Compat report deferred — run manually: bash scripts/update-compat.sh
-echo "released v$NEXT — run scripts/update-compat.sh when ready"
