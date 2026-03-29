@@ -287,37 +287,56 @@ export function fromPrompt(
 // cwd: working directory
 
 export async function graft(
+  ocClient: { session: { messages(sid: string): Promise<{ data?: unknown }> } },
   ocSessionId: string,
   start: number,
   end: number | undefined,
   jsonlPath: string,
   sessionId: string,
   cwd: string,
-  ocPort = 4096,
 ): Promise<number> {
-  // Read OC session messages directly from the source
-  const resp = await fetch(`http://127.0.0.1:${ocPort}/session/${ocSessionId}/message`);
-  if (!resp.ok) throw new Error(`graft: failed to read OC session ${ocSessionId}: ${resp.status}`);
-  const ocData = await resp.json() as Array<{ info: { role: string }; parts: Array<{ type: string; text?: string; toolCallId?: string; toolName?: string; input?: unknown; result?: unknown }> }>;
+  // Read OC session messages via SDK client
+  const resp = await ocClient.session.messages(ocSessionId);
+  const ocData = (resp.data ?? []) as Array<{
+    info: { role: string; id: string; sessionID: string; summary?: boolean };
+    parts: Array<{
+      type: string;
+      text?: string;
+      callID?: string;
+      tool?: string;
+      state?: { status: string; input?: Record<string, unknown>; output?: string };
+    }>;
+  }>;
 
-  // Transform OC messages to the format graft understands
-  const ocMessages: Array<{ role: string; content: unknown }> = [];
+  // Transform OC WithParts into a flat role+content array for grafting
+  const ocMessages: Array<{ role: string; content: Array<Record<string, unknown>> }> = [];
   for (const m of ocData) {
-    const role = m.info.role;
-    if (role === "user") {
-      const content = m.parts
-        .filter(p => p.type === "text" && p.text)
-        .map(p => ({ type: "text", text: p.text }));
-      if (content.length > 0) ocMessages.push({ role: "user", content });
-    } else if (role === "assistant") {
+    if (m.info.role === "assistant" && m.info.summary) continue;
+    if (m.parts.every(p => p.type === "compaction" || p.type === "step-start" || p.type === "step-finish")) continue;
+
+    if (m.info.role === "user") {
       const content: Array<Record<string, unknown>> = [];
       for (const p of m.parts) {
         if (p.type === "text" && p.text) content.push({ type: "text", text: p.text });
-        if (p.type === "tool" && p.toolCallId && p.toolName) {
-          content.push({ type: "tool-call", toolCallId: p.toolCallId, toolName: p.toolName, input: p.input });
+      }
+      if (content.length > 0) ocMessages.push({ role: "user", content });
+    } else if (m.info.role === "assistant") {
+      const content: Array<Record<string, unknown>> = [];
+      for (const p of m.parts) {
+        if (p.type === "text" && p.text) content.push({ type: "text", text: p.text });
+        if (p.type === "tool" && p.callID && p.tool && p.state) {
+          content.push({ type: "tool-call", toolCallId: p.callID, toolName: p.tool, input: p.state.input ?? {} });
         }
       }
       if (content.length > 0) ocMessages.push({ role: "assistant", content });
+
+      const toolResults: Array<Record<string, unknown>> = [];
+      for (const p of m.parts) {
+        if (p.type === "tool" && p.callID && p.state?.status === "completed" && p.state.output) {
+          toolResults.push({ type: "tool-result", toolCallId: p.callID, result: p.state.output });
+        }
+      }
+      if (toolResults.length > 0) ocMessages.push({ role: "tool", content: toolResults });
     }
   }
 
