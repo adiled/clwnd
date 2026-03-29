@@ -1049,11 +1049,20 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
               return;
             }
 
-            // Cup phase — buffer and check
-            cupped.push(chunk);
+            // Detect API errors in Claude CLI's stream — interrupt before retry loop
             if (type === "text_delta" && payload.delta) {
               cuppedText += payload.delta as string;
+              if (cuppedText.startsWith("API Error:")) {
+                trace("nest.api.error", { sid, text: cuppedText.slice(0, 120) });
+                hum(sid, { chi: "error", sid, message: cuppedText.slice(0, 200) });
+                nest.interrupt(poolKey);
+                withered = true;
+                return;
+              }
             }
+
+            // Cup phase — buffer and check
+            cupped.push(chunk);
 
             if (cuppedText.length >= CUP_THRESHOLD) {
               const level = classifySuspicion(cuppedText);
@@ -1095,8 +1104,15 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd);
 
       if (promptContent) {
-        // Murmur immediately — stdin is buffered, Claude CLI processes when ready
-        nest.murmur(sid, poolKey, promptContent);
+        // Guard against empty murmurs — empty text blocks cause API 400 (cache_control on empty text)
+        const hasContent = typeof promptContent === "string"
+          ? promptContent.length > 0
+          : Array.isArray(promptContent) && promptContent.some((p: Record<string, unknown>) => p.type !== "text" || (p.text as string)?.length > 0);
+        if (hasContent) {
+          nest.murmur(sid, poolKey, promptContent);
+        } else {
+          trace("nest.murmur.empty", { sid, poolKey });
+        }
       }
       })().catch(e => trace("prompt.failed", { sid, err: String(e) }));
       break;
