@@ -1,4 +1,4 @@
-import { spawn, type Subprocess } from "bun";
+import { spawn, type FileSink } from "bun";
 import { existsSync, unlinkSync, mkdirSync, writeFileSync, readFileSync } from "fs";
 import { randomUUID } from "crypto";
 import { dirname, join } from "path";
@@ -6,8 +6,8 @@ import { fileURLToPath } from "url";
 
 import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
-import { sigil, rid as makeRid, echo, pulse, isDusk, heuristicSuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type DroneState, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
-import { droneThink } from "../lib/drone-llm.ts";
+import { sigil, rid as makeRid, echo, pulse, isDusk, classifySuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type DroneState, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
+import { droneThink, setDroneWorkspace, releaseDroneSession } from "../lib/drone-llm.ts";
 import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, type GraftResult } from "../lib/session.ts";
 import { createOpencodeClient } from "@opencode-ai/sdk";
 
@@ -46,8 +46,17 @@ function parseLine(line: string): unknown {
 
 // ─── ClaudeNest ──────────────────────────────────────────────────────────
 
+interface RoostProc {
+  pid: number | undefined;
+  stdin: FileSink;
+  stdout: ReadableStream<Uint8Array>;
+  stderr: ReadableStream<Uint8Array>;
+  kill(signal?: number): void;
+  exited: Promise<number>;
+}
+
 interface Roost {
-  proc: Subprocess;
+  proc: RoostProc;
   listeners: Map<string, BloomListener>;
   activeSid: string | null;
 }
@@ -110,6 +119,17 @@ class ClaudeNest {
     }
     listener.onPetal("stream_start", {});
     roost.listeners.set(listener.sessionId, listener);
+  }
+
+  interrupt(poolKey: string): void {
+    const roost = this.roosts.get(poolKey);
+    if (!roost) return;
+    const requestId = randomUUID();
+    roost.proc.stdin.write(JSON.stringify({
+      type: "control_cancel_request",
+      request_id: requestId,
+    }) + "\n");
+    trace("nest.interrupted", { poolKey, requestId });
   }
 
   murmur(sessionId: string, poolKey: string, content: Array<Record<string, unknown>> | string): void {
@@ -236,37 +256,45 @@ class ClaudeNest {
       stdin: "pipe",
       stderr: "pipe",
     });
+    // Bun spawn with stdin/stdout/stderr: "pipe" — narrow the proc shape
+    const roostProc: RoostProc = {
+      pid: proc.pid,
+      stdin: proc.stdin as FileSink,
+      stdout: proc.stdout as ReadableStream<Uint8Array>,
+      stderr: proc.stderr as ReadableStream<Uint8Array>,
+      kill: (signal?: number) => proc.kill(signal),
+      exited: proc.exited,
+    };
 
-    const roost: Roost = { proc, listeners: new Map(), activeSid: null };
+    const roost: Roost = { proc: roostProc, listeners: new Map(), activeSid: null };
     this.roosts.set(poolKey, roost);
-    info("nest.awakened", { poolKey, model: modelId, pid: proc.pid, resume: claudeSessionId ?? "none" });
-    humPulse("roost-spawned", poolKey, { pid: proc.pid });
+    info("nest.awakened", { poolKey, model: modelId, pid: roostProc.pid, resume: claudeSessionId ?? "none" });
+    humPulse("roost-spawned", poolKey, { pid: roostProc.pid });
 
-    this.readStderr(proc, poolKey);
+    this.readStderr(roostProc, poolKey);
 
-    proc.exited.then(exit => {
-      trace("nest.exited", { poolKey, code: exit.exitCode, pid: proc.pid });
+    roostProc.exited.then(code => {
+      trace("nest.exited", { poolKey, code, pid: roostProc.pid });
       // Only clean up if this roost is still the current one — a new spawn may have replaced it
       const current = this.roosts.get(poolKey);
       if (current === roost) {
-        humPulse("roost-died", poolKey, { pid: proc.pid, reason: `exit:${exit.exitCode}` });
+        humPulse("roost-died", poolKey, { pid: roostProc.pid, reason: `exit:${code}` });
         for (const listener of roost.listeners.values()) {
-          try { listener.onThorn(`subprocess exited: code=${exit.exitCode}`); } catch {}
+          try { listener.onThorn(`subprocess exited: code=${code}`); } catch {}
         }
         roost.listeners.clear();
         roost.activeSid = null;
         this.roosts.delete(poolKey);
       } else {
-        trace("nest.exited.stale", { poolKey, pid: proc.pid, reason: "replaced by newer roost" });
+        trace("nest.exited.stale", { poolKey, pid: roostProc.pid, reason: "replaced by newer roost" });
       }
     });
 
-    this.readLoop(proc, poolKey, roost);
+    this.readLoop(roostProc, poolKey, roost);
     return roost;
   }
 
-  private readStderr(proc: Subprocess, modelId: string): void {
-    if (!proc.stderr) return;
+  private readStderr(proc: RoostProc, modelId: string): void {
     const reader = proc.stderr.getReader();
     const dec = new TextDecoder();
     (async () => {
@@ -281,8 +309,8 @@ class ClaudeNest {
     })();
   }
 
-  private readLoop(proc: Subprocess, poolKey: string, roost: Roost): void {
-    const reader = proc.stdout!.getReader();
+  private readLoop(proc: RoostProc, poolKey: string, roost: Roost): void {
+    const reader = proc.stdout.getReader();
     const dec = new TextDecoder();
     let nectar = "";
 
@@ -527,6 +555,7 @@ interface Session {
   needsRespawn?: boolean;
   lastAccessed?: number;
   lastSyncedPetal?: [string, string] | null; // [userMessageId, assistantMessageId]
+  ocServerUrl?: string;
 }
 
 const STATE_DIR = process.env.XDG_STATE_HOME
@@ -578,35 +607,67 @@ const HTTP = SOCK + ".http";
 
 const nest = new ClaudeNest(process.env.CLAUDE_CLI_PATH ?? "claude");
 const wane = new WaneTracker();
-const ocClient = createOpencodeClient({ baseUrl: "http://127.0.0.1:4096" });
+const ocClients = new Map<string, ReturnType<typeof createOpencodeClient>>();
+function getOcClient(baseUrl: string): ReturnType<typeof createOpencodeClient> {
+  let client = ocClients.get(baseUrl);
+  if (!client) {
+    client = createOpencodeClient({ baseUrl });
+    ocClients.set(baseUrl, client);
+  }
+  return client;
+}
+const DEFAULT_OC_URL = "http://127.0.0.1:4096";
 
 // Drone: self-governing observer — opt-in via droned:true in clwnd.json
 // When off, the hum is a raw pipe. When on, the sentinel watches everything.
 const DRONED = cfg.droned;
-const droneEvaluator = async (text: string, state: DroneState): Promise<number> => {
-  // Fast gate: if heuristics don't flag, skip LLM
-  if (!heuristicSuspicion(text)) return 0.1;
 
-  // Slow path: ask the LLM with real session state
+function ocUrlForSigil(s: string): string {
+  for (const [sid, session] of sessions) {
+    if (sigil(sid) === s) return session.ocServerUrl ?? DEFAULT_OC_URL;
+  }
+  return DEFAULT_OC_URL;
+}
+
+function droneCtx(text: string, state: DroneState): Parameters<typeof droneThink>[0] {
+  return {
+    responseText: text,
+    inflightTools: state.inflightTools,
+    pendingPermissions: state.pendingPermissions,
+    tokensBurned: state.tokensBurned,
+    turnCount: 0,
+    localWane: state.localWane,
+    remoteWane: state.remoteWane,
+    missedBeats: state.missedBeats,
+    pendingEchoes: state.pendingEchoes.size,
+    toolNames: [],
+  };
+}
+
+const droneEvaluator = async (text: string, state: DroneState): Promise<number> => {
+  const level = classifySuspicion(text);
+
+  // Clean: no heuristic flags
+  if (level === "none") return 0.1;
+
+  // Critical: near-certain context loss — high confidence without LLM
+  if (level === "critical") {
+    trace("drone.heuristic.critical", { sigil: state.sigil, text: text.slice(0, 200) });
+    return 0.9;
+  }
+
+  // Suspicious: compensation detected — ask the LLM to confirm
+  trace("drone.heuristic.suspicious", { sigil: state.sigil, text: text.slice(0, 200) });
   try {
-    const judgment = await droneThink({
-      responseText: text,
-      inflightTools: state.inflightTools,
-      pendingPermissions: state.pendingPermissions,
-      tokensBurned: state.tokensBurned,
-      turnCount: 0,
-      localWane: state.localWane,
-      remoteWane: state.remoteWane,
-      missedBeats: state.missedBeats,
-      pendingEchoes: state.pendingEchoes.size,
-      toolNames: [],
-    });
+    const s = state.sigil;
+    const url = s ? ocUrlForSigil(s) : DEFAULT_OC_URL;
+    const judgment = await droneThink(droneCtx(text, state), url, s);
     trace("drone.llm.judgment", { assessment: judgment.assessment, action: judgment.action, reason: judgment.reason });
     return judgment.action === "swallow" ? 0.9 : judgment.action === "none" ? 0.2 : 0.6;
   } catch (e) {
     trace("drone.llm.failed", { err: String(e) });
-    // Fallback to heuristic confidence
-    return 0.85;
+    // Suspicious + LLM unreachable — lean towards swallow
+    return 0.75;
   }
 };
 
@@ -656,36 +717,14 @@ const drone = DRONED ? new Drone("daemon", (action: DroneAction) => {
       }
       break;
     case "swallow":
-      // Context loss detected — the LLM said "I don't remember" or equivalent.
-      // Kill process, re-seed, re-murmur. User never sees the broken response.
-      info("drone.swallow", { sigil: action.sigil, reason: action.reason });
-      // Find the session by sigil and trigger retrofit
-      for (const [sid, session] of sessions) {
-        if (sigil(sid) === action.sigil) {
-          nest.fell(sid, sid);
-          session.needsRespawn = true;
-          session.lastSyncedPetal = null;
-          saveSessions(sid);
-          hum(sid, { chi: "drone-retrofit", sid, reason: action.reason });
-          break;
-        }
-      }
+      // Wither is handled by cupped petals in onPetal — daemon-side only.
+      // The Drone class may still emit this from its evaluator, but onPetal already acted.
+      trace("drone.wither.noop", { sigil: action.sigil, reason: action.reason });
       break;
   }
 }, droneEvaluator, 0.7, (s, state) => {
   // LLM assessment on silence — full state evaluation
-  droneThink({
-    responseText: state.responseText,
-    inflightTools: state.inflightTools,
-    pendingPermissions: state.pendingPermissions,
-    tokensBurned: state.tokensBurned,
-    turnCount: 0,
-    localWane: state.localWane,
-    remoteWane: state.remoteWane,
-    missedBeats: state.missedBeats,
-    pendingEchoes: state.pendingEchoes.size,
-    toolNames: [],
-  }).then(judgment => {
+  droneThink(droneCtx(state.responseText, state), ocUrlForSigil(s), s).then(judgment => {
     trace("drone.llm.assess", { sigil: s, assessment: judgment.assessment, action: judgment.action, reason: judgment.reason });
     // Act on LLM judgment
     if (judgment.action === "respawn") {
@@ -697,13 +736,12 @@ const drone = DRONED ? new Drone("daemon", (action: DroneAction) => {
         if (sigil(sid) === s) { session.needsRespawn = true; saveSessions(sid); break; }
       }
     } else if (judgment.action === "swallow") {
+      // Swallow from silence path — by the time silence fires, the stream is done.
+      // Set needsRespawn so next prompt starts fresh.
       for (const [sid, session] of sessions) {
         if (sigil(sid) === s) {
-          nest.fell(sid, sid);
           session.needsRespawn = true;
-          session.lastSyncedPetal = null;
           saveSessions(sid);
-          hum(sid, { chi: "drone-retrofit", sid, reason: judgment.reason });
           break;
         }
       }
@@ -724,7 +762,7 @@ for (const p of [SOCK, HTTP, HUM]) {
 
 const humClients = new Map<string, Reach>();
 
-function humTo(client: Reach, msg: Record<string, unknown>): void {
+function humTo(client: Reach, msg: Record<string, unknown> | Breath): void {
   try { client.socket.write(JSON.stringify(msg) + "\n"); } catch {}
 }
 
@@ -770,7 +808,8 @@ function humBreath(client: Reach): void {
       sid,
       claudeSessionId: session.claudeSessionId,
       claudeSessionPath: session.claudeSessionPath,
-            wane: wane.get(s),
+      lastSyncedPetal: session.lastSyncedPetal ?? null,
+      wane: wane.get(s),
       modelId: session.modelId,
       cwd: session.cwd,
       roostAlive: !!nest.roost(sid),
@@ -839,6 +878,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       const systemPrompt = (msg.systemPrompt as string) || undefined;
       const allowedTools = (msg.allowedTools as string[]) || undefined;
       const cwd = msg.cwd as string | undefined;
+      const ocServerUrl = (msg.ocServerUrl as string) || DEFAULT_OC_URL;
 
       if (cwd) mcpSetCwd(cwd);
       if (permissions.length > 0) {
@@ -847,26 +887,43 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
 
       const poolKey = sid;
 
-      // Update model — prompt always carries the current model
+      // Update model, cwd, and OC server URL — prompt always carries current values
       if (msg.modelId) session.modelId = msg.modelId as string;
+      if (cwd) session.cwd = cwd;
+      if (ocServerUrl !== DEFAULT_OC_URL) session.ocServerUrl = ocServerUrl;
 
       // Graft: sync OC petals into Claude JSONL before spawning
       if (!msg.listenOnly) {
+        trace("graft.enter", { sid, ocServerUrl });
         try {
-          // Cold start: no Claude JSONL yet
-          if (!session.claudeSessionId) {
-            session.claudeSessionId = randomUUID();
-            session.claudeSessionPath = createClaudeSession(cwd ?? session.cwd, session.claudeSessionId);
-            saveSessions(sid);
-          }
-          // Graft petals since the last synced one
+          const effectiveCwd = cwd ?? session.cwd;
           const sinceId = session.lastSyncedPetal?.[1] ?? null;
-          const result = await graft(ocClient, sid, sinceId, null, session.claudeSessionPath!, session.claudeSessionId, cwd ?? session.cwd);
-          if (result.grafted > 0) {
-            session.lastSyncedPetal = result.lastPetal;
-            session.needsRespawn = true;
-            saveSessions(sid);
-            trace("graft.done", { sid, grafted: result.grafted, lastPetal: result.lastPetal });
+          if (session.claudeSessionId && session.claudeSessionPath) {
+            // Existing JSONL — graft any new petals
+            const result = await graft(getOcClient(ocServerUrl), sid, sinceId, null, session.claudeSessionPath, session.claudeSessionId, effectiveCwd);
+            if (result.grafted > 0) {
+              session.lastSyncedPetal = result.lastPetal;
+              session.needsRespawn = true;
+              saveSessions(sid);
+              trace("graft.done", { sid, grafted: result.grafted, lastPetal: result.lastPetal });
+            }
+          } else {
+            // Cold start — peek OC for petals, create JSONL only if there's content
+            const peekId = randomUUID();
+            const peekPath = createClaudeSession(effectiveCwd, peekId);
+            const result = await graft(getOcClient(ocServerUrl), sid, sinceId, null, peekPath, peekId, effectiveCwd);
+            if (result.grafted > 0) {
+              session.claudeSessionId = peekId;
+              session.claudeSessionPath = peekPath;
+              session.lastSyncedPetal = result.lastPetal;
+              session.needsRespawn = true;
+              saveSessions(sid);
+              trace("graft.cold", { sid, grafted: result.grafted, lastPetal: result.lastPetal });
+            } else {
+              // No petals — delete the empty JSONL skeleton
+              trace("graft.cold.empty", { sid, ocServerUrl });
+              try { unlinkSync(peekPath); } catch {}
+            }
           }
         } catch (e) {
           trace("graft.failed", { sid, err: String(e) });
@@ -877,51 +934,169 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       const promptContent: Array<Record<string, unknown>> | string | null =
         !msg.listenOnly ? (msg.content as Array<Record<string, unknown>> | undefined) ?? (msg.text as string ?? "") : null;
       const isResume = !!(session.claudeSessionId && session.needsRespawn);
+      let withered = false; // shared between onPetal and onWilt — true when bad petals were discarded
+      let uncup: (() => void) | null = null; // set by onPetal closure — flushes cupped petals to plugin
 
       const listener: BloomListener = {
         sessionId: sid,
         onRoost(claudeSessionId, model, tools) {
           session.claudeSessionId = claudeSessionId;
           if (!session.claudeSessionPath) {
-            const dir = getSessionDir(session.cwd);
+            // Use the cwd passed to awaken (= spawnCwd), not session.cwd,
+            // because Claude CLI determines its project dir from spawnCwd
+            const effectiveCwd = cwd ?? session.cwd;
+            const dir = getSessionDir(effectiveCwd);
             try { mkdirSync(dir, { recursive: true }); } catch {}
-            session.claudeSessionPath = getSessionPath(session.cwd, claudeSessionId);
+            session.claudeSessionPath = getSessionPath(effectiveCwd, claudeSessionId);
           }
           saveSessions(sid);
-          hum(sid, { chi: "session-ready", sid, claudeSessionId, model, tools, turnsSent: session.turnsSent ?? -1 });
+          hum(sid, { chi: "session-ready", sid, claudeSessionId, model, tools });
           humPulse("roost-ready", sid, { pid: nest.roost(poolKey)?.proc.pid });
         },
         onPetal: (() => {
           let batch: string[] = [];
           let pending = false;
+          // Cupped petals: daemon cups early petals to check for context loss before blooming
+          const CUP_THRESHOLD = 200;
+          const MAX_WITHERS = 1;
+          let withers = 0;
+          let cupped: string[] = [];
+          let cuppedText = "";
+          let uncupped = !DRONED; // drone off = bloom directly
+
+          function sendChunks(chunks: string[]) {
+            const line = chunks.join("\n") + "\n";
+            const s = sigil(sid);
+            let sent = false;
+            for (const [, client] of humClients) {
+              if (client.sigils.has(s)) {
+                try { client.socket.write(line); } catch {}
+                sent = true;
+                break;
+              }
+            }
+            if (!sent) {
+              for (const [, client] of humClients) {
+                if (client.sigils.size === 0) try { client.socket.write(line); } catch {}
+              }
+            }
+          }
+
+          function doUncup() {
+            if (uncupped) return;
+            uncupped = true;
+            if (cupped.length > 0) {
+              sendChunks(cupped);
+              cupped = [];
+            }
+          }
+          uncup = doUncup;
+
+          function wither() {
+            if (!session) return;
+            withered = true;
+            cupped = [];
+            cuppedText = "";
+            trace("drone.wither", { sid });
+            // Kill process, graft, respawn, re-murmur — all internal
+            nest.fell(sid, poolKey);
+            session.needsRespawn = true;
+            session.lastSyncedPetal = null;
+            saveSessions(sid);
+            // Re-send the prompt after a tick (let fell complete)
+            queueMicrotask(() => {
+              // Graft runs inside the prompt handler on the re-sent prompt
+              const effectiveCwd = cwd ?? session.cwd;
+              const ocUrl = session.ocServerUrl ?? DEFAULT_OC_URL;
+              // Re-create listener state for the retry
+              uncupped = !DRONED;
+              withered = false;
+              cuppedText = "";
+              cupped = [];
+              batch = [];
+              pending = false;
+              // Awaken + murmur via prompt handler (simulates a fresh prompt)
+              if (promptContent) {
+                (async () => {
+                  try {
+                    // Graft before respawn
+                    const sinceId = session.lastSyncedPetal?.[1] ?? null;
+                    if (!session.claudeSessionId) {
+                      const peekId = randomUUID();
+                      const peekPath = createClaudeSession(effectiveCwd, peekId);
+                      const result = await graft(getOcClient(ocUrl), sid, sinceId, null, peekPath, peekId, effectiveCwd);
+                      if (result.grafted > 0) {
+                        session.claudeSessionId = peekId;
+                        session.claudeSessionPath = peekPath;
+                        session.lastSyncedPetal = result.lastPetal;
+                        saveSessions(sid);
+                        trace("graft.cold.swallow", { sid, grafted: result.grafted });
+                      } else {
+                        try { unlinkSync(peekPath); } catch {}
+                      }
+                    } else if (session.claudeSessionPath) {
+                      const result = await graft(getOcClient(ocUrl), sid, sinceId, null, session.claudeSessionPath, session.claudeSessionId, effectiveCwd);
+                      if (result.grafted > 0) {
+                        session.lastSyncedPetal = result.lastPetal;
+                        saveSessions(sid);
+                        trace("graft.swallow", { sid, grafted: result.grafted });
+                      }
+                    }
+                    session.needsRespawn = true;
+                    nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd);
+                    nest.murmur(sid, poolKey, promptContent);
+                  } catch (e) {
+                    trace("drone.swallow.retry.failed", { sid, err: String(e) });
+                    hum(sid, { chi: "error", sid, message: `swallow retry failed: ${e}` });
+                  }
+                })();
+              }
+            });
+          }
+
           return (type: string, payload: Record<string, unknown>) => {
-            batch.push(JSON.stringify({ chi: "chunk", sid, chunkType: type, ...payload }));
-            if (!pending) {
-              pending = true;
-              queueMicrotask(() => {
-                // Single socket write for all buffered chunks
-                const line = batch.join("\n") + "\n";
-                batch = [];
-                pending = false;
-                const s = sigil(sid);
-                let chunkSent = false;
-                for (const [, client] of humClients) {
-                  if (client.sigils.has(s)) {
-                    try { client.socket.write(line); } catch {}
-                    chunkSent = true;
-                    break;
-                  }
+            if (withered) return; // withered — drop remaining chunks from old stream
+            const chunk = JSON.stringify({ chi: "chunk", sid, chunkType: type, ...payload });
+
+            if (uncupped) {
+              // Already uncupped — bloom directly via microtask batching
+              batch.push(chunk);
+              if (!pending) {
+                pending = true;
+                queueMicrotask(() => {
+                  sendChunks(batch);
+                  batch = [];
+                  pending = false;
+                });
+              }
+              return;
+            }
+
+            // Cup phase — buffer and check
+            cupped.push(chunk);
+            if (type === "text_delta" && payload.delta) {
+              cuppedText += payload.delta as string;
+            }
+
+            if (cuppedText.length >= CUP_THRESHOLD) {
+              const level = classifySuspicion(cuppedText);
+              if ((level === "critical" || level === "suspicious") && withers < MAX_WITHERS) {
+                withers++;
+                trace(`drone.cup.${level}`, { sid, len: cuppedText.length, wither: withers });
+                wither();
+              } else {
+                // Clean, or exhausted withers — uncup and bloom directly
+                if (level !== "none" && withers >= MAX_WITHERS) {
+                  trace("drone.cup.exhausted", { sid, level, withers });
                 }
-                if (!chunkSent) {
-                  for (const [, client] of humClients) {
-                    if (client.sigils.size === 0) try { client.socket.write(line); } catch {}
-                  }
-                }
-              });
+                doUncup();
+              }
             }
           };
         })(),
         onWilt(harvest) {
+          if (withered) return; // withered petal — don't send finish for bad petals
+          if (uncup) uncup(); // uncup any remaining petals before finish
           hum(sid, {
             chi: "finish", sid,
             finishReason: harvest.finishReason,
@@ -952,13 +1127,23 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       const session = sessions.get(sid);
       if (session) {
         trace("nest.cancelled", { sid, reason: msg.reason });
-        nest.fell(sid, sid);
-        // Compaction: reset anchor — next prompt does full graft
         if (msg.reason === "compaction") {
+          // Compaction: kill process, reset anchor — next prompt does full graft
+          nest.fell(sid, sid);
           session.lastSyncedPetal = null;
           session.claudeSessionId = null;
           session.claudeSessionPath = null;
           saveSessions(sid);
+        } else if (msg.reason === "swallow") {
+          // Drone swallow: kill process — plugin re-sends prompt, daemon re-seeds via graft
+          nest.fell(sid, sid);
+          session.needsRespawn = true;
+          session.lastSyncedPetal = null;
+          saveSessions(sid);
+          hum(sid, { chi: "drone-retrofit", sid, reason: msg.reason });
+        } else {
+          // User interrupt: send control_cancel_request — process stays alive
+          nest.interrupt(sid);
         }
       }
       break;
@@ -983,7 +1168,8 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       const sid = msg.sid as string;
       const session = sessions.get(sid);
       if (session) {
-        nest.fell(sid, session.modelId);
+        nest.fell(sid, sid);
+        releaseDroneSession(sigil(sid));
         sessions.delete(sid);
         saveSessions(sid);
         trace("hum.session.cleaned", { sid });
@@ -1002,7 +1188,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       break;
     }
 
-    case "session-event": {
+    case "petal-cell": {
       // The sentinel's ears — track all OC session activity across all providers
       const sid = msg.sid as string;
       const role = msg.role as string;
@@ -1010,7 +1196,8 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       const provider = msg.provider as string;
       const messageId = msg.messageId as string | undefined;
       const parentId = msg.parentId as string | undefined;
-      trace("session.event", { sid, event: msg.event, role, model, provider, messageId });
+      const completed = msg.completed as number | undefined;
+      trace("petal.cell", { sid, role, provider, messageId, completed: !!completed });
       let session = sessions.get(sid);
       if (!session) {
         session = {
@@ -1023,9 +1210,9 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         sessions.set(sid, session);
       }
       session.lastAccessed = Date.now();
-      // Track last OC petal — but only update lastSyncedPetal for clwnd's own turns.
-      // For other providers, graft() updates lastSyncedPetal when it actually syncs.
-      if (role === "assistant" && messageId && parentId && provider?.startsWith("opencode-clwnd")) {
+      // Only advance anchor on completed clwnd assistant petals —
+      // completed means Claude finished writing to the JSONL
+      if (role === "assistant" && completed && messageId && parentId && provider?.startsWith("opencode-clwnd")) {
         session.lastSyncedPetal = [parentId, messageId];
         saveSessions(sid);
       }
@@ -1083,7 +1270,6 @@ humServer.listen(HUM, () => {
 
 Bun.serve({
   unix: HTTP,
-  idleTimeout: 0,
   fetch(req) {
     const url = new URL(req.url);
 
@@ -1121,11 +1307,13 @@ Bun.serve({
 
     // Cleanup — tests use this to tear down sessions
     if (req.method === "POST" && url.pathname === "/") {
-      return req.json().then((body: { action: string; opencodeSessionId: string }) => {
+      return req.json().then((raw: unknown) => {
+        const body = raw as { action: string; opencodeSessionId: string };
         if (body.action === "cleanup") {
           const session = sessions.get(body.opencodeSessionId);
           if (session) {
-            nest.fell(body.opencodeSessionId, session.modelId);
+            nest.fell(body.opencodeSessionId, body.opencodeSessionId);
+            releaseDroneSession(sigil(body.opencodeSessionId));
             sessions.delete(body.opencodeSessionId);
             saveSessions(body.opencodeSessionId);
             trace("session.cleaned", { sid: body.opencodeSessionId });
@@ -1156,7 +1344,7 @@ const mcpServer = Bun.serve({
     // PreToolUse hook calls this to check permissions
     if (req.method === "POST" && url.pathname === "/permission-check") {
       try {
-        const body = await req.json();
+        const body = await req.json() as { tool_name?: string; tool_input?: Record<string, unknown>; session_id?: string };
         const toolName = ((body.tool_name ?? "") as string).replace("mcp__clwnd__", "");
         const path = (body.tool_input?.file_path ?? body.tool_input?.path) as string | undefined;
         const sessionId = body.session_id as string;
@@ -1249,14 +1437,15 @@ const mcpServer = Bun.serve({
     // MCP JSON-RPC
     if (req.method !== "POST") return new Response("clwnd-mcp", { status: 200 });
     try {
-      const body = await req.json();
-      trace("mcp.request.received", { method: body?.method });
+      const body = await req.json() as { jsonrpc: string; id?: number | string; method: string; params?: unknown };
+      trace("mcp.request.received", { method: body.method });
       const result = await handleMcpRequest(body);
       if (!result) return new Response("", { status: 204 });
       return Response.json(result);
-    } catch (e: any) {
-      trace("mcp.request.failed", { err: e.message });
-      return Response.json({ jsonrpc: "2.0", error: { code: -32700, message: e.message } });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      trace("mcp.request.failed", { err: msg });
+      return Response.json({ jsonrpc: "2.0", error: { code: -32700, message: msg } });
     }
   },
 });
@@ -1313,7 +1502,9 @@ setMetaCallback((toolName, callId, title, metadata) => {
     }
   }
   // No active session — broadcast to all hum clients
-  humChorus({ chi: "tool-meta", tool: toolName, callId, title, metadata });
+  for (const client of humClients.values()) {
+    humTo(client, { chi: "tool-meta", tool: toolName, callId, title, metadata });
+  }
   trace("meta.hummed.broadcast", { tool: toolName });
 });
 

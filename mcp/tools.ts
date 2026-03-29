@@ -350,7 +350,7 @@ async function execPermissionPrompt(args: { tool_name: string; input?: Record<st
   return { output: JSON.stringify({ behavior: "deny", message: "Permission denied by user" }) };
 }
 
-export async function executeTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+export async function executeTool(name: string, args: Record<string, unknown>, _callId?: string): Promise<ToolResult> {
   if (name !== "permission_prompt") trace("mcp.tool.executed", { tool: name });
   switch (name) {
     case "read": return execRead(args as any);

@@ -1,5 +1,8 @@
+import type { PluginInput } from "@opencode-ai/plugin";
+import type { createOpencodeClient } from "@opencode-ai/sdk";
+
 export interface ClwndConfig {
   cwd?: string;
-  client?: any; // OpenCode SDK client for session/permission queries
-  pluginInput?: any; // Full PluginInput — project, directory, worktree, $, serverUrl
+  client?: ReturnType<typeof createOpencodeClient>;
+  pluginInput?: PluginInput;
 }

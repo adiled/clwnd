@@ -37,10 +37,11 @@
     "@ai-sdk/provider-utils": "^2.0.0"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.2.0"
+    "@opencode-ai/plugin": ">=1.3.5"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.2.27",
+    "@opencode-ai/plugin": "^1.3.5",
+    "@opencode-ai/sdk": "^1.3.5",
     "tsup": "^8.0.0",
     "typescript": "^5.7.0"
   }

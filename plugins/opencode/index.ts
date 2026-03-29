@@ -3,7 +3,7 @@ import { tool } from "@opencode-ai/plugin";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
-import { createClwnd, setSharedClient, setLogClient, hum, trace, log } from "./provider.ts";
+import { createClwnd, setSharedClient, setSharedPluginInput, setLogClient, hum, trace, log } from "./provider.ts";
 import { loadConfig, type ClwndConfig } from "../../lib/config.ts";
 import { duskIn } from "../../lib/hum.ts";
 
@@ -47,6 +47,7 @@ async function syncSmallModel(client: any, cfg: ClwndConfig): Promise<void> {
 
 export const clwndPlugin: Plugin = async (input) => {
   setSharedClient(input.client);
+  setSharedPluginInput(input);
   setLogClient(input.client);
   const provider = createClwnd({ client: input.client, pluginInput: input });
 
@@ -83,14 +84,15 @@ export const clwndPlugin: Plugin = async (input) => {
 
       // Message events — daemon tracks full conversation across all providers
       if (etype === "message.updated" && props.info) {
-        const sid = props.info.sessionID;
+        const sid = props.info.sessionID ?? props.info.metadata?.sessionID;
         const role = props.info.role;
-        const model = props.info.modelID;
-        const provider = props.info.providerID;
+        const model = props.info.modelID ?? props.info.metadata?.assistant?.modelID;
+        const provider = props.info.providerID ?? props.info.metadata?.assistant?.providerID;
         const messageId = props.info.id;
         const parentId = props.info.parentID;
+        const completed = props.info.metadata?.time?.completed;
         if (sid && role) {
-          hum({ chi: "session-event", sid, event: etype, role, model, provider, messageId, parentId });
+          hum({ chi: "petal-cell", sid, event: etype, role, model, provider, messageId, parentId, completed });
         }
       }
 

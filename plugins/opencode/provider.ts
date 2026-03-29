@@ -1,6 +1,6 @@
 import { generateId } from "@ai-sdk/provider-utils";
 import { loadConfig } from "../../lib/config.ts";
-import { sigil as makeSigil, heuristicSuspicion, Drone, duskIn, type DroneAction } from "../../lib/hum.ts";
+import { sigil as makeSigil, Drone, duskIn, type DroneAction } from "../../lib/hum.ts";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 // Three destinations: plugin log file (always), hum → daemon (when connected), OC debug (when client ready).
@@ -208,14 +208,6 @@ async function awakenHum(): Promise<void> {
             const kind = msg.kind as string;
             const sid = msg.sid as string;
             trace("hum.pulse", { kind, sid });
-            continue;
-          }
-          // Drone retrofit: daemon swallowed a bad response, process killed + needsRespawn set.
-          // Next doStream call will re-seed and respawn automatically.
-          if (msg.chi === "drone-retrofit") {
-            const sid = msg.sid as string;
-            trace("drone.retrofit", { sid, reason: msg.reason });
-            // Daemon handles re-seed via graft — nothing to reset here
             continue;
           }
           if (humHearer) humHearer(msg);
@@ -788,6 +780,7 @@ export class ClwndModel implements LanguageModelV2 {
         modelId: self.modelId,
         content, text, systemPrompt,
         permissions, allowedTools, listenOnly,
+        ocServerUrl: self.config.pluginInput?.serverUrl?.toString(),
         dusk: duskIn(30_000),
       });
       promptSent = true;
@@ -808,65 +801,7 @@ export class ClwndModel implements LanguageModelV2 {
           buds.length = 0;
         }
 
-        // Petals held: buffer early response to detect context loss before user sees it
-        const heldPetals: LanguageModelV2StreamPart[] = [];
-        let heldText = "";
-        let heldCleared = !DRONED; // drone off = always flow directly
-        let heldSuspicious = false;
-        let swallowRetries = 0;
-        const MAX_SWALLOW_RETRIES = 1;
-        const HELD_THRESHOLD = 200; // chars before heuristic check
-
-        function petalOrHold(part: LanguageModelV2StreamPart) {
-          if (done) return;
-          if (heldCleared) {
-            try { controller.enqueue(part); } catch { done = true; }
-            return;
-          }
-          // Tool-first response — no text, no context-loss risk. Skip buffering.
-          if (heldPetals.length === 0 && (part as any).type === "tool-input-start") {
-            heldCleared = true;
-            try { controller.enqueue(part); } catch { done = true; }
-            return;
-          }
-          // Accumulate text
-          if ((part as any).type === "text-delta" && (part as any).delta) {
-            heldText += (part as any).delta;
-          }
-          heldPetals.push(part);
-          // Check at threshold
-          if (!heldSuspicious && heldText.length >= HELD_THRESHOLD) {
-            if (heuristicSuspicion(heldText)) {
-              heldSuspicious = true;
-              trace("drone.held.suspicious", { sid, len: heldText.length });
-            } else {
-              // Clear — flush all held petals
-              heldCleared = true;
-              for (const p of heldPetals) {
-                try { controller.enqueue(p); } catch { done = true; }
-              }
-              heldPetals.length = 0;
-            }
-          }
-        }
-
-        function flushHeld() {
-          if (heldCleared) return;
-          heldCleared = true;
-          for (const p of heldPetals) {
-            try { controller.enqueue(p); } catch { done = true; }
-          }
-          heldPetals.length = 0;
-        }
-
-        function discardHeld(): boolean {
-          if (heldCleared) return false;
-          if (!heldSuspicious) return false;
-          heldPetals.length = 0;
-          heldText = "";
-          return true;
-        }
-
+        // Petals-held moved to daemon — plugin is a clean pipe
         function petal(part: LanguageModelV2StreamPart) {
           if (done) return;
           try { controller.enqueue(part); } catch { done = true; }
@@ -907,6 +842,7 @@ export class ClwndModel implements LanguageModelV2 {
             modelId: self.modelId,
             content, text, systemPrompt,
             permissions, allowedTools, listenOnly,
+            ocServerUrl: self.config.pluginInput?.serverUrl?.toString(),
                     dusk: duskIn(30_000),
           });
         }
@@ -935,11 +871,11 @@ export class ClwndModel implements LanguageModelV2 {
                 if (ct === "text_start" || (ct === "text_delta" && !textStarted)) {
                   if (!textStarted) {
                     textStarted = true;
-                    petalOrHold({ type: "text-start", id: textId } as LanguageModelV2StreamPart);
+                    petal({ type: "text-start", id: textId } as LanguageModelV2StreamPart);
                   }
                 }
                 if (ct === "text_delta" && msg.delta) {
-                  petalOrHold({ type: "text-delta", id: textId, delta: msg.delta } as LanguageModelV2StreamPart);
+                  petal({ type: "text-delta", id: textId, delta: msg.delta } as LanguageModelV2StreamPart);
                 }
                 if (ct === "reasoning_start" || (ct === "reasoning_delta" && !reasoningStarted)) {
                   if (!reasoningStarted) {
@@ -1040,45 +976,6 @@ export class ClwndModel implements LanguageModelV2 {
               }
 
               if (msg.action === "finish") {
-                // Drone swallow: if held petals are suspicious, discard and retrofit
-                if (heldSuspicious && !heldCleared && swallowRetries >= MAX_SWALLOW_RETRIES) {
-                  // Exhausted retries — let it through but warn the user
-                  trace("drone.swallow.exhausted", { sid, retries: swallowRetries });
-                  if (self.config.client) {
-                    self.config.client.tui.showToast({
-                      body: { title: "Context couldn't be recovered", message: "I tried, but this session's context is degraded. Better start a new session! ~ clwnd", variant: "warning", duration: 8000 },
-                    }).catch(() => {});
-                  }
-                  flushHeld();
-                } else if (discardHeld() && swallowRetries < MAX_SWALLOW_RETRIES) {
-                  swallowRetries++;
-                  trace("drone.swallow.plugin", { sid, heldLen: heldText.length, retry: swallowRetries });
-                  // Kill process, re-seed on next call
-                  hum({ chi: "cancel", sid, reason: "swallow", dusk: duskIn(5_000) });
-                  // Toast the user
-                  if (self.config.client) {
-                    self.config.client.tui.showToast({
-                      body: { title: "Revitalizing your session", message: "Hold on tight! ~ clwnd", variant: "info", duration: 3000 },
-                    }).catch(() => {});
-                  }
-                  // Re-send the same prompt — will trigger re-seed + respawn
-                  hum({
-                    chi: "prompt", sid, cwd,
-                    modelId: self.modelId,
-                    content, text, systemPrompt,
-                    permissions, allowedTools, listenOnly,
-                                dusk: duskIn(30_000),
-                  });
-                  // Reset stream state for the new response
-                  textStarted = false;
-                  reasoningStarted = false;
-                  heldCleared = false;
-                  heldSuspicious = false;
-                  heldText = "";
-                  return; // don't wilt — wait for the new response
-                }
-                // Normal path: flush held petals if any
-                flushHeld();
                 // Flush any buffered tool events (no permission_ask came)
                 shed();
                 // Emit text-end / reasoning-end before finish
@@ -1146,10 +1043,13 @@ export class ClwndModel implements LanguageModelV2 {
 // Shared client — set by the plugin on init, used as fallback when the
 // provider loader calls createClwnd() without args.
 let sharedClient: any = null;
+let sharedPluginInput: ClwndConfig["pluginInput"] = undefined;
 export function setSharedClient(client: any): void { sharedClient = client; }
+export function setSharedPluginInput(input: ClwndConfig["pluginInput"]): void { sharedPluginInput = input; }
 
 export function createClwnd(config: ClwndConfig = {}) {
   if (!config.client && sharedClient) config = { ...config, client: sharedClient };
+  if (!config.pluginInput && sharedPluginInput) config = { ...config, pluginInput: sharedPluginInput };
   const fn = (modelId: string): LanguageModelV2 => new ClwndModel(modelId, config);
   fn.languageModel = (modelId: string) => new ClwndModel(modelId, config);
   return fn;

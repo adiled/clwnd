@@ -147,9 +147,10 @@ describe("e2e-serve-asks: permission dialog via phantom tool call", () => {
     expect(approvedCount).toBeGreaterThan(0);
 
     // Claude responded with a message (not hung, not empty)
-    const text = (resp?.parts ?? [])
-      .filter((p: any) => p.type === "text")
-      .map((p: any) => p.text ?? "")
+    const respObj = resp as { parts?: Array<{ type: string; text?: string }> } | null;
+    const text = (respObj?.parts ?? [])
+      .filter((p) => p.type === "text")
+      .map((p) => p.text ?? "")
       .join("");
     expect(text.length).toBeGreaterThan(0);
 
