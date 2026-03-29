@@ -230,7 +230,25 @@ export function readEntries(path: string): ClaudeEntry[] {
 // ─── Shared Entry Writers ──────────────────────────────────────────────────
 // Used by both fromPrompt() and graft(). No duplication.
 
-const CLWND_META = { userType: "external", entrypoint: "sdk-cli", version: "2.1.80", gitBranch: "main" } as const;
+const metaCache = new Map<string, { userType: string; entrypoint: string; version: string; gitBranch: string }>();
+
+function clwndMeta(path?: string): { userType: string; entrypoint: string; version: string; gitBranch: string } {
+  if (!path) return { userType: "external", entrypoint: "sdk-cli", version: "2.1.86", gitBranch: "main" };
+  const cached = metaCache.get(path);
+  if (cached) return cached;
+  let version = "2.1.86";
+  let gitBranch = "main";
+  const entries = readEntries(path);
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i] as unknown as Record<string, unknown>;
+    if (typeof e.version === "string" && e.version) { version = e.version; }
+    if (typeof e.gitBranch === "string" && e.gitBranch) { gitBranch = e.gitBranch; }
+    if (version !== "2.1.86") break; // found a real entry
+  }
+  const meta = { userType: "external", entrypoint: "sdk-cli", version, gitBranch };
+  metaCache.set(path, meta);
+  return meta;
+}
 
 const ZERO_USAGE: ClaudeUsage = {
   input_tokens: 0, output_tokens: 0,
@@ -258,7 +276,7 @@ function writeUserEntry(path: string, opts: {
     promptId: randomUUID(),
     message: { role: "user", content: opts.content },
     permissionMode: opts.permissionMode ?? "default",
-    ...CLWND_META,
+    ...clwndMeta(path),
     cwd: opts.cwd,
   });
 }
@@ -289,7 +307,7 @@ function writeAssistantEntry(path: string, opts: {
       stop_sequence: null,
       usage: ZERO_USAGE,
     },
-    ...CLWND_META,
+    ...clwndMeta(path),
     cwd: opts.cwd,
   });
 }
