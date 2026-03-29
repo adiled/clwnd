@@ -47,6 +47,7 @@ import type {
   LanguageModelV2StreamPart,
   LanguageModelV2Usage,
   LanguageModelV2Prompt,
+  SharedV2ProviderMetadata,
 } from "@ai-sdk/provider";
 import type { ClwndConfig } from "./types.ts";
 
@@ -436,7 +437,7 @@ function extractContent(prompt: LanguageModelV2Prompt, sessionId?: string): Cont
               const prev = lastReminder.get(sessionId);
               if (prev === reminder) {
                 // Remove this part entirely if it's only the reminder, or strip it
-                const stripped = parts[j].text.replace(reminder, "").trim();
+                const stripped = (parts[j] as { type: "text"; text: string }).text.replace(reminder, "").trim();
                 if (stripped) { parts[j] = { type: "text", text: stripped }; }
                 else { parts.splice(j, 1); }
                 trace("reminder.stripped", { sid: sessionId });
@@ -587,15 +588,7 @@ export class ClwndModel implements LanguageModelV2 {
 
   async doGenerate(
     opts: Parameters<LanguageModelV2["doGenerate"]>[0],
-  ): Promise<{
-    content: LanguageModelV2Content[];
-    finishReason: LanguageModelV2FinishReason;
-    usage: LanguageModelV2Usage;
-    warnings: LanguageModelV2CallWarning[];
-    request: { body: unknown };
-    response: { id: string; timestamp: Date; modelId: string };
-    providerMetadata: Record<string, unknown>;
-  }> {
+  ) {
     // Auxiliary call (title gen, compaction) — reject gracefully unless ocCompaction is on
     if (isAuxiliaryCall(opts) && !loadConfig().ocCompaction) {
       trace("auxiliary.reject", { method: "doGenerate" });
@@ -631,7 +624,7 @@ export class ClwndModel implements LanguageModelV2 {
       content: LanguageModelV2Content[];
       finishReason: LanguageModelV2FinishReason;
       usage: LanguageModelV2Usage;
-      providerMetadata: Record<string, unknown>;
+      providerMetadata: SharedV2ProviderMetadata;
     }>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("doGenerate timeout")), 120_000);
       opts.abortSignal?.addEventListener("abort", () => { clearTimeout(timeout); reject(new Error("aborted")); });
@@ -734,7 +727,7 @@ export class ClwndModel implements LanguageModelV2 {
 
     const sid = opts.headers?.["x-opencode-session"] ?? generateId();
     const content = extractContent(opts.prompt, sid);
-    const text = content.map(p => p.text).join("\n\n");
+    const text = content.filter((p): p is { type: "text"; text: string } => p.type === "text").map(p => p.text).join("\n\n");
     const systemPrompt = extractSystemPrompt(opts.prompt);
     detectAgent(sid, opts.headers);
     const warnings: LanguageModelV2CallWarning[] = [];
@@ -1123,7 +1116,7 @@ export class ClwndModel implements LanguageModelV2 {
               }
 
               if (msg.action === "error") {
-                petal({ type: "error", error: new Error(msg.message) } as LanguageModelV2StreamPart);
+                petal({ type: "error", error: new Error(msg.message as string) } as LanguageModelV2StreamPart);
                 wilt();
                 return;
               }
