@@ -286,14 +286,41 @@ export function fromPrompt(
 // sessionId: the existing Claude CLI session ID
 // cwd: working directory
 
-export function graft(
-  ocMessages: Array<{ role: string; content: unknown }>,
+export async function graft(
+  ocSessionId: string,
   start: number,
   end: number | undefined,
   jsonlPath: string,
   sessionId: string,
   cwd: string,
-): number {
+  ocPort = 4096,
+): Promise<number> {
+  // Read OC session messages directly from the source
+  const resp = await fetch(`http://127.0.0.1:${ocPort}/session/${ocSessionId}/message`);
+  if (!resp.ok) throw new Error(`graft: failed to read OC session ${ocSessionId}: ${resp.status}`);
+  const ocData = await resp.json() as Array<{ info: { role: string }; parts: Array<{ type: string; text?: string; toolCallId?: string; toolName?: string; input?: unknown; result?: unknown }> }>;
+
+  // Transform OC messages to the format graft understands
+  const ocMessages: Array<{ role: string; content: unknown }> = [];
+  for (const m of ocData) {
+    const role = m.info.role;
+    if (role === "user") {
+      const content = m.parts
+        .filter(p => p.type === "text" && p.text)
+        .map(p => ({ type: "text", text: p.text }));
+      if (content.length > 0) ocMessages.push({ role: "user", content });
+    } else if (role === "assistant") {
+      const content: Array<Record<string, unknown>> = [];
+      for (const p of m.parts) {
+        if (p.type === "text" && p.text) content.push({ type: "text", text: p.text });
+        if (p.type === "tool" && p.toolCallId && p.toolName) {
+          content.push({ type: "tool-call", toolCallId: p.toolCallId, toolName: p.toolName, input: p.input });
+        }
+      }
+      if (content.length > 0) ocMessages.push({ role: "assistant", content });
+    }
+  }
+
   const slice = ocMessages.slice(start, end);
   if (slice.length === 0) return 0;
 
