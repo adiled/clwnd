@@ -348,6 +348,7 @@ const OC_TO_MCP: Record<string, string> = {
 };
 
 const lastAllowedTools = new Map<string, string>();
+const bloomedSessions = new Set<string>();
 
 // Agent-based tool restrictions
 const AGENT_DENY: Record<string, Set<string>> = {
@@ -772,6 +773,15 @@ export class ClwndModel implements LanguageModelV2 {
       return lt && Array.isArray(lt.content) && (lt.content as any[]).some((p: any) => p.toolCallId?.startsWith("perm-"));
     })();
 
+    // First prompt for this session — include full OC history for grafting
+    const priorPetals = !bloomedSessions.has(sid)
+      ? opts.prompt.filter(m => m.role === "user" || m.role === "assistant" || m.role === "tool")
+      : undefined;
+    if (priorPetals) {
+      bloomedSessions.add(sid);
+      trace("priorPetals", { sid, count: priorPetals.length, roles: priorPetals.map(m => m.role).join(",") });
+    }
+
     // Send prompt synchronously BEFORE creating the stream — survives OC plugin reload
     let promptSent = false;
     if (!listenOnly && humAlive) {
@@ -781,6 +791,7 @@ export class ClwndModel implements LanguageModelV2 {
         content, text, systemPrompt,
         permissions, allowedTools, listenOnly,
         ocServerUrl: self.config.pluginInput?.serverUrl?.toString(),
+        priorPetals,
         dusk: duskIn(30_000),
       });
       promptSent = true;
@@ -843,7 +854,8 @@ export class ClwndModel implements LanguageModelV2 {
             content, text, systemPrompt,
             permissions, allowedTools, listenOnly,
             ocServerUrl: self.config.pluginInput?.serverUrl?.toString(),
-                    dusk: duskIn(30_000),
+            priorPetals,
+            dusk: duskIn(30_000),
           });
         }
 

@@ -884,32 +884,32 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       if (ocServerUrl !== DEFAULT_OC_URL) session.ocServerUrl = ocServerUrl;
 
       // Graft: sync OC petals into Claude JSONL before spawning
-      if (!msg.listenOnly) {
-        trace("graft.enter", { sid });
+      const priorPetals = msg.priorPetals as Array<{ role: string; content: unknown }> | undefined;
+      if (!msg.listenOnly && priorPetals && priorPetals.length > 0) {
+        trace("graft.enter", { sid, petals: priorPetals.length });
         try {
           const effectiveCwd = cwd ?? session.cwd;
-          const sinceId = session.lastSyncedPetal?.[1] ?? null;
           if (session.claudeSessionId && session.claudeSessionPath) {
             // Existing JSONL — graft any new petals
-            const result = graft(sid, sinceId, null, session.claudeSessionPath, session.claudeSessionId, effectiveCwd);
+            const result = graft(priorPetals ?? [], session.claudeSessionPath, session.claudeSessionId, effectiveCwd);
             if (result.grafted > 0) {
               session.lastSyncedPetal = result.lastPetal;
               session.needsRespawn = true;
               saveSessions(sid);
-              trace("graft.done", { sid, grafted: result.grafted, lastPetal: result.lastPetal });
+              trace("graft.done", { sid, grafted: result.grafted });
             }
           } else {
             // Cold start — peek OC for petals, create JSONL only if there's content
             const peekId = randomUUID();
             const peekPath = createClaudeSession(effectiveCwd, peekId);
-            const result = graft(sid, sinceId, null, peekPath, peekId, effectiveCwd);
+            const result = graft(priorPetals ?? [], peekPath, peekId, effectiveCwd);
             if (result.grafted > 0) {
               session.claudeSessionId = peekId;
               session.claudeSessionPath = peekPath;
               session.lastSyncedPetal = result.lastPetal;
               session.needsRespawn = true;
               saveSessions(sid);
-              trace("graft.cold", { sid, grafted: result.grafted, lastPetal: result.lastPetal });
+              trace("graft.cold", { sid, grafted: result.grafted });
             } else {
               // No petals — delete the empty JSONL skeleton
               trace("graft.cold.empty", { sid });
@@ -1006,33 +1006,10 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
               cupped = [];
               batch = [];
               pending = false;
-              // Awaken + murmur via prompt handler (simulates a fresh prompt)
+              // Respawn with existing JSONL — history is already grafted from prior prompt
               if (promptContent) {
                 (async () => {
                   try {
-                    // Graft before respawn
-                    const sinceId = session.lastSyncedPetal?.[1] ?? null;
-                    if (!session.claudeSessionId) {
-                      const peekId = randomUUID();
-                      const peekPath = createClaudeSession(effectiveCwd, peekId);
-                      const result = graft(sid, sinceId, null, peekPath, peekId, effectiveCwd);
-                      if (result.grafted > 0) {
-                        session.claudeSessionId = peekId;
-                        session.claudeSessionPath = peekPath;
-                        session.lastSyncedPetal = result.lastPetal;
-                        saveSessions(sid);
-                        trace("graft.cold.swallow", { sid, grafted: result.grafted });
-                      } else {
-                        try { unlinkSync(peekPath); } catch {}
-                      }
-                    } else if (session.claudeSessionPath) {
-                      const result = graft(sid, sinceId, null, session.claudeSessionPath, session.claudeSessionId, effectiveCwd);
-                      if (result.grafted > 0) {
-                        session.lastSyncedPetal = result.lastPetal;
-                        saveSessions(sid);
-                        trace("graft.swallow", { sid, grafted: result.grafted });
-                      }
-                    }
                     session.needsRespawn = true;
                     nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd);
                     nest.murmur(sid, poolKey, promptContent);

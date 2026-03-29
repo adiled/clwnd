@@ -128,7 +128,7 @@ interface OcPartData {
   state?: { status?: string; input?: Record<string, unknown>; output?: string };
 }
 
-function readOcMessages(sessionId: string): Array<{ info: OcMessageInfo & { id: string }; parts: OcPartData[] }> {
+export function readOcMessages(sessionId: string): Array<{ info: OcMessageInfo & { id: string }; parts: OcPartData[] }> {
   if (!existsSync(OC_DB_PATH)) {
     trace("oc.db.missing", { path: OC_DB_PATH });
     return [];
@@ -398,133 +398,21 @@ export interface GraftResult {
 }
 
 export function graft(
-  ocSessionId: string,
-  sinceId: string | null,
-  upToId: string | null,
+  priorPetals: Array<{ role: string; content: unknown }>,
   jsonlPath: string,
   sessionId: string,
   cwd: string,
 ): GraftResult {
-  const ocData = readOcMessages(ocSessionId);
-
-  // Separate user and assistant messages, index by ID
-  interface OcEntry { id: string; content: ClaudeContent[]; toolResults: ClaudeContent[] }
-  const userMsgs = new Map<string, OcEntry>();
-  const assistantMsgs: Array<{ id: string; parentId: string; content: ClaudeContent[]; toolResults: ClaudeContent[] }> = [];
-
-  for (const m of ocData) {
-    if (m.info.role === "assistant" && m.info.summary) continue;
-    trace("graft.msg", { id: m.info.id, role: m.info.role, parts: m.parts.length, types: m.parts.map(p => p.type).join(",") || "none", parentID: m.info.parentID ?? "missing", providerID: m.info.providerID ?? "missing" });
-    if (m.parts.length > 0 && m.parts.every(p => p.type === "compaction" || p.type === "step-start" || p.type === "step-finish")) continue;
-
-    if (m.info.role === "user") {
-      const content: ClaudeContent[] = [];
-      for (const p of m.parts) {
-        if (p.type === "text" && p.text) content.push({ type: "text", text: p.text });
-      }
-      if (content.length > 0) userMsgs.set(m.info.id, { id: m.info.id, content, toolResults: [] });
-
-    } else if (m.info.role === "assistant" && m.info.parentID) {
-      // Skip clwnd's own turns — already in the JSONL via Claude CLI
-      if (m.info.providerID === "opencode-clwnd") continue;
-      const content: ClaudeContent[] = [];
-      const toolResults: ClaudeContent[] = [];
-      for (const p of m.parts) {
-        if (p.type === "text" && p.text) {
-          content.push({ type: "text", text: p.text });
-        } else if (p.type === "tool" && p.callID && p.tool) {
-          content.push({
-            type: "tool_use",
-            id: p.callID,
-            name: p.tool,
-            input: p.state?.input ?? {},
-          });
-          if (p.state?.status === "completed" && p.state.output) {
-            toolResults.push({
-              type: "tool_result",
-              tool_use_id: p.callID,
-              content: p.state.output,
-            });
-          }
-        }
-      }
-      if (content.length > 0) {
-        assistantMsgs.push({ id: m.info.id, parentId: m.info.parentID, content, toolResults });
-      }
-    }
-  }
-
-  // Pair into complete petals: user + assistant linked by parentID
-  interface CompletePetal {
-    userId: string;
-    assistantId: string;
-    userContent: ClaudeContent[];
-    assistantContent: ClaudeContent[];
-    toolResults: ClaudeContent[];
-  }
-  const petals: CompletePetal[] = [];
-  const pairedUsers = new Set<string>();
-  for (const asst of assistantMsgs) {
-    const user = userMsgs.get(asst.parentId);
-    if (!user) continue; // orphaned assistant — skip
-    if (pairedUsers.has(user.id)) continue; // already paired — skip duplicate
-    pairedUsers.add(user.id);
-    petals.push({
-      userId: user.id,
-      assistantId: asst.id,
-      userContent: user.content,
-      assistantContent: asst.content,
-      toolResults: asst.toolResults,
-    });
-  }
-
-  // Slice by assistant IDs: after sinceId (non-inclusive), up to upToId (inclusive)
-  let startIdx = 0;
-  if (sinceId) {
-    const idx = petals.findIndex(p => p.assistantId === sinceId);
-    startIdx = idx >= 0 ? idx + 1 : 0;
-  }
-  let endIdx = petals.length;
-  if (upToId) {
-    const idx = petals.findIndex(p => p.assistantId === upToId);
-    if (idx >= 0) endIdx = idx + 1;
-  }
-
-  trace("graft.paired", { ocMessages: ocData.length, users: userMsgs.size, completedAssistants: assistantMsgs.length, petals: petals.length, sinceId: sinceId ?? "null", startIdx, endIdx: petals.length });
-
-  const slice = petals.slice(startIdx, endIdx);
-  trace("graft.sliced", { count: slice.length, startIdx, endIdx });
-  if (slice.length === 0) return { grafted: 0, lastPetal: sinceId ? null : null };
-
-  // Append to existing JSONL
-  let parentUuid = lastUuid(jsonlPath);
-  const entryCount = slice.length * 2 + slice.filter(p => p.toolResults.length > 0).length;
-  const ts = makeTimestamps(entryCount);
-  let grafted = 0;
-
-  for (const petal of slice) {
-    trace("graft.petal", { userId: petal.userId, assistantId: petal.assistantId, userText: petal.userContent[0]?.type === "text" ? (petal.userContent[0] as ClaudeContentText).text.slice(0, 60) : "?" });
-    // User message
-    parentUuid = writeUserEntry(jsonlPath, {
-      parentUuid, sessionId, timestamp: ts(), content: petal.userContent, cwd,
-    });
-    // Assistant response
-    parentUuid = writeAssistantEntry(jsonlPath, {
-      parentUuid, sessionId, timestamp: ts(), content: petal.assistantContent, cwd,
-    });
-    // Tool results (as user entry in Claude JSONL format)
-    if (petal.toolResults.length > 0) {
-      parentUuid = writeUserEntry(jsonlPath, {
-        parentUuid, sessionId, timestamp: ts(), content: petal.toolResults, cwd,
-      });
-    }
-    grafted++;
-  }
-
-  if (parentUuid) updateLeafUuid(jsonlPath, parentUuid);
-
-  const last = slice[slice.length - 1];
-  return { grafted, lastPetal: [last.userId, last.assistantId] };
+  // Strip system messages and the trailing user message — murmur handles the current prompt
+  const conversation = priorPetals.filter(m => m.role !== "system");
+  const history = conversation.length > 0 && conversation[conversation.length - 1].role === "user"
+    ? conversation.slice(0, -1)
+    : conversation;
+  if (history.length === 0 || history.every(m => m.role === "user")) return { grafted: 0, lastPetal: null };
+  trace("graft.prompt", { turns: history.filter(m => m.role === "assistant").length, roles: history.map(m => m.role).join(",") });
+  fromPrompt(jsonlPath, sessionId, history, cwd);
+  const count = history.filter(m => m.role === "assistant").length;
+  return { grafted: count, lastPetal: null };
 }
 
 // ─── JSONL → Messages ──────────────────────────────────────────────────────
