@@ -524,7 +524,7 @@ interface Session {
   modelId: string;
   needsRespawn?: boolean;
   lastAccessed?: number;
-  lastSyncedPetalId?: string | null;
+  lastSyncedPetal?: [string, string] | null; // [userMessageId, assistantMessageId]
 }
 
 const STATE_DIR = process.env.XDG_STATE_HOME
