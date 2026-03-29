@@ -322,28 +322,31 @@ export function fromPrompt(
 
 // ─── Graft: splice OC session into existing Claude JSONL ───────────────────
 //
-// Reads OC session messages via SDK, transforms [start, end) slice into
-// Claude CLI entries, appends to existing JSONL. No new file, no new session.
+// Reads OC session messages via SDK. Grafts petals (complete turns) between
+// sinceId (non-inclusive) and upToId (inclusive, null = latest).
+// Appends to existing JSONL. No new file, no new session.
 // Claude CLI's own responses are preserved. No ghosts.
+//
+// Returns the ID of the last grafted OC message, or null if nothing grafted.
 
 export async function graft(
   ocClient: OcClient,
   ocSessionId: string,
-  start: number,
-  end: number | undefined,
+  sinceId: string | null,
+  upToId: string | null,
   jsonlPath: string,
   sessionId: string,
   cwd: string,
-): Promise<number> {
+): Promise<{ grafted: number; lastId: string | null }> {
   const resp = await ocClient.session.messages({ path: { id: ocSessionId } });
-  const ocData = (resp.data ?? []) as Array<{ info: Message; parts: Part[] }>;
+  const ocData = (resp.data ?? []) as Array<{ info: Message & { id: string; summary?: boolean }; parts: Part[] }>;
 
-  // Transform OC WithParts → flat role+content for JSONL writing
-  const messages: Array<{ role: string; content: ClaudeContent[] }> = [];
+  // Transform OC WithParts → flat petals with OC message IDs
+  interface Petal { id: string; role: string; content: ClaudeContent[] }
+  const petals: Petal[] = [];
 
   for (const m of ocData) {
-    // Skip compaction summaries and lifecycle-only messages
-    if (m.info.role === "assistant" && (m.info as { summary?: boolean }).summary) continue;
+    if (m.info.role === "assistant" && m.info.summary) continue;
     if (m.parts.every(p => p.type === "compaction" || p.type === "step-start" || p.type === "step-finish")) continue;
 
     if (m.info.role === "user") {
@@ -351,7 +354,7 @@ export async function graft(
       for (const p of m.parts) {
         if (p.type === "text") content.push({ type: "text", text: (p as TextPart).text });
       }
-      if (content.length > 0) messages.push({ role: "user", content });
+      if (content.length > 0) petals.push({ id: m.info.id, role: "user", content });
 
     } else if (m.info.role === "assistant") {
       const content: ClaudeContent[] = [];
@@ -368,7 +371,6 @@ export async function graft(
             name: tp.tool,
             input: (tp.state as { input?: Record<string, unknown> }).input ?? {},
           });
-          // Collect completed tool results for the tool_result user entry
           if (tp.state.status === "completed") {
             const completed = tp.state as ToolStateCompleted;
             toolResults.push({
@@ -379,36 +381,48 @@ export async function graft(
           }
         }
       }
-      if (content.length > 0) messages.push({ role: "assistant", content });
-      if (toolResults.length > 0) messages.push({ role: "tool", content: toolResults });
+      if (content.length > 0) petals.push({ id: m.info.id, role: "assistant", content });
+      if (toolResults.length > 0) petals.push({ id: m.info.id, role: "tool", content: toolResults });
     }
   }
 
-  // Slice the requested range
-  const slice = messages.slice(start, end);
-  if (slice.length === 0) return 0;
+  // Slice by IDs: after sinceId (non-inclusive), up to upToId (inclusive)
+  let startIdx = 0;
+  if (sinceId) {
+    const idx = petals.findIndex(p => p.id === sinceId);
+    startIdx = idx >= 0 ? idx + 1 : 0;
+  }
+  let endIdx = petals.length;
+  if (upToId) {
+    const idx = petals.findIndex(p => p.id === upToId);
+    if (idx >= 0) endIdx = idx + 1;
+  }
+
+  const slice = petals.slice(startIdx, endIdx);
+  if (slice.length === 0) return { grafted: 0, lastId: sinceId };
 
   // Append to existing JSONL
   let parentUuid = lastUuid(jsonlPath);
   const ts = makeTimestamps(slice.length);
   let grafted = 0;
+  let lastId: string | null = sinceId;
 
-  for (const msg of slice) {
-    if (msg.role === "user" || msg.role === "tool") {
+  for (const petal of slice) {
+    if (petal.role === "user" || petal.role === "tool") {
       parentUuid = writeUserEntry(jsonlPath, {
-        parentUuid, sessionId, timestamp: ts(), content: msg.content, cwd,
+        parentUuid, sessionId, timestamp: ts(), content: petal.content, cwd,
       });
-      grafted++;
-    } else if (msg.role === "assistant") {
+    } else if (petal.role === "assistant") {
       parentUuid = writeAssistantEntry(jsonlPath, {
-        parentUuid, sessionId, timestamp: ts(), content: msg.content, cwd,
+        parentUuid, sessionId, timestamp: ts(), content: petal.content, cwd,
       });
-      grafted++;
     }
+    lastId = petal.id;
+    grafted++;
   }
 
   if (parentUuid) updateLeafUuid(jsonlPath, parentUuid);
-  return grafted;
+  return { grafted, lastId };
 }
 
 // ─── JSONL → Messages ──────────────────────────────────────────────────────
