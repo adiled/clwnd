@@ -3,11 +3,11 @@
  * Claude CLI JSONL persistence. Both daemon and plugin import from here.
  */
 
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync } from "fs";
 import { randomUUID } from "crypto";
-import type { Message, Part, TextPart, ToolPart, ToolStateCompleted } from "@opencode-ai/sdk";
-import { createOpencodeClient } from "@opencode-ai/sdk";
+import { Database as BunDatabase } from "bun:sqlite";
 import { trace } from "../log.ts";
+import { join } from "path";
 
 // ─── Claude CLI JSONL Types ────────────────────────────────────────────────
 // Accurate to real JSONL files written by Claude CLI 2.1.86+.
@@ -101,9 +101,67 @@ export interface ClaudeLastPrompt {
 
 export type ClaudeEntry = ClaudeUserEntry | ClaudeAssistantEntry | ClaudeSummaryEntry | ClaudeQueueOperation | ClaudeLastPrompt;
 
-// ─── OC Client Type ────────────────────────────────────────────────────────
+// ─── OC Database ──────────────────────────────────────────────────────────
 
-export type OcClient = ReturnType<typeof createOpencodeClient>;
+const OC_DATA = process.env.XDG_DATA_HOME
+  ? join(process.env.XDG_DATA_HOME, "opencode")
+  : join(process.env.HOME ?? "/", ".local", "share", "opencode");
+const OC_DB_PATH = join(OC_DATA, "opencode.db");
+
+interface OcMessageRow { id: string; session_id: string; data: string }
+interface OcPartRow { id: string; message_id: string; data: string }
+
+interface OcMessageInfo {
+  role: "user" | "assistant";
+  parentID?: string;
+  providerID?: string;
+  modelID?: string;
+  summary?: boolean;
+  time?: { created?: number; completed?: number };
+}
+
+interface OcPartData {
+  type: string;
+  text?: string;
+  tool?: string;
+  callID?: string;
+  state?: { status?: string; input?: Record<string, unknown>; output?: string };
+}
+
+function readOcMessages(sessionId: string): Array<{ info: OcMessageInfo & { id: string }; parts: OcPartData[] }> {
+  if (!existsSync(OC_DB_PATH)) {
+    trace("oc.db.missing", { path: OC_DB_PATH });
+    return [];
+  }
+  const db = new BunDatabase(OC_DB_PATH, { readonly: true });
+  try {
+    const msgs = db.query<OcMessageRow, [string]>(
+      "SELECT id, session_id, data FROM message WHERE session_id = ? ORDER BY time_created, id"
+    ).all(sessionId);
+
+    const msgIds = msgs.map(m => m.id);
+    const partsByMsg = new Map<string, OcPartData[]>();
+    if (msgIds.length > 0) {
+      const placeholders = msgIds.map(() => "?").join(",");
+      const parts = db.query<OcPartRow, string[]>(
+        `SELECT id, message_id, data FROM part WHERE message_id IN (${placeholders}) ORDER BY message_id, id`
+      ).all(...msgIds);
+      for (const p of parts) {
+        const parsed = JSON.parse(p.data) as OcPartData;
+        const list = partsByMsg.get(p.message_id);
+        if (list) list.push(parsed);
+        else partsByMsg.set(p.message_id, [parsed]);
+      }
+    }
+
+    return msgs.map(m => ({
+      info: { ...JSON.parse(m.data) as OcMessageInfo, id: m.id },
+      parts: partsByMsg.get(m.id) ?? [],
+    }));
+  } finally {
+    db.close();
+  }
+}
 
 // ─── Path Resolution ───────────────────────────────────────────────────────
 
@@ -339,20 +397,15 @@ export interface GraftResult {
   lastPetal: [string, string] | null; // [userMsgId, assistantMsgId]
 }
 
-export async function graft(
-  ocClient: OcClient,
+export function graft(
   ocSessionId: string,
   sinceId: string | null,
   upToId: string | null,
   jsonlPath: string,
   sessionId: string,
   cwd: string,
-): Promise<GraftResult> {
-  const resp = await ocClient.session.messages({ path: { id: ocSessionId } });
-  const ocData = (resp.data ?? []) as Array<{
-    info: Message & { id: string; summary?: boolean; parentID?: string };
-    parts: Part[];
-  }>;
+): GraftResult {
+  const ocData = readOcMessages(ocSessionId);
 
   // Separate user and assistant messages, index by ID
   interface OcEntry { id: string; content: ClaudeContent[]; toolResults: ClaudeContent[] }
@@ -361,39 +414,36 @@ export async function graft(
 
   for (const m of ocData) {
     if (m.info.role === "assistant" && m.info.summary) continue;
-    const infoAny = m.info as unknown as Record<string, unknown>;
-    trace("graft.msg", { id: infoAny.id, role: m.info.role, parts: m.parts.length, types: m.parts.map(p => p.type).join(",") || "none", parentID: infoAny.parentID ?? "missing", providerID: infoAny.providerID ?? "missing" });
-    if (m.parts.every(p => p.type === "compaction" || p.type === "step-start" || p.type === "step-finish")) continue;
+    trace("graft.msg", { id: m.info.id, role: m.info.role, parts: m.parts.length, types: m.parts.map(p => p.type).join(",") || "none", parentID: m.info.parentID ?? "missing", providerID: m.info.providerID ?? "missing" });
+    if (m.parts.length > 0 && m.parts.every(p => p.type === "compaction" || p.type === "step-start" || p.type === "step-finish")) continue;
 
     if (m.info.role === "user") {
       const content: ClaudeContent[] = [];
       for (const p of m.parts) {
-        if (p.type === "text") content.push({ type: "text", text: (p as TextPart).text });
+        if (p.type === "text" && p.text) content.push({ type: "text", text: p.text });
       }
       if (content.length > 0) userMsgs.set(m.info.id, { id: m.info.id, content, toolResults: [] });
 
     } else if (m.info.role === "assistant" && m.info.parentID) {
       // Skip clwnd's own turns — already in the JSONL via Claude CLI
-      const providerID = (m.info as unknown as { providerID?: string }).providerID;
-      if (providerID === "opencode-clwnd") continue;
+      if (m.info.providerID === "opencode-clwnd") continue;
       const content: ClaudeContent[] = [];
       const toolResults: ClaudeContent[] = [];
       for (const p of m.parts) {
-        if (p.type === "text") {
-          content.push({ type: "text", text: (p as TextPart).text });
-        } else if (p.type === "tool") {
-          const tp = p as ToolPart;
+        if (p.type === "text" && p.text) {
+          content.push({ type: "text", text: p.text });
+        } else if (p.type === "tool" && p.callID && p.tool) {
           content.push({
             type: "tool_use",
-            id: tp.callID,
-            name: tp.tool,
-            input: (tp.state as { input?: Record<string, unknown> }).input ?? {},
+            id: p.callID,
+            name: p.tool,
+            input: p.state?.input ?? {},
           });
-          if (tp.state.status === "completed") {
+          if (p.state?.status === "completed" && p.state.output) {
             toolResults.push({
               type: "tool_result",
-              tool_use_id: tp.callID,
-              content: (tp.state as ToolStateCompleted).output,
+              tool_use_id: p.callID,
+              content: p.state.output,
             });
           }
         }

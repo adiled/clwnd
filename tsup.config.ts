@@ -5,5 +5,5 @@ export default defineConfig({
   format: "esm",
   platform: "node",
   target: "node18",
-  external: ["bun"],
+  external: ["bun", "bun:sqlite"],
 });

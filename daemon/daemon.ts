@@ -9,7 +9,7 @@ import { loadConfig } from "../lib/config.ts";
 import { sigil, rid as makeRid, echo, pulse, isDusk, classifySuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type DroneState, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
 import { droneThink, setDroneWorkspace, releaseDroneSession } from "../lib/drone-llm.ts";
 import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, type GraftResult } from "../lib/session.ts";
-import { createOpencodeClient } from "@opencode-ai/sdk";
+
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
 
@@ -607,15 +607,6 @@ const HTTP = SOCK + ".http";
 
 const nest = new ClaudeNest(process.env.CLAUDE_CLI_PATH ?? "claude");
 const wane = new WaneTracker();
-const ocClients = new Map<string, ReturnType<typeof createOpencodeClient>>();
-function getOcClient(baseUrl: string): ReturnType<typeof createOpencodeClient> {
-  let client = ocClients.get(baseUrl);
-  if (!client) {
-    client = createOpencodeClient({ baseUrl });
-    ocClients.set(baseUrl, client);
-  }
-  return client;
-}
 const DEFAULT_OC_URL = "http://127.0.0.1:4096";
 
 // Drone: self-governing observer — opt-in via droned:true in clwnd.json
@@ -894,13 +885,13 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
 
       // Graft: sync OC petals into Claude JSONL before spawning
       if (!msg.listenOnly) {
-        trace("graft.enter", { sid, ocServerUrl });
+        trace("graft.enter", { sid });
         try {
           const effectiveCwd = cwd ?? session.cwd;
           const sinceId = session.lastSyncedPetal?.[1] ?? null;
           if (session.claudeSessionId && session.claudeSessionPath) {
             // Existing JSONL — graft any new petals
-            const result = await graft(getOcClient(ocServerUrl), sid, sinceId, null, session.claudeSessionPath, session.claudeSessionId, effectiveCwd);
+            const result = graft(sid, sinceId, null, session.claudeSessionPath, session.claudeSessionId, effectiveCwd);
             if (result.grafted > 0) {
               session.lastSyncedPetal = result.lastPetal;
               session.needsRespawn = true;
@@ -911,7 +902,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
             // Cold start — peek OC for petals, create JSONL only if there's content
             const peekId = randomUUID();
             const peekPath = createClaudeSession(effectiveCwd, peekId);
-            const result = await graft(getOcClient(ocServerUrl), sid, sinceId, null, peekPath, peekId, effectiveCwd);
+            const result = graft(sid, sinceId, null, peekPath, peekId, effectiveCwd);
             if (result.grafted > 0) {
               session.claudeSessionId = peekId;
               session.claudeSessionPath = peekPath;
@@ -921,7 +912,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
               trace("graft.cold", { sid, grafted: result.grafted, lastPetal: result.lastPetal });
             } else {
               // No petals — delete the empty JSONL skeleton
-              trace("graft.cold.empty", { sid, ocServerUrl });
+              trace("graft.cold.empty", { sid });
               try { unlinkSync(peekPath); } catch {}
             }
           }
@@ -1024,7 +1015,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
                     if (!session.claudeSessionId) {
                       const peekId = randomUUID();
                       const peekPath = createClaudeSession(effectiveCwd, peekId);
-                      const result = await graft(getOcClient(ocUrl), sid, sinceId, null, peekPath, peekId, effectiveCwd);
+                      const result = graft(sid, sinceId, null, peekPath, peekId, effectiveCwd);
                       if (result.grafted > 0) {
                         session.claudeSessionId = peekId;
                         session.claudeSessionPath = peekPath;
@@ -1035,7 +1026,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
                         try { unlinkSync(peekPath); } catch {}
                       }
                     } else if (session.claudeSessionPath) {
-                      const result = await graft(getOcClient(ocUrl), sid, sinceId, null, session.claudeSessionPath, session.claudeSessionId, effectiveCwd);
+                      const result = graft(sid, sinceId, null, session.claudeSessionPath, session.claudeSessionId, effectiveCwd);
                       if (result.grafted > 0) {
                         session.lastSyncedPetal = result.lastPetal;
                         saveSessions(sid);
