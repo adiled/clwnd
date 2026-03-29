@@ -273,9 +273,131 @@ export function fromPrompt(
   }
 }
 
-// ─── Future: JSONL → Messages ───────────────────────────────────────────────
+// ─── Graft: splice OC history into an existing Claude JSONL ────────────────
+//
+// Pure function. Reads OC messages (from opts.prompt), transforms the slice
+// [start, end) into Claude CLI JSONL entries, appends them to an existing
+// JSONL at the current tail. Updates leafUuid. No new file, no new session ID.
+//
+// ocMessages: the full OC conversation (from opts.prompt, excluding system)
+// start: index of first message to graft (inclusive)
+// end: index of last message to graft (exclusive), or undefined for all remaining
+// jsonlPath: path to the existing Claude CLI JSONL
+// sessionId: the existing Claude CLI session ID
+// cwd: working directory
+
+export function graft(
+  ocMessages: Array<{ role: string; content: unknown }>,
+  start: number,
+  end: number | undefined,
+  jsonlPath: string,
+  sessionId: string,
+  cwd: string,
+): number {
+  const slice = ocMessages.slice(start, end);
+  if (slice.length === 0) return 0;
+
+  let parentUuid = lastUuid(jsonlPath);
+  const baseTime = Date.now() - slice.length * 10_000;
+  let idx = 0;
+  const ts = () => new Date(baseTime + (idx++) * 10_000).toISOString();
+  let grafted = 0;
+
+  for (const msg of slice) {
+    const contentArr = msg.content;
+
+    if (msg.role === "user") {
+      const content: Array<Record<string, unknown>> = [];
+      if (typeof contentArr === "string") {
+        content.push({ type: "text", text: contentArr });
+      } else if (Array.isArray(contentArr)) {
+        for (const p of contentArr as Array<Record<string, unknown>>) {
+          if (p.type === "text" && p.text) content.push({ type: "text", text: p.text });
+        }
+      }
+      if (content.length === 0) continue;
+      parentUuid = appendEntry(jsonlPath, {
+        type: "user", parentUuid, sessionId, isSidechain: false, timestamp: ts(),
+        promptId: randomUUID(),
+        message: { role: "user", content },
+        permissionMode: "default",
+        userType: "external", entrypoint: "sdk-cli", cwd, version: "2.1.80", gitBranch: "main",
+      });
+      grafted++;
+
+    } else if (msg.role === "assistant") {
+      const content: Array<Record<string, unknown>> = [];
+      if (typeof contentArr === "string") {
+        if (contentArr) content.push({ type: "text", text: contentArr });
+      } else if (Array.isArray(contentArr)) {
+        for (const p of contentArr as Array<Record<string, unknown>>) {
+          if (p.type === "text" && p.text) content.push({ type: "text", text: p.text });
+          else if (p.type === "tool-call" && p.toolCallId && p.toolName) {
+            let input: unknown = {};
+            try { input = typeof p.input === "string" ? JSON.parse(p.input as string) : p.input; } catch {}
+            content.push({ type: "tool_use", id: p.toolCallId, name: p.toolName, input });
+          } else if (p.type === "reasoning") continue; // skip — requires cryptographic signature
+        }
+      }
+      if (content.length === 0) content.push({ type: "text", text: "(no text response)" });
+      parentUuid = appendEntry(jsonlPath, {
+        type: "assistant", parentUuid, sessionId, isSidechain: false, timestamp: ts(),
+        requestId: `req_01${randomUUID().replace(/-/g, "").slice(0, 20)}`,
+        message: {
+          model: "claude-sonnet-4-5-20250929",
+          id: `msg_01${randomUUID().replace(/-/g, "").slice(0, 20)}`,
+          type: "message", role: "assistant", content,
+          stop_reason: "end_turn", stop_sequence: null,
+          usage: {
+            input_tokens: 0, output_tokens: 0,
+            cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            server_tool_use: { web_search_requests: 0, web_fetch_requests: 0 },
+            service_tier: "standard",
+            cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 0 },
+            inference_geo: "", iterations: [], speed: "standard",
+          },
+        },
+        userType: "external", entrypoint: "sdk-cli", cwd, version: "2.1.80", gitBranch: "main",
+      });
+      grafted++;
+
+    } else if (msg.role === "tool") {
+      const content: Array<Record<string, unknown>> = [];
+      if (Array.isArray(contentArr)) {
+        for (const p of contentArr as Array<Record<string, unknown>>) {
+          if (p.type === "tool-result" && p.toolCallId) {
+            const result = typeof p.result === "string" ? p.result : JSON.stringify(p.result ?? "");
+            content.push({ type: "tool_result", tool_use_id: p.toolCallId, content: result });
+          }
+        }
+      }
+      if (content.length === 0) continue;
+      parentUuid = appendEntry(jsonlPath, {
+        type: "user", parentUuid, sessionId, isSidechain: false, timestamp: ts(),
+        promptId: randomUUID(),
+        message: { role: "user", content },
+        userType: "external", entrypoint: "sdk-cli", cwd, version: "2.1.80", gitBranch: "main",
+      });
+      grafted++;
+    }
+  }
+
+  // Update leafUuid — tells --resume where the conversation ends
+  if (parentUuid) {
+    const lines = readFileSync(jsonlPath, "utf-8").trim().split("\n");
+    if (lines.length > 0) {
+      const summary = JSON.parse(lines[0]);
+      summary.leafUuid = parentUuid;
+      lines[0] = JSON.stringify(summary);
+      writeFileSync(jsonlPath, lines.join("\n") + "\n");
+    }
+  }
+
+  return grafted;
+}
+
+// ─── JSONL → Messages ──────────────────────────────────────────────────────
 // Read Claude CLI JSONL and convert to OC-compatible message array.
-// Placeholder for bidirectional session transfer.
 
 export function toMessages(path: string): Array<{ role: string; content: unknown }> {
   const entries = readEntries(path);
