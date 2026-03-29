@@ -4,7 +4,7 @@
  */
 
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync } from "fs";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import { Database as BunDatabase } from "bun:sqlite";
 import { trace } from "../log.ts";
 import { join } from "path";
@@ -397,44 +397,102 @@ export interface GraftResult {
   lastPetal: [string, string] | null; // [userMsgId, assistantMsgId]
 }
 
+// ─── Chain Hash ───────────────────────────────────────────────────────────
+// Rolling hash over user messages only. Each link = hash(prevHash + userText).
+// User messages are invariant — same text in both JSONL and priorPetals.
+// Assistant responses differ (Claude writes its own formatting) — excluded.
+// The tip hash encodes the exact sequence of all user messages.
+
+function chainLink(prev: string, text: string): string {
+  return createHash("sha256").update(prev + text).digest("hex").slice(0, 16);
+}
+
+function promptText(msg: { role: string; content: unknown }): string {
+  const raw = msg.content;
+  if (typeof raw === "string") return raw;
+  if (!Array.isArray(raw)) return "";
+  return (raw as Array<Record<string, unknown>>)
+    .filter(p => p.type === "text" && p.text)
+    .map(p => p.text as string)
+    .join("");
+}
+
+/** Build user-only hash chain from AI SDK prompt. Returns [hashes, convIdx] pairs. */
+function chainFromPrompt(history: Array<{ role: string; content: unknown }>): { hash: string; convIdx: number }[] {
+  const chain: { hash: string; convIdx: number }[] = [];
+  let prev = "0";
+  for (let i = 0; i < history.length; i++) {
+    if (history[i].role === "user") {
+      prev = chainLink(prev, promptText(history[i]));
+      chain.push({ hash: prev, convIdx: i });
+    }
+  }
+  return chain;
+}
+
+/** Build user-only hash chain from Claude JSONL. */
+function chainFromJSONL(entries: ClaudeEntry[]): string[] {
+  const chain: string[] = [];
+  let prev = "0";
+  for (const e of entries) {
+    if (e.type === "user" && "message" in e) {
+      const text = (e as ClaudeUserEntry).message.content
+        .filter(c => c.type === "text")
+        .map(c => (c as ClaudeContentText).text)
+        .join("");
+      prev = chainLink(prev, text);
+      chain.push(prev);
+    }
+  }
+  return chain;
+}
+
+// ─── Graft ────────────────────────────────────────────────────────────────
+
 export function graft(
   priorPetals: Array<{ role: string; content: unknown }>,
   jsonlPath: string,
   sessionId: string,
   cwd: string,
 ): GraftResult {
-  // Strip system messages and the trailing user message — murmur handles the current prompt
+  // Strip system messages and trailing user — murmur handles the current prompt
   const conversation = priorPetals.filter(m => m.role !== "system");
   const history = conversation.length > 0 && conversation[conversation.length - 1].role === "user"
     ? conversation.slice(0, -1)
     : conversation;
   if (history.length === 0 || history.every(m => m.role === "user")) return { grafted: 0, lastPetal: null };
 
-  // Compare with existing JSONL — only write the delta.
-  // Count user+assistant pairs in JSONL (Claude's own writes + prior grafts).
-  // Skip that many pairs from the history. Only graft what's new.
+  // Build user-only hash chains
+  const promptChain = chainFromPrompt(history);
   const existing = readEntries(jsonlPath);
-  const existingPairs = existing.filter(e => e.type === "assistant").length;
+  const jsonlChain = chainFromJSONL(existing);
 
-  // Count pairs in history (each assistant = one pair completed)
-  let historyPairs = 0;
+  // Find merge-base: last JSONL tip in prompt chain
   let deltaStart = 0;
-  for (let i = 0; i < history.length; i++) {
-    if (history[i].role === "assistant") {
-      historyPairs++;
-      if (historyPairs <= existingPairs) {
-        deltaStart = i + 1; // skip past this pair
+  if (jsonlChain.length > 0) {
+    const tip = jsonlChain[jsonlChain.length - 1];
+    for (let i = promptChain.length - 1; i >= 0; i--) {
+      if (promptChain[i].hash === tip) {
+        // Merge-base found at this user message in the conversation.
+        // Skip past this user and its paired assistant.
+        let skip = promptChain[i].convIdx + 1;
+        // Skip the assistant(s) that follow the matched user
+        while (skip < history.length && history[skip].role !== "user") skip++;
+        deltaStart = skip;
+        break;
       }
     }
   }
 
   const delta = history.slice(deltaStart);
 
-  trace("graft.prompt", {
-    historyPairs,
-    existingPairs,
+  trace("graft.chain", {
+    promptUsers: promptChain.length,
+    jsonlUsers: jsonlChain.length,
+    deltaStart,
     deltaLen: delta.length,
     roles: delta.map(m => m.role).join(",") || "none",
+    tip: jsonlChain.length > 0 ? jsonlChain[jsonlChain.length - 1] : "empty",
   });
 
   if (delta.length === 0 || delta.every(m => m.role === "user")) return { grafted: 0, lastPetal: null };
