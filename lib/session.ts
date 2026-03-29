@@ -7,6 +7,7 @@ import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "fs";
 import { randomUUID } from "crypto";
 import type { Message, Part, TextPart, ToolPart, ToolStateCompleted } from "@opencode-ai/sdk";
 import { createOpencodeClient } from "@opencode-ai/sdk";
+import { trace } from "../log.ts";
 
 // ─── Claude CLI JSONL Types ────────────────────────────────────────────────
 // Accurate to real JSONL files written by Claude CLI 2.1.86+.
@@ -370,6 +371,12 @@ export async function graft(
       if (content.length > 0) userMsgs.set(m.info.id, { id: m.info.id, content, toolResults: [] });
 
     } else if (m.info.role === "assistant" && m.info.parentID) {
+      // Skip in-flight responses — only graft completed petals
+      const time = (m.info as unknown as { time?: { completed?: number } }).time;
+      if (!time?.completed) continue;
+      // Skip clwnd's own turns — already in the JSONL via Claude CLI
+      const providerID = (m.info as unknown as { providerID?: string }).providerID;
+      if (providerID?.startsWith("opencode-clwnd")) continue;
       const content: ClaudeContent[] = [];
       const toolResults: ClaudeContent[] = [];
       for (const p of m.parts) {
@@ -407,9 +414,12 @@ export async function graft(
     toolResults: ClaudeContent[];
   }
   const petals: CompletePetal[] = [];
+  const pairedUsers = new Set<string>();
   for (const asst of assistantMsgs) {
     const user = userMsgs.get(asst.parentId);
     if (!user) continue; // orphaned assistant — skip
+    if (pairedUsers.has(user.id)) continue; // already paired — skip duplicate
+    pairedUsers.add(user.id);
     petals.push({
       userId: user.id,
       assistantId: asst.id,
@@ -431,7 +441,10 @@ export async function graft(
     if (idx >= 0) endIdx = idx + 1;
   }
 
+  trace("graft.paired", { ocMessages: ocData.length, users: userMsgs.size, completedAssistants: assistantMsgs.length, petals: petals.length, sinceId: sinceId ?? "null", startIdx, endIdx: petals.length });
+
   const slice = petals.slice(startIdx, endIdx);
+  trace("graft.sliced", { count: slice.length, startIdx, endIdx });
   if (slice.length === 0) return { grafted: 0, lastPetal: sinceId ? null : null };
 
   // Append to existing JSONL
@@ -441,6 +454,7 @@ export async function graft(
   let grafted = 0;
 
   for (const petal of slice) {
+    trace("graft.petal", { userId: petal.userId, assistantId: petal.assistantId, userText: petal.userContent[0]?.type === "text" ? (petal.userContent[0] as ClaudeContentText).text.slice(0, 60) : "?" });
     // User message
     parentUuid = writeUserEntry(jsonlPath, {
       parentUuid, sessionId, timestamp: ts(), content: petal.userContent, cwd,
