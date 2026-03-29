@@ -13,7 +13,7 @@ const SUITE_DIR = join(HOME, ".clwnd-e2e-serve");
 const PROJECT_DIR = join(SUITE_DIR, "project");
 const TIMEOUT = 180_000;
 const SEED_FIXTURE = join(import.meta.dir, "fixtures", "seed-session.json");
-const DUMMY_MODEL = { providerID: "opencode-dummy", modelID: "gpt-5-nano" };
+const DUMMY_MODEL = { providerID: "piano", modelID: "pianoV2" };
 
 // Track sessions created during each test for cleanup
 const activeSessions: string[] = [];
@@ -278,15 +278,14 @@ beforeAll(async () => {
   const dummyJs = `file://${join(import.meta.dir, "fixtures", "dummy-provider.js")}`;
   await Bun.write(join(PROJECT_DIR, "opencode.json"), JSON.stringify({
     "$schema": "https://opencode.ai/config.json",
-    small_model: "opencode/gpt-5-nano",
     plugin: [dummyJs],
     provider: {
-      "opencode-dummy": {
+      "piano": {
         npm: dummyJs,
         models: {
-          "gpt-5-nano": {
-            id: "gpt-5-nano",
-            name: "Dummy Free Model",
+          "pianoV2": {
+            id: "pianoV2",
+            name: "Piano Free Model",
             tool_call: false,
             limit: { context: 128000, output: 4096 },
           },
@@ -1016,7 +1015,7 @@ describe("e2e-serve: compaction", () => {
     const summarizeReq = fetch(`${BASE}/session/${sid}/summarize`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ providerID: "opencode", modelID: "gpt-5-nano", auto: false }),
+      body: JSON.stringify({ providerID: "opencode", modelID: "pianoV2", auto: false }),
     });
 
     // Wait for session.compacted event (timeout 120s — free model compaction is slow)

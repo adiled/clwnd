@@ -3,72 +3,90 @@ const { join } = require("path");
 
 // Load seed fixture — replay assistant responses in order
 const fixture = JSON.parse(readFileSync(join(__dirname, "seed-session.json"), "utf8"));
-const assistantTexts = fixture.messages
+const assistantParts = fixture.messages
   .filter(m => m.info.role === "assistant")
-  .map(m => m.parts.filter(p => p.type === "text").map(p => p.text).join("\n"));
+  .map(m => m.parts);
 let replayIdx = 0;
 
-function nextReply(userText) {
-  // If we have fixture responses, replay them; otherwise echo
-  if (replayIdx < assistantTexts.length) {
-    return assistantTexts[replayIdx++];
+function nextParts(userText) {
+  if (replayIdx < assistantParts.length) {
+    return assistantParts[replayIdx++];
   }
-  return "OK. " + userText;
+  // Fallback: simple text response
+  return [{ type: "text", text: "OK. " + userText }];
 }
 
-exports.default = async function(input) {
-  return {
-    models: {
-      "gpt-5-nano": {
-        specificationVersion: "v2",
-        modelId: "gpt-5-nano",
-        provider: "opencode",
-        supportedUrls: {},
-        async doGenerate(opts) {
-          const last = opts.prompt.findLast(m => m.role === "user");
-          const text = typeof last?.content === "string"
-            ? last.content
-            : (last?.content ?? []).filter(p => p.type === "text").map(p => p.text).join(" ");
-          const reply = nextReply(text);
-          return {
-            content: [{ type: "text", text: reply }],
-            usage: { inputTokens: 10, outputTokens: reply.length, totalTokens: reply.length + 10 },
-            finishReason: "stop",
-            response: { id: "dummy-" + Date.now(), timestamp: new Date(), modelId: "gpt-5-nano" },
-            providerMetadata: {},
-            warnings: [],
-            request: { body: {} },
-          };
-        },
-        async doStream(opts) {
-          const last = opts.prompt.findLast(m => m.role === "user");
-          const text = typeof last?.content === "string"
-            ? last.content
-            : (last?.content ?? []).filter(p => p.type === "text").map(p => p.text).join(" ");
-          const reply = nextReply(text);
-          const id = "dummy-" + Date.now();
-          return {
-            stream: new ReadableStream({
-              async start(controller) {
-                await new Promise(r => setTimeout(r, 10));
-                controller.enqueue({ type: "response-metadata", id, timestamp: new Date(), modelId: "gpt-5-nano" });
+// AI SDK provider factory — OC looks for exports starting with "create"
+exports.createPiano = function createPiano(options) {
+  const model = {
+    specificationVersion: "v2",
+    modelId: "pianoV2",
+    provider: options?.name ?? "piano",
+    supportedUrls: {},
+    async doGenerate(opts) {
+      const last = opts.prompt.findLast(m => m.role === "user");
+      const text = typeof last?.content === "string"
+        ? last.content
+        : (last?.content ?? []).filter(p => p.type === "text").map(p => p.text).join(" ");
+      const parts = nextParts(text);
+      const reply = parts.filter(p => p.type === "text").map(p => p.text).join("\n");
+      return {
+        content: [{ type: "text", text: reply }],
+        usage: { inputTokens: 10, outputTokens: reply.length, totalTokens: reply.length + 10 },
+        finishReason: "stop",
+        response: { id: "dummy-" + Date.now(), timestamp: new Date(), modelId: "pianoV2" },
+        providerMetadata: {},
+        warnings: [],
+        request: { body: {} },
+      };
+    },
+    async doStream(opts) {
+      const last = opts.prompt.findLast(m => m.role === "user");
+      const text = typeof last?.content === "string"
+        ? last.content
+        : (last?.content ?? []).filter(p => p.type === "text").map(p => p.text).join(" ");
+      const parts = nextParts(text);
+      const id = "dummy-" + Date.now();
+      let reasoningIdx = 0;
+
+      return {
+        stream: new ReadableStream({
+          async start(controller) {
+            await new Promise(r => setTimeout(r, 10));
+            controller.enqueue({ type: "response-metadata", id, timestamp: new Date(), modelId: "pianoV2" });
+
+            for (const p of parts) {
+              if (p.type === "reasoning") {
+                const rid = "r" + (reasoningIdx++);
+                controller.enqueue({ type: "reasoning-start", id: rid });
+                controller.enqueue({ type: "reasoning-delta", id: rid, delta: p.text });
+                controller.enqueue({ type: "reasoning-end", id: rid });
+              } else if (p.type === "text") {
                 controller.enqueue({ type: "text-start", id: "t1" });
-                controller.enqueue({ type: "text-delta", id: "t1", delta: reply });
+                controller.enqueue({ type: "text-delta", id: "t1", delta: p.text });
                 controller.enqueue({ type: "text-end", id: "t1" });
-                controller.enqueue({
-                  type: "finish",
-                  finishReason: "stop",
-                  usage: { inputTokens: 10, outputTokens: reply.length, totalTokens: reply.length + 10 },
-                  providerMetadata: {},
-                });
-                controller.close();
-              },
-            }),
-            rawCall: { raw: {}, rawHeaders: {} },
-            warnings: [],
-          };
-        },
-      },
+              }
+            }
+
+            const totalText = parts.filter(p => p.type === "text" || p.type === "reasoning").map(p => p.text || "").join("");
+            controller.enqueue({
+              type: "finish",
+              finishReason: "stop",
+              usage: { inputTokens: 10, outputTokens: totalText.length, totalTokens: totalText.length + 10 },
+              providerMetadata: {},
+            });
+            controller.close();
+          },
+        }),
+        rawCall: { raw: {}, rawHeaders: {} },
+        warnings: [],
+      };
+    },
+  };
+
+  return {
+    languageModel(modelId) {
+      return model;
     },
   };
 };

@@ -361,7 +361,8 @@ export async function graft(
 
   for (const m of ocData) {
     if (m.info.role === "assistant" && m.info.summary) continue;
-    trace("graft.msg", { id: (m.info as unknown as { id: string }).id, role: m.info.role, parts: m.parts.length, types: m.parts.map(p => p.type).join(",") || "none" });
+    const infoAny = m.info as unknown as Record<string, unknown>;
+    trace("graft.msg", { id: infoAny.id, role: m.info.role, parts: m.parts.length, types: m.parts.map(p => p.type).join(",") || "none", parentID: infoAny.parentID ?? "missing", providerID: infoAny.providerID ?? "missing" });
     if (m.parts.every(p => p.type === "compaction" || p.type === "step-start" || p.type === "step-finish")) continue;
 
     if (m.info.role === "user") {
@@ -374,7 +375,7 @@ export async function graft(
     } else if (m.info.role === "assistant" && m.info.parentID) {
       // Skip clwnd's own turns — already in the JSONL via Claude CLI
       const providerID = (m.info as unknown as { providerID?: string }).providerID;
-      if (providerID?.startsWith("opencode-clwnd")) continue;
+      if (providerID === "opencode-clwnd") continue;
       const content: ClaudeContent[] = [];
       const toolResults: ClaudeContent[] = [];
       for (const p of m.parts) {
