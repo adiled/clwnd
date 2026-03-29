@@ -556,6 +556,7 @@ interface Session {
   lastAccessed?: number;
   lastSyncedPetal?: [string, string] | null; // [userMessageId, assistantMessageId]
   ocServerUrl?: string;
+  thorns?: number; // consecutive error count — circuit breaker
 }
 
 const STATE_DIR = process.env.XDG_STATE_HOME
@@ -883,6 +884,14 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       if (cwd) session.cwd = cwd;
       if (ocServerUrl !== DEFAULT_OC_URL) session.ocServerUrl = ocServerUrl;
 
+      // Circuit breaker — stop after 3 consecutive errors
+      const MAX_THORNS = 3;
+      if ((session.thorns ?? 0) >= MAX_THORNS) {
+        trace("nest.thorns.breaker", { sid, thorns: session.thorns });
+        hum(sid, { chi: "error", sid, message: `circuit breaker: ${session.thorns} consecutive errors` });
+        return;
+      }
+
       // Graft: sync OC petals into Claude JSONL before spawning
       const priorPetals = msg.priorPetals as Array<{ role: string; content: unknown }> | undefined;
       if (!msg.listenOnly && priorPetals && priorPetals.length > 0) {
@@ -1064,6 +1073,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         })(),
         onWilt(harvest) {
           if (withered) return; // withered petal — don't send finish for bad petals
+          session.thorns = 0; // reset circuit breaker on success
           if (uncup) uncup(); // uncup any remaining petals before finish
           hum(sid, {
             chi: "finish", sid,
@@ -1074,6 +1084,8 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           nest.hush(sid, poolKey);
         },
         onThorn(wound) {
+          session.thorns = (session.thorns ?? 0) + 1;
+          trace("nest.thorn", { sid, wound: wound.slice(0, 100), thorns: session.thorns });
           hum(sid, { chi: "error", sid, message: wound });
           nest.fell(sid, poolKey);
         },
