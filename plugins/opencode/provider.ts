@@ -1,11 +1,36 @@
-import { generateId } from "@ai-sdk/provider-utils";
-import { loadConfig } from "../../lib/config.ts";
-import { sigil as makeSigil, Drone, duskIn, type DroneAction } from "../../lib/hum.ts";
-
-// ─── Logging ────────────────────────────────────────────────────────────────
-// Three destinations: plugin log file (always), hum → daemon (when connected), OC debug (when client ready).
+/**
+ * clwnd provider — LanguageModelV3 for OpenCode.
+ *
+ * Receives Claude CLI stream events from the daemon via hum,
+ * emits v3 stream parts to OC's processor. Clean pipe — daemon
+ * owns seeding, cupping, and drone evaluation.
+ */
 
 import { appendFileSync, mkdirSync } from "fs";
+import { connect as netConnect, type Socket as NetSocket } from "net";
+import { loadConfig, type ClwndConfig as CfgShape } from "../../lib/config.ts";
+import { sigil as makeSigil, Drone, duskIn, type DroneAction } from "../../lib/hum.ts";
+
+import type {
+  LanguageModelV3,
+  LanguageModelV3CallOptions,
+  LanguageModelV3StreamPart,
+  LanguageModelV3StreamResult,
+  LanguageModelV3GenerateResult,
+  LanguageModelV3FinishReason,
+  LanguageModelV3Usage,
+  LanguageModelV3Prompt,
+} from "@ai-sdk/provider";
+
+// ─── Config ──────────────────────────────────────────────────────────────
+
+export interface ClwndConfig {
+  cwd?: string;
+  client?: any;
+  pluginInput?: any;
+}
+
+// ─── Logging ─────────────────────────────────────────────────────────────
 
 const LOG_DIR = `${process.env.XDG_STATE_HOME || process.env.HOME + "/.local/state"}/clwnd`;
 const LOG_FILE = `${LOG_DIR}/plugin.log`;
@@ -39,23 +64,11 @@ export function log(event: string, data?: Record<string, unknown>): void {
   }
   hum({ chi: "log", level: "info", event, data });
 }
-import type {
-  LanguageModelV2,
-  LanguageModelV2CallWarning,
-  LanguageModelV2Content,
-  LanguageModelV2FinishReason,
-  LanguageModelV2StreamPart,
-  LanguageModelV2Usage,
-  LanguageModelV2Prompt,
-  SharedV2ProviderMetadata,
-} from "@ai-sdk/provider";
-import type { ClwndConfig } from "./types.ts";
 
-// ─── Tool Mapping (Claude CLI MCP → OpenCode native) ────────────────────────
+// ─── Tool Mapping (Claude CLI MCP → OpenCode native) ────────────────────
 
 const MCP_PREFIX = "mcp__clwnd__";
 
-// Map tool names to OpenCode equivalents
 const TOOL_NAME_MAP: Record<string, string> = {
   WebFetch: "webfetch", WebSearch: "websearch",
   TodoWrite: "todowrite", AskUserQuestion: "question",
@@ -67,33 +80,24 @@ function mapToolName(name: string): string {
   return TOOL_NAME_MAP[name] ?? name;
 }
 
-// Tools that OpenCode should execute (providerExecuted: false).
-// These are brokered: MCP server runs them for Claude CLI, but we
-// tell OpenCode to also execute them natively for state/UI integration.
-// Tools that OpenCode should execute (providerExecuted: false).
-// MCP server still runs them for Claude CLI, but we tell OpenCode
-// to also execute them natively for state/UI integration.
 const BROKERED_TOOLS = new Set(["webfetch", "websearch", "todowrite"]);
 
-// snake_case → camelCase field mapping per tool
 const INPUT_FIELD_MAP: Record<string, Record<string, string>> = {
   read:  { file_path: "filePath" },
   edit:  { file_path: "filePath", old_string: "oldString", new_string: "newString", replace_all: "replaceAll" },
   write: { file_path: "filePath" },
-  bash:  {}, // command, description, timeout are already correct
-  glob:  {}, // pattern, path are already correct
-  grep:  {}, // pattern, path, include are already correct
+  bash:  {},
+  glob:  {},
+  grep:  {},
 };
 
 function mapToolInput(toolName: string, input: string): string {
   const ocName = mapToolName(toolName);
-
-  // TodoWrite: ensure each todo has 'priority', remove 'activeForm'
   if (ocName === "todowrite") {
     try {
       const parsed = JSON.parse(input);
       if (parsed.todos && Array.isArray(parsed.todos)) {
-        parsed.todos = parsed.todos.map((t: any) => ({
+        parsed.todos = parsed.todos.map((t: Record<string, unknown>) => ({
           content: t.content ?? "",
           status: t.status ?? "pending",
           priority: t.priority ?? "medium",
@@ -102,7 +106,6 @@ function mapToolInput(toolName: string, input: string): string {
       return JSON.stringify(parsed);
     } catch { return input; }
   }
-
   const fieldMap = INPUT_FIELD_MAP[ocName];
   if (!fieldMap || Object.keys(fieldMap).length === 0) return input;
   try {
@@ -117,13 +120,11 @@ function mapToolInput(toolName: string, input: string): string {
   }
 }
 
-// Extract <!--clwnd-meta:...--> from MCP tool result text
 function parseToolResult(resultText: string): { output: string; title: string; metadata: Record<string, unknown> } {
   const metaMatch = resultText.match(/<!--clwnd-meta:(.*?)-->/s);
   let title = "";
   let metadata: Record<string, unknown> = {};
   let output = resultText;
-
   if (metaMatch) {
     output = resultText.replace(/\n?<!--clwnd-meta:.*?-->/s, "").trim();
     try {
@@ -132,10 +133,10 @@ function parseToolResult(resultText: string): { output: string; title: string; m
       metadata = parsed.metadata ?? {};
     } catch {}
   }
-
   return { output, title, metadata };
 }
 
+// ─── Hum: Bidirectional NDJSON socket ────────────────────────────────────
 
 function defaultSocketPath(): string {
   const runtime = process.env.XDG_RUNTIME_DIR;
@@ -144,12 +145,6 @@ function defaultSocketPath(): string {
 }
 
 const HUM_PATH = (process.env.CLWND_SOCKET ?? defaultSocketPath()) + ".hum";
-
-// ─── clwndHum: Bidirectional NDJSON socket ─────────────────────────────────
-// Persistent connection to daemon via net.connect (Node-compatible).
-// Both sides push typed messages (chi field).
-
-import { connect as netConnect, type Socket as NetSocket } from "net";
 
 type HumListener = (msg: Record<string, unknown>) => void;
 
@@ -168,16 +163,30 @@ async function awaitHum(): Promise<void> {
   await Promise.race([humAwaken, timeout]);
 }
 
+const DRONED = loadConfig().droned;
+const pluginDrone = DRONED ? new Drone("plugin", (action: DroneAction) => {
+  switch (action.type) {
+    case "beat":
+      if (humSocket && humAlive) {
+        try { humSocket.write(JSON.stringify(action.beat) + "\n"); } catch {}
+      }
+      break;
+    case "retry": trace("drone.retry", { rid: action.rid, chi: action.chi }); break;
+    case "lost": trace("drone.lost", { rid: action.rid, chi: action.chi }); break;
+    case "drift": trace("drone.drift", { local: action.local, remote: action.remote }); break;
+    case "dead": trace("drone.dead", { missedBeats: action.missedBeats }); break;
+    case "swallow": trace("drone.swallow", { reason: action.reason }); break;
+  }
+}) : { sent() {}, heard() {}, observed() {}, setWane() {}, inspect() { return new Map(); }, stop() {} } as unknown as Drone;
+
 async function awakenHum(): Promise<void> {
   try {
     humSocket = netConnect({ path: HUM_PATH });
-
     humSocket.on("connect", () => {
       humAlive = true;
       if (humReady) { humReady.resolve(); humReady = null; }
       trace("hum.connected");
     });
-
     humSocket.on("data", (data) => {
       humEcho += data.toString();
       const lines = humEcho.split("\n");
@@ -186,45 +195,25 @@ async function awakenHum(): Promise<void> {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line) as Record<string, unknown>;
-          // Drone observes all incoming tones
           pluginDrone.heard(msg);
-          // Echo: daemon acknowledges receipt of our tone
-          if (msg.chi === "echo") {
-            trace("hum.echo", { rid: msg.rid, ok: msg.ok });
-            continue;
-          }
-          // Breath: daemon sends session state on connect
+          if (msg.chi === "echo") { trace("hum.echo", { rid: msg.rid, ok: msg.ok }); continue; }
           if (msg.chi === "breath") {
             const sessions = (msg.sessions ?? []) as Array<{ sid: string; sigil: string; wane: number }>;
-            let synced = 0;
-            for (const s of sessions) {
-              synced++;
-            }
-            trace("hum.breath.received", { sessions: sessions.length, synced });
+            trace("hum.breath.received", { sessions: sessions.length, synced: sessions.length });
             continue;
           }
-          // Pulse: lifecycle events from the sentinel
-          if (msg.chi === "pulse") {
-            const kind = msg.kind as string;
-            const sid = msg.sid as string;
-            trace("hum.pulse", { kind, sid });
-            continue;
-          }
+          if (msg.chi === "pulse") { trace("hum.pulse", { kind: msg.kind, sid: msg.sid }); continue; }
           if (humHearer) humHearer(msg);
         } catch {}
       }
     });
-
     humSocket.on("close", () => {
       humAlive = false;
       humSocket = null;
-      // Daemon owns seeding state — nothing to clear on reconnect.
       trace("hum.disconnected");
-      // Refresh the await-able promise so doStream waits for reconnect
       humAwaken = new Promise<void>(r => { humReady = { resolve: r }; });
       setTimeout(awakenHum, 2000);
     });
-
     humSocket.on("error", (err) => {
       trace("hum.error", { err: String(err) });
     });
@@ -244,7 +233,6 @@ export function hum(msg: Record<string, unknown>): void {
     writeLog("trace", "hum.send.skipped", { chi: msg.chi as string, alive: humAlive, socket: !!humSocket });
     return;
   }
-  // Log tones are fire-and-forget — no rid, no echo, no tracking
   if (msg.chi !== "log" && !msg.rid) msg.rid = makeRid();
   msg.from = "plugin";
   try {
@@ -257,33 +245,6 @@ export function hum(msg: Record<string, unknown>): void {
   }
 }
 
-/**
- * Send a prompt on the hum and return a promise that collects messages
- * until "finish" or "error" arrives. The consumer reads messages via
- * the callback. Returns when the turn is done.
- */
-async function humSpeak(msg: Record<string, unknown>, onMessage: HumListener): Promise<void> {
-  // Wait for hum reconnect if it dropped (e.g., OC plugin reload on model switch)
-  if (!humAlive) {
-    writeLog("trace", "humSpeak.waiting", { chi: msg.chi as string });
-    await awaitHum();
-  }
-  return new Promise<void>((resolve, reject) => {
-    humHearer = (incoming) => {
-      onMessage(incoming);
-      if (incoming.chi === "finish" || incoming.chi === "error") {
-        humHearer = null;
-        resolve();
-      }
-    };
-    hum({ chi: "prompt", ...msg });
-  });
-}
-
-/**
- * Listen on the hum without sending a prompt (for permission return continuation).
- * Returns when the turn finishes.
- */
 function humHear(onMessage: HumListener): Promise<void> {
   return new Promise<void>((resolve) => {
     humHearer = (incoming) => {
@@ -296,113 +257,24 @@ function humHear(onMessage: HumListener): Promise<void> {
   });
 }
 
-
-/**
- * Detect auxiliary calls — provider calls with no tools attached.
- *
- * OpenCode uses `small_model` (config) for lightweight tasks that don't need
- * tools: title generation, session compaction, and summarization. When
- * `small_model` is set (the daemon auto-detects a free opencode/* model on
- * startup), these calls are routed to that provider and never reach us.
- *
- * This guard exists as a safety net for when `small_model` is unset or the
- * free model is unavailable — in that case OpenCode falls back to the main
- * provider (us). We return an empty response immediately rather than spawning
- * a claude CLI process for something that doesn't need session context, MCP
- * tools, or any clwnd machinery.
- *
- * Detection: auxiliary calls have no tools in `opts.tools`. All real chat
- * calls from OpenCode always include the tool list.
- */
-function isAuxiliaryCall(opts: { prompt: LanguageModelV2Prompt; tools?: unknown[] | unknown }): boolean {
-  const hasTools = Array.isArray(opts.tools) && opts.tools.length > 0;
-  return !hasTools;
-}
-
-
-// Detect brokered tool return — OpenCode executed the tool and is sending
-// the result back. We short-circuit: Claude already responded with real data.
-function isBrokeredToolReturn(prompt: LanguageModelV2Prompt): boolean {
-  if (prompt.length < 2) return false;
-  const last = prompt[prompt.length - 1];
-  if (last.role !== "tool" || !Array.isArray(last.content)) return false;
-  for (const part of last.content as Array<{ type: string; toolName?: string; toolCallId?: string }>) {
-    if (part.type === "tool-result" && (
-      (part.toolName && BROKERED_TOOLS.has(part.toolName)) ||
-      part.toolName === "clwnd_permission" ||
-      part.toolCallId?.startsWith("perm-")
-    )) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// Derive allowed MCP tools from OpenCode's resolved tool set.
-// OpenCode's resolveTools() already filters tools based on agent+session permissions.
-// If edit/write are denied (e.g. plan mode), they won't be in opts.tools.
-// We map OpenCode tool names to our MCP tool names.
-const OC_TO_MCP: Record<string, string> = {
-  read: "read", edit: "edit", write: "write", bash: "bash",
-  glob: "glob", grep: "grep", apply_patch: "edit", webfetch: "webfetch",
-};
-
-const lastAllowedTools = new Map<string, string>();
-const bloomedSessions = new Set<string>();
-
-// Agent-based tool restrictions
-const AGENT_DENY: Record<string, Set<string>> = {
-  plan: new Set(["edit", "write"]),
-};
-
-function deriveAllowedTools(sid: string, opts: { tools?: Array<{ name: string }> | unknown, headers?: Record<string, string | undefined> }): string[] {
-  const agent = opts.headers?.["x-clwnd-agent"] ?? "";
-  let agentName = agent;
-  try { const p = JSON.parse(agent); if (p?.name) agentName = p.name; } catch {}
-
-  const denied = AGENT_DENY[agentName] ?? new Set();
-  const all = ["read", "edit", "write", "bash", "glob", "grep", "webfetch"];
-  const result = all.filter(t => !denied.has(t));
-
-  const key = result.join(",");
-  const prev = lastAllowedTools.get(sid);
-  if (prev !== key) {
-    trace("allowedTools.changed", { sid, agent: agentName, old: prev ?? "none", new: key });
-    lastAllowedTools.set(sid, key);
-  }
-  return result;
-}
-
-const lastReminder = new Map<string, string>();
+// ─── Prompt Helpers ──────────────────────────────────────────────────────
 
 type ContentPart =
   | { type: "text"; text: string }
   | { type: "image"; source: { type: "base64"; media_type: string; data: string } };
 
-function extractContent(prompt: LanguageModelV2Prompt, sessionId?: string): ContentPart[] {
+function extractContent(prompt: LanguageModelV3Prompt, sessionId?: string): ContentPart[] {
   for (let i = prompt.length - 1; i >= 0; i--) {
     const m = prompt[i];
     if (m.role === "user") {
       if (typeof m.content === "string") return [{ type: "text", text: m.content }];
       if (Array.isArray(m.content)) {
         const parts: ContentPart[] = [];
-        for (const p of m.content as Array<{ type: string; text?: string; image?: Uint8Array | URL; mimeType?: string; data?: Uint8Array | string | URL; mediaType?: string; url?: string }>) {
+        for (const p of m.content) {
           if (p.type === "text" && p.text) parts.push({ type: "text", text: p.text });
-          // V1 ImagePart: { type: "image", image: Uint8Array | URL, mimeType }
-          if (p.type === "image" && p.image) {
-            const b64 = p.image instanceof Uint8Array
-              ? Buffer.from(p.image).toString("base64")
-              : p.image.toString();
-            parts.push({
-              type: "image",
-              source: { type: "base64", media_type: p.mimeType ?? "image/png", data: b64 },
-            });
-          }
-          // V2 FilePart: { type: "file", data: Uint8Array | string | URL, mediaType }
-          // Also handles OC's format: { type: "file", url: "data:...", mediaType }
           if (p.type === "file" && (p.mediaType ?? "").startsWith("image/")) {
             let b64: string | undefined;
-            const raw = p.data ?? p.url;
+            const raw = p.data;
             if (raw instanceof Uint8Array) {
               b64 = Buffer.from(raw).toString("base64");
             } else if (typeof raw === "string") {
@@ -413,15 +285,12 @@ function extractContent(prompt: LanguageModelV2Prompt, sessionId?: string): Cont
               b64 = match ? match[1] : undefined;
             }
             if (b64) {
-              parts.push({
-                type: "image",
-                source: { type: "base64", media_type: p.mediaType ?? "image/png", data: b64 },
-              });
+              parts.push({ type: "image", source: { type: "base64", media_type: p.mediaType ?? "image/png", data: b64 } });
             }
           }
         }
         if (parts.length === 0) continue;
-        // Strip repeated system reminders — only send when changed
+        // Strip repeated system reminders
         if (sessionId) {
           for (let j = parts.length - 1; j >= 0; j--) {
             if (parts[j].type !== "text") continue;
@@ -429,14 +298,12 @@ function extractContent(prompt: LanguageModelV2Prompt, sessionId?: string): Cont
             if (reminder) {
               const prev = lastReminder.get(sessionId);
               if (prev === reminder) {
-                // Remove this part entirely if it's only the reminder, or strip it
                 const stripped = (parts[j] as { type: "text"; text: string }).text.replace(reminder, "").trim();
                 if (stripped) { parts[j] = { type: "text", text: stripped }; }
                 else { parts.splice(j, 1); }
                 trace("reminder.stripped", { sid: sessionId });
               } else {
                 lastReminder.set(sessionId, reminder);
-                trace("reminder.updated", { sid: sessionId });
               }
             }
           }
@@ -448,129 +315,143 @@ function extractContent(prompt: LanguageModelV2Prompt, sessionId?: string): Cont
   return [{ type: "text", text: "" }];
 }
 
-// Flatten content parts to string — used where a single string is needed
-function extractText(prompt: LanguageModelV2Prompt, sessionId?: string): string {
-  return extractContent(prompt, sessionId)
-    .filter((p): p is { type: "text"; text: string } => p.type === "text")
-    .map(p => p.text).join("\n\n");
-}
+const lastReminder = new Map<string, string>();
 
-// ─── History Seeding (#7) ────────────────────────────────────────────────────
-// Seeding is daemon-driven via graft(). Plugin is thin — send prompt, stream response.
-
-// Plugin drone — observes hum I/O from the plugin side (opt-in via droned:true)
-const DRONED = loadConfig().droned;
-const pluginDrone = DRONED ? new Drone("plugin", (action: DroneAction) => {
-  switch (action.type) {
-    case "beat":
-      // Send drone beat to daemon
-      if (humSocket && humAlive) {
-        try { humSocket.write(JSON.stringify(action.beat) + "\n"); } catch {}
-      }
-      break;
-    case "retry":
-      trace("drone.retry", { rid: action.rid, chi: action.chi });
-      break;
-    case "lost":
-      trace("drone.lost", { rid: action.rid, chi: action.chi });
-      break;
-    case "drift":
-      trace("drone.drift", { local: action.local, remote: action.remote });
-      break;
-    case "dead":
-      trace("drone.dead", { missedBeats: action.missedBeats });
-      break;
-    case "swallow":
-      trace("drone.swallow", { reason: action.reason });
-      break;
-  }
-}) : { sent() {}, heard() {}, observed() {}, setWane() {}, inspect() { return new Map(); }, stop() {} } as unknown as Drone;
-
-
-
-function extractSystemPrompt(prompt: LanguageModelV2Prompt): string {
+function extractSystemPrompt(prompt: LanguageModelV3Prompt): string {
   const parts: string[] = [];
   for (const m of prompt) {
     if (m.role === "system") {
-      if (typeof m.content === "string") {
-        parts.push(m.content);
-      } else if (Array.isArray(m.content)) {
-        for (const p of m.content as Array<{ type: string; text?: string }>) {
-          if (p.type === "text" && p.text) parts.push(p.text);
-        }
-      }
+      if (typeof m.content === "string") parts.push(m.content);
     }
   }
   return parts.join("\n\n");
 }
 
-// Track agent per session via x-clwnd-agent header (injected by chat.headers hook)
+// ─── Detection Helpers ───────────────────────────────────────────────────
+
+function isAuxiliaryCall(opts: LanguageModelV3CallOptions): boolean {
+  return !opts.tools || !Array.isArray(opts.tools) || opts.tools.length === 0;
+}
+
+function isBrokeredToolReturn(prompt: LanguageModelV3Prompt): boolean {
+  if (prompt.length < 2) return false;
+  const last = prompt[prompt.length - 1];
+  if (last.role !== "tool" || !Array.isArray(last.content)) return false;
+  for (const part of last.content) {
+    if (part.type === "tool-result" && (
+      (part.toolName && BROKERED_TOOLS.has(part.toolName)) ||
+      part.toolName === "clwnd_permission" ||
+      part.toolCallId?.startsWith("perm-")
+    )) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ─── Agent + Session Helpers ─────────────────────────────────────────────
+
 const sessionLastAgent = new Map<string, string>();
 
 function detectAgent(sid: string, headers?: Record<string, string | undefined>): string | null {
   const raw = headers?.["x-clwnd-agent"] ?? null;
   if (!raw) return null;
-  // Parse agent name — could be string or JSON object
   let agent = raw;
-  try {
-    const parsed = JSON.parse(raw);
-    if (typeof parsed === "object" && parsed.name) agent = parsed.name;
-  } catch {}
+  try { const parsed = JSON.parse(raw); if (typeof parsed === "object" && parsed.name) agent = parsed.name; } catch {}
   const prev = sessionLastAgent.get(sid);
-  if (prev && prev !== agent) {
-    trace("agent.changed", { sid, old: prev, new: agent });
-  }
+  if (prev && prev !== agent) trace("agent.changed", { sid, old: prev, new: agent });
   sessionLastAgent.set(sid, agent);
   trace("agent.current", { sid, agent });
   return agent;
 }
 
-// Fetch session directory from OpenCode (may change via opencode-dir /cd)
-async function getSessionDirectory(client: any, sessionId: string): Promise<string | null> {
+async function getSessionDirectory(client: unknown, sessionId: string): Promise<string | null> {
   if (!client) return null;
   try {
-    const resp = await client.session.get({ path: { sessionID: sessionId } });
+    const resp = await (client as any).session.get({ path: { sessionID: sessionId } });
     return resp.data?.directory ?? null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-// Fetch session permission rules from OpenCode
-
-// Cache agent permission rules — fetched once per agent name
 const agentPermissionCache = new Map<string, Array<{ permission: string; pattern: string; action: string }>>();
 
-async function getSessionPermissions(client: any, sessionId: string): Promise<Array<{ permission: string; pattern: string; action: string }>> {
+async function getSessionPermissions(client: unknown, sessionId: string): Promise<Array<{ permission: string; pattern: string; action: string }>> {
   if (!client) return [];
   const agentName = sessionLastAgent.get(sessionId) ?? "build";
-
-  // Check cache first
   if (agentPermissionCache.has(agentName)) return agentPermissionCache.get(agentName)!;
-
   try {
-    // Fetch all agents and find the matching one
-    const resp = await client.app.agents();
+    const resp = await (client as any).app.agents();
     const agents = resp.data ?? [];
-    const agent = agents.find((a: any) => a.name === agentName);
+    const agent = agents.find((a: { name: string }) => a.name === agentName);
     const perms = agent?.permission ?? [];
     agentPermissionCache.set(agentName, perms);
     trace("permissions.loaded", { agent: agentName, count: perms.length });
     return perms;
-  } catch (e: any) {
-    trace("permissions.error", { agent: agentName, err: e?.message ?? String(e) });
+  } catch (e: unknown) {
+    trace("permissions.error", { agent: agentName, err: e instanceof Error ? e.message : String(e) });
     return [];
   }
 }
 
-// Parse NDJSON lines from buffer
-export class ClwndModel implements LanguageModelV2 {
-  readonly specificationVersion = "v2";
+const OC_TO_MCP: Record<string, string> = {
+  read: "read", edit: "edit", write: "write", bash: "bash",
+  glob: "glob", grep: "grep", apply_patch: "edit", webfetch: "webfetch",
+};
+
+const lastAllowedTools = new Map<string, string>();
+
+const AGENT_DENY: Record<string, Set<string>> = {
+  plan: new Set(["edit", "write"]),
+};
+
+function deriveAllowedTools(sid: string, opts: LanguageModelV3CallOptions): string[] {
+  const agent = opts.headers?.["x-clwnd-agent"] ?? "";
+  let agentName = agent;
+  try { const p = JSON.parse(agent); if (p?.name) agentName = p.name; } catch {}
+  const denied = AGENT_DENY[agentName] ?? new Set();
+  const all = ["read", "edit", "write", "bash", "glob", "grep", "webfetch"];
+  const result = all.filter(t => !denied.has(t));
+  const key = result.join(",");
+  const prev = lastAllowedTools.get(sid);
+  if (prev !== key) {
+    trace("allowedTools.changed", { sid, agent: agentName, old: prev ?? "none", new: key });
+    lastAllowedTools.set(sid, key);
+  }
+  return result;
+}
+
+// ─── Finish Reason Mapping ───────────────────────────────────────────────
+
+function mapFinishReason(raw: string | undefined): LanguageModelV3FinishReason {
+  const r = raw ?? "stop";
+  const unified: LanguageModelV3FinishReason["unified"] =
+    r === "end_turn" ? "stop"
+    : r === "max_tokens" ? "length"
+    : r === "stop_sequence" ? "stop"
+    : r === "tool_use" ? "tool-calls"
+    : r === "tool-calls" ? "tool-calls"
+    : r === "content_filter" ? "content-filter"
+    : r === "stop" ? "stop"
+    : r === "length" ? "length"
+    : r === "error" ? "error"
+    : "other";
+  return { unified, raw: r };
+}
+
+function zeroUsage(): LanguageModelV3Usage {
+  return {
+    inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
+    outputTokens: { total: 0, text: 0, reasoning: 0 },
+  };
+}
+
+// ─── ClwndModel ──────────────────────────────────────────────────────────
+
+export class ClwndModel implements LanguageModelV3 {
+  readonly specificationVersion = "v3" as const;
   readonly modelId: string;
   readonly provider = "clwnd";
-  readonly supportedUrls: Record<string, RegExp[]> = {
-    "image/*": [],  // accept all image types (data URLs handled inline)
-  };
+  readonly supportedUrls: Record<string, RegExp[]> = { "image/*": [] };
 
   constructor(
     modelId: string,
@@ -579,210 +460,97 @@ export class ClwndModel implements LanguageModelV2 {
     this.modelId = modelId;
   }
 
-  async doGenerate(
-    opts: Parameters<LanguageModelV2["doGenerate"]>[0],
-  ) {
-    // Auxiliary call (title gen, compaction) — reject gracefully unless ocCompaction is on
-    if (isAuxiliaryCall(opts) && !loadConfig().ocCompaction) {
-      trace("auxiliary.reject", { method: "doGenerate" });
+  async doGenerate(opts: LanguageModelV3CallOptions): Promise<LanguageModelV3GenerateResult> {
+    if (isAuxiliaryCall(opts)) {
       return {
-        content: [{ type: "text" as const, text: "" }],
-        finishReason: "stop" as LanguageModelV2FinishReason,
-        usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined },
+        content: [{ type: "text", text: "" }],
+        usage: zeroUsage(),
+        finishReason: { unified: "stop", raw: "stop" },
         warnings: [],
-        request: { body: {} },
-        response: { id: generateId(), timestamp: new Date(), modelId: this.modelId },
-        providerMetadata: {},
       };
     }
-
-    const sid = opts.headers?.["x-opencode-session"] ?? generateId();
-    const text = extractText(opts.prompt, sid);
-    const systemPrompt = extractSystemPrompt(opts.prompt);
-    detectAgent(sid, opts.headers);
-    const warnings: LanguageModelV2CallWarning[] = [];
-    const cwd = (this.config.client ? await getSessionDirectory(this.config.client, sid) : null) ?? this.config.cwd ?? process.cwd();
-    const permissions = await getSessionPermissions(this.config.client, sid);
-    const allowedTools = deriveAllowedTools(sid, opts);
-
-    let reasoning = "";
-    let responseText = "";
-    const toolCalls: LanguageModelV2Content[] = [];
-    const sap = new Map<string, string>();
-
-    await awaitHum();
-    if (!humAlive) throw new Error("clwndHum not connected");
-
-    const result = await new Promise<{
-      content: LanguageModelV2Content[];
-      finishReason: LanguageModelV2FinishReason;
-      usage: LanguageModelV2Usage;
-      providerMetadata: SharedV2ProviderMetadata;
-    }>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("doGenerate timeout")), 120_000);
-      opts.abortSignal?.addEventListener("abort", () => { clearTimeout(timeout); reject(new Error("aborted")); });
-
-      humSpeak({
-        sid, cwd, modelId: this.modelId, text,
-        systemPrompt, permissions, allowedTools,
-      }, (msg) => {
-        const chi = msg.chi as string;
-        if (chi === "tool-meta") return; // out-of-band, not needed for doGenerate
-
-        if (chi === "chunk") {
-          const ct = msg.chunkType as string;
-          if (ct === "reasoning_delta" && typeof msg.delta === "string") reasoning += msg.delta;
-          if (ct === "text_delta" && typeof msg.delta === "string") responseText += msg.delta;
-          if (ct === "tool_input_start" && msg.toolCallId) sap.set(msg.toolCallId as string, "");
-          if (ct === "tool_input_delta" && msg.toolCallId && msg.partialJson) {
-            const prev = sap.get(msg.toolCallId as string) ?? "";
-            sap.set(msg.toolCallId as string, prev + msg.partialJson);
-          }
-          if (ct === "tool_call" && msg.toolCallId && msg.toolName) {
-            const accumulated = sap.get(msg.toolCallId as string) ?? "{}";
-            const mapped = mapToolInput(msg.toolName as string, accumulated);
-            let input: unknown = {};
-            try { input = JSON.parse(mapped); } catch { input = {}; }
-            toolCalls.push({
-              type: "tool-call", toolCallId: msg.toolCallId,
-              toolName: mapToolName(msg.toolName as string), input,
-            } as LanguageModelV2Content);
-          }
-        }
-
-        if (chi === "finish") {
-          clearTimeout(timeout);
-          const content: LanguageModelV2Content[] = [];
-          if (reasoning) content.push({ type: "reasoning", text: reasoning } as LanguageModelV2Content);
-          if (responseText) content.push({ type: "text", text: responseText } as LanguageModelV2Content);
-          content.push(...toolCalls);
-          const fu = msg.usage as Record<string, unknown> | undefined;
-          const fCacheRead = (fu?.cache_read_input_tokens ?? 0) as number;
-          const fCacheWrite = (fu?.cache_creation_input_tokens ?? 0) as number;
-          const fInput = (fu?.input_tokens ?? 0) as number;
-          resolve({
-            content,
-            finishReason: (msg.finishReason ?? "stop") as LanguageModelV2FinishReason,
-            usage: {
-              inputTokens: fInput + fCacheRead + fCacheWrite,
-              outputTokens: (fu?.output_tokens ?? 0) as number,
-              totalTokens: undefined,
-              cachedInputTokens: fCacheRead,
-            } as LanguageModelV2Usage,
-            providerMetadata: {
-              ...((msg.providerMetadata ?? {}) as Record<string, unknown>),
-              anthropic: { cacheCreationInputTokens: fCacheWrite },
-            },
-          });
-        }
-
-        if (chi === "error") {
-          clearTimeout(timeout);
-          reject(new Error(msg.message as string));
-        }
-      }).catch(reject);
-    });
-
-    return {
-      ...result,
-      warnings,
-      request: { body: { text } },
-      response: { id: sid, timestamp: new Date(), modelId: this.modelId },
-    };
-  }
-
-  async doStream(
-    opts: Parameters<LanguageModelV2["doStream"]>[0],
-  ): Promise<{
-    stream: ReadableStream<LanguageModelV2StreamPart>;
-    rawCall: { raw: unknown; rawHeaders: unknown };
-    warnings: LanguageModelV2CallWarning[];
-  }> {
-    // Debug: log prompt content types
-    for (const m of opts.prompt) {
-      if (m.role === "user" && Array.isArray(m.content)) {
-        for (const p of m.content) {
-        }
+    // Delegate to stream and collect
+    const { stream } = await this.doStream(opts);
+    const reader = stream.getReader();
+    const content: Array<{ type: "text"; text: string }> = [];
+    let finishReason: LanguageModelV3FinishReason = { unified: "stop", raw: "stop" };
+    let usage: LanguageModelV3Usage = zeroUsage();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.type === "text-delta") {
+        // Accumulate text deltas for doGenerate
+        const last = content[content.length - 1];
+        if (last) last.text += value.delta;
+        else content.push({ type: "text", text: value.delta });
+      }
+      if (value.type === "finish") {
+        finishReason = value.finishReason;
+        usage = value.usage;
       }
     }
-    // Auxiliary call (title gen, compaction) — reject gracefully unless ocCompaction is on.
-    // When ocCompaction is enabled, compaction calls come through us — let them proceed.
-    if (isAuxiliaryCall(opts) && !loadConfig().ocCompaction) {
-      trace("auxiliary.reject", { method: "doStream" });
-      const bloom = new ReadableStream<LanguageModelV2StreamPart>({
-        start(controller) {
-          controller.enqueue({ type: "finish", finishReason: "stop", usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined }, providerMetadata: {} } as LanguageModelV2StreamPart);
-          controller.close();
-        },
-      });
-      return { stream: bloom, rawCall: { raw: {}, rawHeaders: {} }, warnings: [] };
-    }
+    return { content, usage, finishReason, warnings: [] };
+  }
 
-    const sid = opts.headers?.["x-opencode-session"] ?? generateId();
+  async doStream(opts: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
+    const sid = opts.headers?.["x-opencode-session"] ?? makeSigil(Date.now().toString());
     const content = extractContent(opts.prompt, sid);
     const text = content.filter((p): p is { type: "text"; text: string } => p.type === "text").map(p => p.text).join("\n\n");
     const systemPrompt = extractSystemPrompt(opts.prompt);
     detectAgent(sid, opts.headers);
-    const warnings: LanguageModelV2CallWarning[] = [];
     const cwd = (this.config.client ? await getSessionDirectory(this.config.client, sid) : null) ?? this.config.cwd ?? process.cwd();
     const self = this;
     const sap = new Map<string, string>();
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
-    // Seeding handled by daemon via graft() — plugin just sends the prompt
+    // Auxiliary — empty response
+    if (isAuxiliaryCall(opts) && !loadConfig().ocCompaction) {
+      trace("auxiliary.reject", { method: "doStream" });
+      return {
+        stream: new ReadableStream<LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: zeroUsage() });
+            controller.close();
+          },
+        }),
+      };
+    }
 
-    // Brokered tool return — OpenCode executed the tool, sending result back.
+    // Brokered tool return — finish immediately unless permission return
     if (isBrokeredToolReturn(opts.prompt)) {
       trace("brokered.return", { sid });
-
-      // Check if this is a permission return — if so, fall through to normal
-      // stream handling so Claude CLI's continuation (write + response) flows to OC
       let isPermissionReturn = false;
       const lastTool = opts.prompt.findLast(m => m.role === "tool");
       if (lastTool && Array.isArray(lastTool.content)) {
-        for (const part of lastTool.content as Array<{ type: string; toolCallId?: string; result?: unknown; isError?: boolean }>) {
+        for (const part of lastTool.content) {
           if (part.type === "tool-result" && part.toolCallId?.startsWith("perm-")) {
             isPermissionReturn = true;
-            trace("permission.return", { callId: part.toolCallId });
           }
         }
       }
-
-      // Non-permission brokered return — finish immediately
       if (!isPermissionReturn) {
-        const bloom = new ReadableStream<LanguageModelV2StreamPart>({
-          start(controller) {
-            controller.enqueue({ type: "finish", finishReason: "stop", usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined }, providerMetadata: {} } as LanguageModelV2StreamPart);
-            controller.close();
-          },
-        });
-        return { stream: bloom, rawCall: { raw: {}, rawHeaders: {} }, warnings };
+        return {
+          stream: new ReadableStream<LanguageModelV3StreamPart>({
+            start(controller) {
+              controller.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: zeroUsage() });
+              controller.close();
+            },
+          }),
+        };
       }
-
-      // Permission return — fall through to open a new ear to clwndHum.
-      // Claude CLI already executed the tool and is continuing. The daemon's
-      // stream endpoint will attach to the persistent process and forward
-      // the write tool call + result + text response to OC.
-      trace("permission.continue", { sid });
     }
 
-    // Flag for permission return — daemon should listen only, not send a prompt
     const listenOnly = isBrokeredToolReturn(opts.prompt) && (() => {
       const lt = opts.prompt.findLast(m => m.role === "tool");
-      return lt && Array.isArray(lt.content) && (lt.content as any[]).some((p: any) => p.toolCallId?.startsWith("perm-"));
+      return lt && Array.isArray(lt.content) && lt.content.some(p => p.type === "tool-result" && p.toolCallId?.startsWith("perm-"));
     })();
 
-    // First prompt for this session — include full OC history for grafting
-    const priorPetals = !bloomedSessions.has(sid)
-      ? opts.prompt.filter(m => m.role === "user" || m.role === "assistant" || m.role === "tool")
-      : undefined;
-    if (priorPetals) {
-      bloomedSessions.add(sid);
-      trace("priorPetals", { sid, count: priorPetals.length, roles: priorPetals.map(m => m.role).join(",") });
-    }
+    // Include prior petals — daemon compares with JSONL state and grafts only what's new
+    const priorPetals = opts.prompt.filter(m => m.role === "user" || m.role === "assistant" || m.role === "tool");
+    trace("priorPetals", { sid, count: priorPetals.length, roles: priorPetals.map(m => m.role).join(",") });
 
-    // Send prompt synchronously BEFORE creating the stream — survives OC plugin reload
+    // Send prompt before creating stream — survives OC plugin reload
     let promptSent = false;
     if (!listenOnly && humAlive) {
       hum({
@@ -797,57 +565,49 @@ export class ClwndModel implements LanguageModelV2 {
       promptSent = true;
     }
 
-    const bloom = new ReadableStream<LanguageModelV2StreamPart>({
+    const stream = new ReadableStream<LanguageModelV3StreamPart>({
       async start(controller) {
-        const textId = generateId();
-        const reasoningId = generateId();
         let done = false;
-        let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+        const tendrils = new Set<string>();
+        const buds: LanguageModelV3StreamPart[] = [];
+        const metaQueue: Array<{ tool: string; title?: string; metadata?: Record<string, unknown> }> = [];
+        let textId = "t0";
         let textStarted = false;
+        let reasoningId = "r0";
         let reasoningStarted = false;
-        const tendrils = new Set<string>(); // tool calls OpenCode should execute
-        const buds: LanguageModelV2StreamPart[] = []; // buffered tool events pending permit check
-        function shed() {
-          for (const part of buds) petal(part);
-          buds.length = 0;
-        }
 
-        // Petals-held moved to daemon — plugin is a clean pipe
-        function petal(part: LanguageModelV2StreamPart) {
+        function petal(part: LanguageModelV3StreamPart): void {
           if (done) return;
           try { controller.enqueue(part); } catch { done = true; }
         }
 
-        function wilt() {
+        function wilt(): void {
           if (done) return;
           done = true;
-          try { reader?.releaseLock(); } catch {}
           try { controller.close(); } catch {}
         }
 
+        function shed(): void {
+          for (const b of buds) petal(b);
+          buds.length = 0;
+        }
+
         opts.abortSignal?.addEventListener("abort", () => {
-          if (!done) {
-            // Mid-turn abort — kill the Claude CLI process.
-            // Session state preserved — next message respawns via --resume.
-            hum({ chi: "cancel", sid, dusk: duskIn(5_000) });
-          }
+          if (!done) hum({ chi: "cancel", sid, dusk: duskIn(5_000) });
           wilt();
         });
 
-        // Wait for hum connection (refreshable — survives plugin reload)
         await awaitHum();
         if (!humAlive) {
-          petal({ type: "error", error: new Error("clwndHum not connected") } as LanguageModelV2StreamPart);
+          petal({ type: "error", error: new Error("clwndHum not connected") });
           wilt();
           return;
         }
 
-        petal({ type: "stream-start", warnings } as LanguageModelV2StreamPart);
+        petal({ type: "stream-start", warnings: [] });
 
-        // Listen for responses — prompt already sent before stream creation
         const humFade = humHear(onHummin);
         if (!promptSent) {
-          // Hum was dead during sync send — send now that we've reconnected
           hum({
             chi: "prompt", sid, cwd,
             modelId: self.modelId,
@@ -859,210 +619,202 @@ export class ClwndModel implements LanguageModelV2 {
           });
         }
 
-        // Out-of-band tool metadata queue — daemon hums meta before Claude CLI streams the result
-        const metaQueue: Array<{ tool: string; title?: string; metadata?: Record<string, unknown> }> = [];
-
         function onHummin(raw: Record<string, unknown>): void {
-          // Tool metadata arrives out-of-band — queue it for the next tool_result
           if (raw.chi === "tool-meta") {
-            metaQueue.push({ tool: raw.tool as string, title: raw.title as string, metadata: raw.metadata as Record<string, unknown> });
-            trace("meta.received", { tool: raw.tool });
+            metaQueue.push({
+              tool: raw.tool as string,
+              title: raw.title as string,
+              metadata: raw.metadata as Record<string, unknown>,
+            });
             return;
           }
 
-          // Map chi → action for compatibility with existing processing code
-          const msg: Record<string, unknown> = { ...raw };
-          if (raw.chi === "chunk") msg.action = "chunk";
-          else if (raw.chi === "finish") msg.action = "finish";
-          else if (raw.chi === "session-ready") msg.action = "session_ready";
-          else if (raw.chi === "error") msg.action = "error";
-          else if (raw.chi === "permission-ask") msg.action = "permission_ask";
-          else msg.action = raw.chi;
-              if (msg.action === "chunk") {
-                const ct = msg.chunkType;
-                if (ct === "text_start" || (ct === "text_delta" && !textStarted)) {
-                  if (!textStarted) {
-                    textStarted = true;
-                    petal({ type: "text-start", id: textId } as LanguageModelV2StreamPart);
-                  }
-                }
-                if (ct === "text_delta" && msg.delta) {
-                  petal({ type: "text-delta", id: textId, delta: msg.delta } as LanguageModelV2StreamPart);
-                }
-                if (ct === "reasoning_start" || (ct === "reasoning_delta" && !reasoningStarted)) {
-                  if (!reasoningStarted) {
-                    reasoningStarted = true;
-                    petal({ type: "reasoning-start", id: reasoningId } as LanguageModelV2StreamPart);
-                  }
-                }
-                if (ct === "reasoning_delta" && msg.delta) {
-                  petal({ type: "reasoning-delta", id: reasoningId, delta: msg.delta } as LanguageModelV2StreamPart);
-                }
-                if (ct === "reasoning_end") {
-                  petal({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
-                  reasoningStarted = false; // prevent double-end at finish
-                }
-                // Buffer tool events — don't emit until we know if permission_ask follows.
-                // If permission_ask arrives, drop the buffer and emit clwnd_permission instead.
-                // If finish arrives, flush the buffer as normal.
-                if (ct === "tool_input_start" && msg.toolCallId && msg.toolName) {
-                  sap.set(msg.toolCallId as string, "");
-                  buds.push({ type: "tool-input-start", id: msg.toolCallId, toolName: mapToolName(msg.toolName as string) } as LanguageModelV2StreamPart);
-                }
-                if (ct === "tool_input_delta" && msg.toolCallId && msg.partialJson) {
-                  const prev = sap.get(msg.toolCallId as string) ?? "";
-                  sap.set(msg.toolCallId as string, prev + msg.partialJson);
-                  buds.push({ type: "tool-input-delta", id: msg.toolCallId, delta: msg.partialJson } as LanguageModelV2StreamPart);
-                }
-                if (ct === "tool_call" && msg.toolCallId && msg.toolName) {
-                  const ocToolName = mapToolName(msg.toolName as string);
-                  if (!sap.has(msg.toolCallId as string)) {
-                    buds.push({ type: "tool-input-start", id: msg.toolCallId, toolName: ocToolName } as LanguageModelV2StreamPart);
-                  }
-                  const accumulated = sap.get(msg.toolCallId as string);
-                  let rawInput: string;
-                  if (accumulated) {
-                    rawInput = mapToolInput(msg.toolName as string, accumulated);
-                  } else if (msg.input && typeof msg.input === "object") {
-                    rawInput = mapToolInput(msg.toolName as string, JSON.stringify(msg.input));
-                  } else {
-                    rawInput = "{}";
-                  }
-                  const isBrokered = BROKERED_TOOLS.has(ocToolName);
-                  if (isBrokered) tendrils.add(msg.toolCallId as string);
-                  buds.push({
-                    type: "tool-call",
-                    toolCallId: msg.toolCallId,
-                    toolName: ocToolName,
-                    input: rawInput,
-                    providerExecuted: !isBrokered,
-                  } as LanguageModelV2StreamPart);
-                }
-                if (ct === "tool_result" && (msg.toolCallId || msg.toolUseId)) {
-                  const callId = (msg.toolCallId ?? msg.toolUseId) as string;
-                  if (tendrils.has(callId)) return;
-                  const rawResult = (msg as Record<string, unknown>).result ?? "";
-                  const resultText = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
-                  // Prefer out-of-band metadata (hummed separately, never touched Claude CLI)
-                  // Fall back to parsing <!--clwnd-meta:--> for backward compat
-                  const queued = metaQueue.shift();
-                  const output = queued ? resultText : parseToolResult(resultText).output;
-                  const title = queued?.title ?? parseToolResult(resultText).title;
-                  const metadata = queued?.metadata ?? parseToolResult(resultText).metadata;
-                  shed();
-                  petal({
-                    type: "tool-result",
-                    toolCallId: callId,
-                    result: { output, title, metadata },
-                    providerExecuted: true,
-                  } as LanguageModelV2StreamPart);
-                }
-              }
+          const chi = raw.chi as string;
 
-              // Permission ask — drop buffered tool events, emit clwnd_permission instead
-              if (msg.action === "permission_ask") {
-                trace("permission.toolcall", { askId: msg.askId, tool: msg.tool, buffered: buds.length });
-                buds.length = 0; // drop the buffered tool-call
-                const permCallId = `perm-${msg.askId}`;
-                const permInput = JSON.stringify({ tool: msg.tool, path: msg.path ?? "", askId: msg.askId });
-                petal({ type: "tool-input-start", id: permCallId, toolName: "clwnd_permission" } as LanguageModelV2StreamPart);
-                tendrils.add(permCallId);
-                petal({
-                  type: "tool-call",
-                  toolCallId: permCallId,
-                  toolName: "clwnd_permission",
-                  input: permInput,
-                  providerExecuted: false,
-                } as LanguageModelV2StreamPart);
-                // Close bloom so OC processes the permission tool call immediately
-                if (textStarted) petal({ type: "text-end", id: textId } as LanguageModelV2StreamPart);
-                if (reasoningStarted) petal({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
-                petal({
-                  type: "finish",
-                  finishReason: "tool-calls",
-                  usage: { inputTokens: 0, outputTokens: 0, totalTokens: undefined },
-                  providerMetadata: {},
-                } as LanguageModelV2StreamPart);
-                wilt();
-                return;
-              }
+          // ── Chunks from Claude CLI ──
+          if (chi === "chunk") {
+            const ct = raw.chunkType as string;
 
-              if (msg.action === "finish") {
-                // Flush any buffered tool events (no permission_ask came)
-                shed();
-                // Emit text-end / reasoning-end before finish
-                if (textStarted) {
-                  petal({ type: "text-end", id: textId } as LanguageModelV2StreamPart);
-                }
-                if (reasoningStarted) {
-                  petal({ type: "reasoning-end", id: reasoningId } as LanguageModelV2StreamPart);
-                }
-                const u = msg.usage as Record<string, unknown> | undefined;
-                const cacheRead = (u?.cache_read_input_tokens ?? 0) as number;
-                const cacheWrite = (u?.cache_creation_input_tokens ?? 0) as number;
-                const inputBase = (u?.input_tokens ?? u?.inputTokens ?? 0) as number;
-                const fr = tendrils.size > 0
-                  ? "tool-calls"
-                  : (msg.finishReason ?? "stop");
-                petal({
-                  type: "finish",
-                  finishReason: fr as LanguageModelV2FinishReason,
-                  usage: {
-                    inputTokens: inputBase + cacheRead + cacheWrite,
-                    outputTokens: (u?.output_tokens ?? u?.outputTokens) as number | undefined,
-                    totalTokens: undefined,
-                    // OC reads cachedInputTokens for cache read
-                    cachedInputTokens: cacheRead,
-                  },
-                  providerMetadata: {
-                    ...((msg.providerMetadata ?? {}) as Record<string, unknown>),
-                    // OC reads anthropic.cacheCreationInputTokens for cache write
-                    anthropic: { cacheCreationInputTokens: cacheWrite },
-                  },
-                } as LanguageModelV2StreamPart);
-                wilt();
-                return;
+            // Text
+            if (ct === "text_start" || (ct === "text_delta" && !textStarted)) {
+              if (!textStarted) {
+                textStarted = true;
+                petal({ type: "text-start", id: textId });
               }
+            }
+            if (ct === "text_delta" && raw.delta) {
+              petal({ type: "text-delta", id: textId, delta: raw.delta as string });
+            }
 
-              if (msg.action === "error") {
-                petal({ type: "error", error: new Error(msg.message as string) } as LanguageModelV2StreamPart);
-                wilt();
-                return;
+            // Reasoning
+            if (ct === "reasoning_start" || (ct === "reasoning_delta" && !reasoningStarted)) {
+              if (!reasoningStarted) {
+                reasoningStarted = true;
+                petal({ type: "reasoning-start", id: reasoningId });
               }
-        } // end onHummin
+            }
+            if (ct === "reasoning_delta" && raw.delta) {
+              petal({ type: "reasoning-delta", id: reasoningId, delta: raw.delta as string });
+            }
+            if (ct === "reasoning_end") {
+              petal({ type: "reasoning-end", id: reasoningId });
+              reasoningStarted = false;
+            }
+
+            // Tool events — buffer until we know if permission_ask follows
+            if (ct === "tool_input_start" && raw.toolCallId && raw.toolName) {
+              sap.set(raw.toolCallId as string, "");
+              buds.push({ type: "tool-input-start", id: raw.toolCallId as string, toolName: mapToolName(raw.toolName as string) });
+            }
+            if (ct === "tool_input_delta" && raw.toolCallId && raw.partialJson) {
+              const prev = sap.get(raw.toolCallId as string) ?? "";
+              sap.set(raw.toolCallId as string, prev + raw.partialJson);
+              buds.push({ type: "tool-input-delta", id: raw.toolCallId as string, delta: raw.partialJson as string });
+            }
+            if (ct === "tool_call" && raw.toolCallId && raw.toolName) {
+              const ocToolName = mapToolName(raw.toolName as string);
+              if (!sap.has(raw.toolCallId as string)) {
+                buds.push({ type: "tool-input-start", id: raw.toolCallId as string, toolName: ocToolName });
+              }
+              const accumulated = sap.get(raw.toolCallId as string);
+              let rawInput: string;
+              if (accumulated) {
+                rawInput = mapToolInput(raw.toolName as string, accumulated);
+              } else if (raw.input && typeof raw.input === "object") {
+                rawInput = mapToolInput(raw.toolName as string, JSON.stringify(raw.input));
+              } else {
+                rawInput = "{}";
+              }
+              const isBrokered = BROKERED_TOOLS.has(ocToolName);
+              if (isBrokered) tendrils.add(raw.toolCallId as string);
+              buds.push({
+                type: "tool-call",
+                toolCallId: raw.toolCallId as string,
+                toolName: ocToolName,
+                input: rawInput,
+                providerExecuted: !isBrokered,
+              });
+            }
+            if (ct === "tool_result" && (raw.toolCallId || raw.toolUseId)) {
+              const callId = (raw.toolCallId ?? raw.toolUseId) as string;
+              if (tendrils.has(callId)) return;
+              const rawResult = raw.result ?? "";
+              const resultText = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
+              const queued = metaQueue.shift();
+              const output = queued ? resultText : parseToolResult(resultText).output;
+              const title = queued?.title ?? parseToolResult(resultText).title;
+              const metadata = queued?.metadata ?? parseToolResult(resultText).metadata;
+              shed();
+              petal({
+                type: "tool-result",
+                toolCallId: callId,
+                toolName: mapToolName(raw.toolName as string ?? ""),
+                result: { output, title, metadata },
+                providerExecuted: true,
+              } as LanguageModelV3StreamPart);
+            }
+          }
+
+          // ── Permission ask ──
+          if (chi === "permission-ask") {
+            trace("permission.toolcall", { askId: raw.askId, tool: raw.tool, buffered: buds.length });
+            buds.length = 0;
+            const permCallId = `perm-${raw.askId}`;
+            const permInput = JSON.stringify({ tool: raw.tool, path: raw.path ?? "", askId: raw.askId });
+            petal({ type: "tool-input-start", id: permCallId, toolName: "clwnd_permission" });
+            tendrils.add(permCallId);
+            petal({
+              type: "tool-call",
+              toolCallId: permCallId,
+              toolName: "clwnd_permission",
+              input: permInput,
+              providerExecuted: false,
+            });
+            if (textStarted) petal({ type: "text-end", id: textId });
+            if (reasoningStarted) petal({ type: "reasoning-end", id: reasoningId });
+            petal({
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: zeroUsage(),
+            });
+            wilt();
+            return;
+          }
+
+          // ── Finish ──
+          if (chi === "finish") {
+            shed();
+            if (textStarted) petal({ type: "text-end", id: textId });
+            if (reasoningStarted) petal({ type: "reasoning-end", id: reasoningId });
+
+            const u = raw.usage as Record<string, unknown> | undefined;
+            const cacheRead = Number(u?.cache_read_input_tokens ?? 0);
+            const cacheWrite = Number(u?.cache_creation_input_tokens ?? 0);
+            const inputBase = Number(u?.input_tokens ?? u?.inputTokens ?? 0);
+            const outputTokens = Number(u?.output_tokens ?? u?.outputTokens ?? 0);
+
+            const fr: LanguageModelV3FinishReason = tendrils.size > 0
+              ? { unified: "tool-calls", raw: "tool-calls" }
+              : mapFinishReason(raw.finishReason as string | undefined);
+
+            trace("stream.finish", { sid, finishReason: fr.unified });
+
+            petal({
+              type: "finish",
+              finishReason: fr,
+              usage: {
+                inputTokens: {
+                  total: inputBase + cacheRead + cacheWrite,
+                  noCache: inputBase,
+                  cacheRead,
+                  cacheWrite,
+                },
+                outputTokens: {
+                  total: outputTokens,
+                  text: undefined,
+                  reasoning: undefined,
+                },
+              },
+              providerMetadata: {
+                anthropic: { cacheCreationInputTokens: cacheWrite },
+              },
+            });
+            wilt();
+            return;
+          }
+
+          // ── Error ──
+          if (chi === "error") {
+            petal({ type: "error", error: new Error(raw.message as string) });
+            wilt();
+            return;
+          }
+        }
 
         try {
           await humFade;
         } catch (e) {
-          petal({ type: "error", error: new Error(String(e)) } as LanguageModelV2StreamPart);
+          petal({ type: "error", error: e instanceof Error ? e : new Error(String(e)) });
           wilt();
         }
       },
-
-      cancel() {
-        // Don't send destroy — daemon manages session lifecycle for --resume.
-      },
     });
 
-    return {
-      stream: bloom,
-      rawCall: { raw: { text }, rawHeaders: {} },
-      warnings,
-    };
+    return { stream };
   }
 }
 
-// Shared client — set by the plugin on init, used as fallback when the
-// provider loader calls createClwnd() without args.
-let sharedClient: any = null;
+// ─── Factory ─────────────────────────────────────────────────────────────
+
+let sharedClient: unknown = null;
 let sharedPluginInput: ClwndConfig["pluginInput"] = undefined;
-export function setSharedClient(client: any): void { sharedClient = client; }
+export function setSharedClient(client: unknown): void { sharedClient = client; }
 export function setSharedPluginInput(input: ClwndConfig["pluginInput"]): void { sharedPluginInput = input; }
 
 export function createClwnd(config: ClwndConfig = {}) {
   if (!config.client && sharedClient) config = { ...config, client: sharedClient };
   if (!config.pluginInput && sharedPluginInput) config = { ...config, pluginInput: sharedPluginInput };
-  const fn = (modelId: string): LanguageModelV2 => new ClwndModel(modelId, config);
+  const fn = (modelId: string): LanguageModelV3 => new ClwndModel(modelId, config);
   fn.languageModel = (modelId: string) => new ClwndModel(modelId, config);
   return fn;
 }

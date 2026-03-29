@@ -409,9 +409,38 @@ export function graft(
     ? conversation.slice(0, -1)
     : conversation;
   if (history.length === 0 || history.every(m => m.role === "user")) return { grafted: 0, lastPetal: null };
-  trace("graft.prompt", { turns: history.filter(m => m.role === "assistant").length, roles: history.map(m => m.role).join(",") });
-  fromPrompt(jsonlPath, sessionId, history, cwd);
-  const count = history.filter(m => m.role === "assistant").length;
+
+  // Compare with existing JSONL — only write the delta.
+  // Count user+assistant pairs in JSONL (Claude's own writes + prior grafts).
+  // Skip that many pairs from the history. Only graft what's new.
+  const existing = readEntries(jsonlPath);
+  const existingPairs = existing.filter(e => e.type === "assistant").length;
+
+  // Count pairs in history (each assistant = one pair completed)
+  let historyPairs = 0;
+  let deltaStart = 0;
+  for (let i = 0; i < history.length; i++) {
+    if (history[i].role === "assistant") {
+      historyPairs++;
+      if (historyPairs <= existingPairs) {
+        deltaStart = i + 1; // skip past this pair
+      }
+    }
+  }
+
+  const delta = history.slice(deltaStart);
+
+  trace("graft.prompt", {
+    historyPairs,
+    existingPairs,
+    deltaLen: delta.length,
+    roles: delta.map(m => m.role).join(",") || "none",
+  });
+
+  if (delta.length === 0 || delta.every(m => m.role === "user")) return { grafted: 0, lastPetal: null };
+
+  fromPrompt(jsonlPath, sessionId, delta, cwd);
+  const count = delta.filter(m => m.role === "assistant").length;
   return { grafted: count, lastPetal: null };
 }
 

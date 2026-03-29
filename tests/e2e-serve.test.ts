@@ -754,7 +754,7 @@ describe("e2e-serve: provider migration (#7)", () => {
   test("cold start: multi-turn after seed (opus) verifies no ghost corruption", async () => {
     skipIfDead();
     const sid = await createSession();
-    const freeModel = DUMMY_MODEL;
+    const freeModel = FREE_MODEL;
     const opusModel = { providerID: "opencode-clwnd", modelID: "claude-opus-4-6" };
 
     await sendMessage(sid, "My code is TIGER. Remember this.", undefined, TIMEOUT, freeModel);
@@ -783,7 +783,7 @@ describe("e2e-serve: provider migration (#7)", () => {
   test("cold start: multi-turn free model history is preserved", async () => {
     skipIfDead();
     const sid = await createSession();
-    const freeModel = DUMMY_MODEL;
+    const freeModel = FREE_MODEL;
 
     // Multiple turns with free model
     await sendMessage(sid, "My dog's name is BISCUIT. Acknowledge.", undefined, TIMEOUT, freeModel);
@@ -815,7 +815,7 @@ describe("e2e-serve: provider migration (#7)", () => {
   test("cold start seeding does not double tokens on subsequent turns", async () => {
     skipIfDead();
     const sid = await createSession();
-    const freeModel = DUMMY_MODEL;
+    const freeModel = FREE_MODEL;
 
     // Establish context with free model
     await sendMessage(sid, "Remember: ALPHA BETA GAMMA.", undefined, TIMEOUT, freeModel);
@@ -843,16 +843,16 @@ describe("e2e-serve: model switch history (#7)", () => {
   test("gap fill: clwnd → free → clwnd retains context from free model turn", async () => {
     skipIfDead();
     const sid = await createSession();
-    const freeModel = DUMMY_MODEL;
+    const freeModel = FREE_MODEL;
 
     // Turn 1: clwnd establishes context
-    await sendMessage(sid, "My secret animal is PENGUIN. Acknowledge.");
+    await sendMessage(sid, "My awesome pet is PENGUIN. Acknowledge.");
 
     // Turn 2: free model establishes different context
-    await sendMessage(sid, "My secret number is 7777. Acknowledge.", undefined, TIMEOUT, freeModel);
+    await sendMessage(sid, "My lucky number is 7777. Acknowledge.", undefined, TIMEOUT, freeModel);
 
     // Turn 3: back to clwnd — should know the free model's context (gap fill)
-    const resp = await sendMessage(sid, "What is my secret number?");
+    const resp = await sendMessage(sid, "What is my lucky number?");
     const text = extractResponseText(resp).toLowerCase();
     expect(text).toContain("7777");
   }, TIMEOUT);
@@ -860,7 +860,7 @@ describe("e2e-serve: model switch history (#7)", () => {
   test("gap fill does not re-inject on same-provider continuation", async () => {
     skipIfDead();
     const sid = await createSession();
-    const freeModel = DUMMY_MODEL;
+    const freeModel = FREE_MODEL;
 
     // clwnd → free → clwnd (gap fill happens here)
     await sendMessage(sid, "Remember DELTA.", undefined, TIMEOUT);

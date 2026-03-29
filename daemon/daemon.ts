@@ -985,6 +985,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           function doUncup() {
             if (uncupped) return;
             uncupped = true;
+            trace("nest.uncup", { sid, cuppedChunks: cupped.length, cuppedLen: cuppedText.length });
             if (cupped.length > 0) {
               sendChunks(cupped);
               cupped = [];
@@ -1083,6 +1084,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         onWilt(harvest) {
           if (withered) return; // withered petal — don't send finish for bad petals
           session.thorns = 0; // reset circuit breaker on success
+          trace("nest.wilt", { sid, finishReason: harvest.finishReason });
           if (uncup) uncup(); // uncup any remaining petals before finish
           hum(sid, {
             chi: "finish", sid,

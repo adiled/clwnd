@@ -150,4 +150,4 @@ export const clwndPlugin: Plugin = async (input) => {
   };
 };
 
-export { createClwnd };
+export { createClwnd } from "./provider.ts";
