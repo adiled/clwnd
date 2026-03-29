@@ -1109,7 +1109,7 @@ export class ClwndModel implements LanguageModelV2 {
                       const left = Math.ceil(((msg.dusk as number) - Date.now()) / 1000);
                       if (left > 0) {
                         self.config.client?.tui.showToast({
-                          body: { title: "Permission expiring", message: `${left}s remaining for ${msg.tool}`, variant: "warning", duration: left * 1000 },
+                          body: { title: "Permission expiring", message: `${left}s remaining for ${msg.tool} ~ clwnd`, variant: "warning", duration: left * 1000 },
                         }).catch(() => {});
                       }
                     }, warnAt);
@@ -1147,7 +1147,7 @@ export class ClwndModel implements LanguageModelV2 {
                   trace("drone.swallow.exhausted", { sid, retries: swallowRetries });
                   if (self.config.client) {
                     self.config.client.tui.showToast({
-                      body: { title: "Session context degraded", message: "Recovery attempts exhausted. Consider starting a new session.", variant: "warning", duration: 8000 },
+                      body: { title: "Context couldn't be recovered", message: "I tried, but this session's context is degraded. Better start a new session! ~ clwnd", variant: "warning", duration: 8000 },
                     }).catch(() => {});
                   }
                   flushHeld();
@@ -1160,7 +1160,7 @@ export class ClwndModel implements LanguageModelV2 {
                   // Toast the user
                   if (self.config.client) {
                     self.config.client.tui.showToast({
-                      body: { title: "Revitalizing your session", message: "Hold on tight!", variant: "info", duration: 3000 },
+                      body: { title: "Revitalizing your session", message: "Hold on tight! ~ clwnd", variant: "info", duration: 3000 },
                     }).catch(() => {});
                   }
                   // Re-send the same prompt — will trigger re-seed + respawn

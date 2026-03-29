@@ -62,7 +62,7 @@ export const clwndPlugin: Plugin = async (input) => {
     try { lastVersion = readFileSync(versionFile, "utf8").trim(); } catch {}
     if (lastVersion && lastVersion !== version) {
       input.client.tui.showToast({
-        body: { title: "clwnd updated", message: `v${lastVersion} → v${version}`, variant: "success", duration: 5000 },
+        body: { title: "clwnd updated", message: `v${lastVersion} → v${version} ~ clwnd`, variant: "success", duration: 5000 },
       }).catch(() => {});
     }
     try { mkdirSync(stateDir, { recursive: true }); writeFileSync(versionFile, version); } catch {}
