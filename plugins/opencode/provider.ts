@@ -872,6 +872,7 @@ export class ClwndModel implements LanguageModelV2 {
         content, text, systemPrompt,
         permissions, allowedTools, listenOnly,
         turnsSent: turnsSent.get(sid) ?? -1,
+        ...(seedClaudeId ? { seedClaudeId, seedClaudePath } : {}),
         dusk: duskIn(30_000),
       });
       promptSent = true;
@@ -1100,21 +1101,6 @@ export class ClwndModel implements LanguageModelV2 {
               // Permission ask — drop buffered tool events, emit clwnd_permission instead
               if (msg.action === "permission_ask") {
                 trace("permission.toolcall", { askId: msg.askId, tool: msg.tool, buffered: buds.length });
-                // Warn user before permission expires
-                if (typeof msg.dusk === "number" && self.config.client) {
-                  const remaining = (msg.dusk as number) - Date.now();
-                  if (remaining > 5000) {
-                    const warnAt = Math.floor(remaining * 0.8);
-                    setTimeout(() => {
-                      const left = Math.ceil(((msg.dusk as number) - Date.now()) / 1000);
-                      if (left > 0) {
-                        self.config.client?.tui.showToast({
-                          body: { title: "Permission expiring", message: `${left}s remaining for ${msg.tool} ~ clwnd`, variant: "warning", duration: left * 1000 },
-                        }).catch(() => {});
-                      }
-                    }, warnAt);
-                  }
-                }
                 buds.length = 0; // drop the buffered tool-call
                 const permCallId = `perm-${msg.askId}`;
                 const permInput = JSON.stringify({ tool: msg.tool, path: msg.path ?? "", askId: msg.askId });

@@ -442,7 +442,7 @@ export class Drone {
       if (state.suspicious && this.evaluate && !this.evaluating.has(s)) {
         this.evaluating.add(s);
         const text = state.responseText;
-        this.evaluate(text).then(probability => {
+        this.evaluate(text, state).then(probability => {
           this.evaluating.delete(s);
           if (probability >= this.swallowThreshold) {
             this.onAction({ type: "swallow", sigil: s, reason: `context loss probability ${probability.toFixed(2)}`, text });
@@ -502,4 +502,4 @@ export type DroneAction =
   | { type: "swallow"; sigil: string; reason: string; text: string };
 
 /** Neural evaluation callback — injected at creation, called when heuristics flag suspicion */
-export type DroneEvaluator = (text: string) => Promise<number>; // returns probability 0-1
+export type DroneEvaluator = (text: string, state: DroneState) => Promise<number>; // returns probability 0-1

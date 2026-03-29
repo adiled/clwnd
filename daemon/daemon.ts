@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 
 import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
-import { sigil, rid as makeRid, echo, pulse, isDusk, heuristicSuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
+import { sigil, rid as makeRid, echo, pulse, isDusk, heuristicSuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type DroneState, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
 import { droneThink } from "../lib/drone-llm.ts";
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
@@ -583,22 +583,22 @@ const wane = new WaneTracker();
 // Drone: self-governing observer — opt-in via droned:true in clwnd.json
 // When off, the hum is a raw pipe. When on, the sentinel watches everything.
 const DRONED = cfg.droned;
-const droneEvaluator = async (text: string): Promise<number> => {
+const droneEvaluator = async (text: string, state: DroneState): Promise<number> => {
   // Fast gate: if heuristics don't flag, skip LLM
   if (!heuristicSuspicion(text)) return 0.1;
 
-  // Slow path: ask the LLM
+  // Slow path: ask the LLM with real session state
   try {
     const judgment = await droneThink({
       responseText: text,
-      inflightTools: 0,
-      pendingPermissions: 0,
-      tokensBurned: 0,
+      inflightTools: state.inflightTools,
+      pendingPermissions: state.pendingPermissions,
+      tokensBurned: state.tokensBurned,
       turnCount: 0,
-      localWane: 0,
-      remoteWane: 0,
-      missedBeats: 0,
-      pendingEchoes: 0,
+      localWane: state.localWane,
+      remoteWane: state.remoteWane,
+      missedBeats: state.missedBeats,
+      pendingEchoes: state.pendingEchoes.size,
       toolNames: [],
     });
     trace("drone.llm.judgment", { assessment: judgment.assessment, action: judgment.action, reason: judgment.reason });
@@ -849,6 +849,14 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
 
       // Update model — prompt always carries the current model
       if (msg.modelId) session.modelId = msg.modelId as string;
+
+      // Seed info fallback — if chi:"seeded" was lost, prompt carries it
+      if (msg.seedClaudeId && msg.seedClaudePath) {
+        session.claudeSessionId = msg.seedClaudeId as string;
+        session.claudeSessionPath = msg.seedClaudePath as string;
+        session.needsRespawn = true;
+        saveSessions(sid);
+      }
 
       // Persist turnsSent from plugin — survives daemon/plugin restarts
       if (typeof msg.turnsSent === "number") {
