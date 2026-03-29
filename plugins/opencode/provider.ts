@@ -1142,7 +1142,16 @@ export class ClwndModel implements LanguageModelV2 {
 
               if (msg.action === "finish") {
                 // Drone swallow: if held petals are suspicious, discard and retrofit
-                if (discardHeld() && swallowRetries < MAX_SWALLOW_RETRIES) {
+                if (heldSuspicious && !heldCleared && swallowRetries >= MAX_SWALLOW_RETRIES) {
+                  // Exhausted retries — let it through but warn the user
+                  trace("drone.swallow.exhausted", { sid, retries: swallowRetries });
+                  if (self.config.client) {
+                    self.config.client.tui.showToast({
+                      body: { title: "Session context degraded", message: "Recovery attempts exhausted. Consider starting a new session.", variant: "warning", duration: 8000 },
+                    }).catch(() => {});
+                  }
+                  flushHeld();
+                } else if (discardHeld() && swallowRetries < MAX_SWALLOW_RETRIES) {
                   swallowRetries++;
                   trace("drone.swallow.plugin", { sid, heldLen: heldText.length, retry: swallowRetries });
                   // Kill process, re-seed on next call
