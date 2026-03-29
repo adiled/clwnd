@@ -1112,6 +1112,8 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           nest.murmur(sid, poolKey, promptContent);
         } else {
           trace("nest.murmur.empty", { sid, poolKey });
+          // Send finish so OC doesn't hang waiting for a response
+          hum(sid, { chi: "finish", sid, finishReason: "stop", usage: undefined, providerMetadata: {} });
         }
       }
       })().catch(e => trace("prompt.failed", { sid, err: String(e) }));
