@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 
 import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
-import { sigil, rid as makeRid, echo, pulse, isDusk, heuristicSuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type Breath, type BreathSession, type Reach, type DroneAction } from "../lib/hum.ts";
+import { sigil, rid as makeRid, echo, pulse, isDusk, heuristicSuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
 import { droneThink } from "../lib/drone-llm.ts";
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
@@ -431,7 +431,6 @@ class ClaudeNest {
 
     if (msg.type === "content_block_stop") {
       petal("content_block_stop", { blockIdx: msg.index });
-      drone.observed(sigil(poolKey), { type: "tool_end" });
       return;
     }
 
@@ -454,6 +453,7 @@ class ClaudeNest {
           if (typeof body === "string") resultText = body;
           else if (Array.isArray(body)) resultText = (body as Array<Record<string, unknown>>).filter(c => typeof c.text === "string").map(c => c.text as string).join("\n");
           petal("tool_result", { toolUseId, result: resultText });
+          drone.observed(sigil(poolKey), { type: "tool_end" });
         }
       }
       return;
@@ -697,9 +697,11 @@ const drone = DRONED ? new Drone("daemon", (action: DroneAction) => {
         if (sigil(sid) === s) { session.needsRespawn = true; saveSessions(sid); break; }
       }
     } else if (judgment.action === "swallow") {
-      for (const [sid] of sessions) {
+      for (const [sid, session] of sessions) {
         if (sigil(sid) === s) {
           nest.fell(sid, sid);
+          session.needsRespawn = true;
+          saveSessions(sid);
           hum(sid, { chi: "drone-retrofit", sid, reason: judgment.reason });
           break;
         }
@@ -786,8 +788,8 @@ function humEcho(clientId: string, tone: Record<string, unknown>, ok = true, err
   humTo(client, { chi: "echo", rid: tone.rid, ok, error });
 }
 
-function humPulse(kind: string, sid: string, extra?: Record<string, unknown>): void {
-  const p = pulse(kind as any, sigil(sid), sid, extra as any);
+function humPulse(kind: PulseKind, sid: string, extra?: Partial<Pulse>): void {
+  const p = pulse(kind, sigil(sid), sid, extra);
   hum(sid, p as unknown as Record<string, unknown>);
 }
 

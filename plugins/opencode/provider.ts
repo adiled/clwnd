@@ -536,26 +536,6 @@ function extractHistoryForExport(prompt: LanguageModelV2Prompt): Array<{ role: s
   return history.length > 0 ? history.map(m => ({ role: m.role, content: m.content })) : null;
 }
 
-// Path B: Extract gap turns EXCLUDING current user message for JSONL export.
-function extractGapForExport(prompt: LanguageModelV2Prompt, after: number): Array<{ role: string; content: unknown }> | null {
-  let lastUserIdx = -1;
-  for (let i = prompt.length - 1; i >= 0; i--) {
-    if (prompt[i].role === "user") { lastUserIdx = i; break; }
-  }
-  const allHistory = prompt.slice(0, lastUserIdx).filter(m => m.role !== "system");
-  // Count user turns to find the gap start point
-  let userCount = 0;
-  let gapStart = 0;
-  for (let i = 0; i < allHistory.length; i++) {
-    if (allHistory[i].role === "user") {
-      userCount++;
-      if (userCount > after) { gapStart = i; break; }
-    }
-  }
-  if (userCount <= after) return null;
-  const gap = allHistory.slice(gapStart);
-  return gap.length > 0 ? gap.map(m => ({ role: m.role, content: m.content })) : null;
-}
 
 function extractSystemPrompt(prompt: LanguageModelV2Prompt): string {
   const parts: string[] = [];
@@ -917,6 +897,8 @@ export class ClwndModel implements LanguageModelV2 {
         let heldText = "";
         let heldCleared = !DRONED; // drone off = always flow directly
         let heldSuspicious = false;
+        let swallowRetries = 0;
+        const MAX_SWALLOW_RETRIES = 1;
         const HELD_THRESHOLD = 200; // chars before heuristic check
 
         function petalOrHold(part: LanguageModelV2StreamPart) {
@@ -1160,8 +1142,9 @@ export class ClwndModel implements LanguageModelV2 {
 
               if (msg.action === "finish") {
                 // Drone swallow: if held petals are suspicious, discard and retrofit
-                if (discardHeld()) {
-                  trace("drone.swallow.plugin", { sid, heldLen: heldText.length });
+                if (discardHeld() && swallowRetries < MAX_SWALLOW_RETRIES) {
+                  swallowRetries++;
+                  trace("drone.swallow.plugin", { sid, heldLen: heldText.length, retry: swallowRetries });
                   // Kill process, re-seed on next call
                   hum({ chi: "cancel", sid, dusk: duskIn(5_000) });
                   turnsSent.delete(sid);
