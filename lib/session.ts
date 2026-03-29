@@ -361,6 +361,7 @@ export async function graft(
 
   for (const m of ocData) {
     if (m.info.role === "assistant" && m.info.summary) continue;
+    trace("graft.msg", { id: (m.info as unknown as { id: string }).id, role: m.info.role, parts: m.parts.length, types: m.parts.map(p => p.type).join(",") || "none" });
     if (m.parts.every(p => p.type === "compaction" || p.type === "step-start" || p.type === "step-finish")) continue;
 
     if (m.info.role === "user") {
@@ -371,9 +372,6 @@ export async function graft(
       if (content.length > 0) userMsgs.set(m.info.id, { id: m.info.id, content, toolResults: [] });
 
     } else if (m.info.role === "assistant" && m.info.parentID) {
-      // Skip in-flight responses — only graft completed petals
-      const time = (m.info as unknown as { time?: { completed?: number } }).time;
-      if (!time?.completed) continue;
       // Skip clwnd's own turns — already in the JSONL via Claude CLI
       const providerID = (m.info as unknown as { providerID?: string }).providerID;
       if (providerID?.startsWith("opencode-clwnd")) continue;
