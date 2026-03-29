@@ -524,6 +524,7 @@ interface Session {
   modelId: string;
   needsRespawn?: boolean;
   lastAccessed?: number;
+  lastSyncedPetalId?: string | null;
 }
 
 const STATE_DIR = process.env.XDG_STATE_HOME
@@ -1005,7 +1006,8 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       const role = msg.role as string;
       const model = msg.model as string;
       const provider = msg.provider as string;
-      trace("session.event", { sid, event: msg.event, role, model, provider });
+      const messageId = msg.messageId as string | undefined;
+      trace("session.event", { sid, event: msg.event, role, model, provider, messageId });
       let session = sessions.get(sid);
       if (!session) {
         session = {
