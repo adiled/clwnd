@@ -3,7 +3,7 @@ import { tool } from "@opencode-ai/plugin";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
-import { createClwnd, setSharedClient, setLogClient, hum, trace, log, resetTurnsSent } from "./provider.ts";
+import { createClwnd, setSharedClient, setLogClient, hum, trace, log } from "./provider.ts";
 import { loadConfig, type ClwndConfig } from "../../lib/config.ts";
 import { duskIn } from "../../lib/hum.ts";
 
@@ -105,8 +105,7 @@ export const clwndPlugin: Plugin = async (input) => {
           setTimeout(() => delete (globalThis as any)[key], 5000);
 
           trace("session.compacted", { sid });
-          resetTurnsSent(sid);
-          hum({ chi: "cancel", sid, dusk: duskIn(5_000) });
+          hum({ chi: "cancel", sid, reason: "compaction", dusk: duskIn(5_000) });
         }
       }
     },

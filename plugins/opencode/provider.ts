@@ -1,8 +1,6 @@
 import { generateId } from "@ai-sdk/provider-utils";
-import { randomUUID } from "crypto";
-import * as session from "../../lib/session.ts";
 import { loadConfig } from "../../lib/config.ts";
-import { sigil as makeSigil, heuristicSuspicion, WaneTracker, Drone, duskIn, type DroneAction } from "../../lib/hum.ts";
+import { sigil as makeSigil, heuristicSuspicion, Drone, duskIn, type DroneAction } from "../../lib/hum.ts";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 // Three destinations: plugin log file (always), hum → daemon (when connected), OC debug (when client ready).
@@ -194,19 +192,12 @@ async function awakenHum(): Promise<void> {
             trace("hum.echo", { rid: msg.rid, ok: msg.ok });
             continue;
           }
-          // Breath: daemon sends full state on connect — resync stale sessions via wane
+          // Breath: daemon sends session state on connect
           if (msg.chi === "breath") {
-            const sessions = (msg.sessions ?? []) as Array<{ sid: string; sigil: string; turnsSent: number; wane: number }>;
+            const sessions = (msg.sessions ?? []) as Array<{ sid: string; sigil: string; wane: number }>;
             let synced = 0;
             for (const s of sessions) {
-              // Only resync if daemon's wane is ahead of ours
-              if (localWane.behind(s.sigil, s.wane)) {
-                if (typeof s.turnsSent === "number" && s.turnsSent >= 0) {
-                  turnsSent.set(s.sid, s.turnsSent);
-                }
-                localWane.set(s.sigil, s.wane);
-                synced++;
-              }
+              synced++;
             }
             trace("hum.breath.received", { sessions: sessions.length, synced });
             continue;
@@ -223,8 +214,7 @@ async function awakenHum(): Promise<void> {
           if (msg.chi === "drone-retrofit") {
             const sid = msg.sid as string;
             trace("drone.retrofit", { sid, reason: msg.reason });
-            // Reset turnsSent so next call does full re-seed from current prompt
-            turnsSent.delete(sid);
+            // Daemon handles re-seed via graft — nothing to reset here
             continue;
           }
           if (humHearer) humHearer(msg);
@@ -235,8 +225,7 @@ async function awakenHum(): Promise<void> {
     humSocket.on("close", () => {
       humAlive = false;
       humSocket = null;
-      // Don't clear turnsSent — OC's prompt history doesn't change on hum reconnect.
-      // The daemon tracks needsRespawn separately for process lifecycle.
+      // Daemon owns seeding state — nothing to clear on reconnect.
       trace("hum.disconnected");
       // Refresh the await-able promise so doStream waits for reconnect
       humAwaken = new Promise<void>(r => { humReady = { resolve: r }; });
@@ -473,10 +462,7 @@ function extractText(prompt: LanguageModelV2Prompt, sessionId?: string): string 
 }
 
 // ─── History Seeding (#7) ────────────────────────────────────────────────────
-// Two paths: cold start (JSONL export) and gap fill (content injection).
-
-const turnsSent = new Map<string, number>();
-const localWane = new WaneTracker();
+// Seeding is daemon-driven via graft(). Plugin is thin — send prompt, stream response.
 
 // Plugin drone — observes hum I/O from the plugin side (opt-in via droned:true)
 const DRONED = loadConfig().droned;
@@ -506,35 +492,6 @@ const pluginDrone = DRONED ? new Drone("plugin", (action: DroneAction) => {
   }
 }) : { sent() {}, heard() {}, observed() {}, setWane() {}, inspect() { return new Map(); }, stop() {} } as unknown as Drone;
 
-/** Reset turn counter after compaction — forces full re-seed on next message */
-export function resetTurnsSent(sid: string): void {
-  turnsSent.delete(sid);
-}
-
-// turnsSent restored via breath on hum connect — wane guards against stale data
-
-function countHistoryTurns(prompt: LanguageModelV2Prompt): number {
-  let lastUserIdx = -1;
-  for (let i = prompt.length - 1; i >= 0; i--) {
-    if (prompt[i].role === "user") { lastUserIdx = i; break; }
-  }
-  let turns = 0;
-  for (let i = 0; i < lastUserIdx; i++) {
-    if (prompt[i].role === "user") turns++;
-  }
-  return turns;
-}
-
-// Path A: Extract history EXCLUDING current user message for JSONL export.
-// The current message arrives via stdin (murmur). Seed provides context only.
-function extractHistoryForExport(prompt: LanguageModelV2Prompt): Array<{ role: string; content: unknown }> | null {
-  let lastUserIdx = -1;
-  for (let i = prompt.length - 1; i >= 0; i--) {
-    if (prompt[i].role === "user") { lastUserIdx = i; break; }
-  }
-  const history = prompt.slice(0, lastUserIdx).filter(m => m.role !== "system");
-  return history.length > 0 ? history.map(m => ({ role: m.role, content: m.content })) : null;
-}
 
 
 function extractSystemPrompt(prompt: LanguageModelV2Prompt): string {
@@ -787,40 +744,7 @@ export class ClwndModel implements LanguageModelV2 {
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
-    // History seeding (#7) — plugin writes JSONL directly, signals daemon
-    // turnsSent restored via breath on hum connect
-    const historyTurns = countHistoryTurns(opts.prompt);
-    const sent = turnsSent.get(sid) ?? -1;
-    let seedClaudeId: string | undefined;
-    let seedClaudePath: string | undefined;
-
-    if (!isAuxiliaryCall(opts) && !isBrokeredToolReturn(opts.prompt)) {
-      let seedHistory: Array<{ role: string; content: unknown }> | null = null;
-
-      if (historyTurns > 0 && historyTurns !== sent) {
-        // Always full re-seed — gap fill breaks with multi-model hops
-        seedHistory = extractHistoryForExport(opts.prompt);
-        if (seedHistory) {
-          trace("seed.export", { sid, turns: historyTurns, sent, seedLen: seedHistory.length });
-        }
-      }
-
-      if (seedHistory) {
-        // Write JSONL directly — synchronous, survives plugin reload
-        seedClaudeId = randomUUID();
-        seedClaudePath = session.createSession(cwd, seedClaudeId);
-        session.fromPrompt(seedClaudePath, seedClaudeId, seedHistory, cwd);
-        log("seed.written", { sid, claudeId: seedClaudeId, path: seedClaudePath, turns: seedHistory.length });
-        // Signal daemon — echo confirms custody
-        hum({ chi: "seeded", sid, claudeSessionId: seedClaudeId, claudeSessionPath: seedClaudePath, cwd, dusk: duskIn(10_000) });
-      }
-
-      // +1 because the current turn (being sent now) will be history on the next call
-      turnsSent.set(sid, historyTurns + 1);
-      const s = makeSigil(sid);
-      localWane.tick(s);
-      pluginDrone.setWane(s, localWane.get(s));
-    }
+    // Seeding handled by daemon via graft() — plugin just sends the prompt
 
     // Brokered tool return — OpenCode executed the tool, sending result back.
     if (isBrokeredToolReturn(opts.prompt)) {
@@ -871,8 +795,6 @@ export class ClwndModel implements LanguageModelV2 {
         modelId: self.modelId,
         content, text, systemPrompt,
         permissions, allowedTools, listenOnly,
-        turnsSent: turnsSent.get(sid) ?? -1,
-        ...(seedClaudeId ? { seedClaudeId, seedClaudePath } : {}),
         dusk: duskIn(30_000),
       });
       promptSent = true;
@@ -992,9 +914,7 @@ export class ClwndModel implements LanguageModelV2 {
             modelId: self.modelId,
             content, text, systemPrompt,
             permissions, allowedTools, listenOnly,
-            turnsSent: turnsSent.get(sid) ?? -1,
-            ...(seedClaudeId ? { seedClaudeId, seedClaudePath } : {}),
-            dusk: duskIn(30_000),
+                    dusk: duskIn(30_000),
           });
         }
 
@@ -1141,8 +1061,7 @@ export class ClwndModel implements LanguageModelV2 {
                   swallowRetries++;
                   trace("drone.swallow.plugin", { sid, heldLen: heldText.length, retry: swallowRetries });
                   // Kill process, re-seed on next call
-                  hum({ chi: "cancel", sid, dusk: duskIn(5_000) });
-                  turnsSent.delete(sid);
+                  hum({ chi: "cancel", sid, reason: "swallow", dusk: duskIn(5_000) });
                   // Toast the user
                   if (self.config.client) {
                     self.config.client.tui.showToast({
@@ -1155,8 +1074,7 @@ export class ClwndModel implements LanguageModelV2 {
                     modelId: self.modelId,
                     content, text, systemPrompt,
                     permissions, allowedTools, listenOnly,
-                    turnsSent: turnsSent.get(sid) ?? -1,
-                    dusk: duskIn(30_000),
+                                dusk: duskIn(30_000),
                   });
                   // Reset stream state for the new response
                   textStarted = false;

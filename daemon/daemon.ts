@@ -8,6 +8,8 @@ import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
 import { sigil, rid as makeRid, echo, pulse, isDusk, heuristicSuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type DroneState, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
 import { droneThink } from "../lib/drone-llm.ts";
+import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, type GraftResult } from "../lib/session.ts";
+import { createOpencodeClient } from "@opencode-ai/sdk";
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
 
@@ -557,10 +559,6 @@ function saveSessions(mutatedSid?: string): void {
 
 const sessions = loadSessions();
 
-// ─── Session (Claude CLI JSONL) ─────────────────────────────────────────────
-
-import { sessionDir as getSessionDir, sessionPath as getSessionPath } from "../lib/session.ts";
-
 // ─── HTTP Server ─────────────────────────────────────────────────────────────
 
 function defaultSocketPath(): string {
@@ -580,6 +578,7 @@ const HTTP = SOCK + ".http";
 
 const nest = new ClaudeNest(process.env.CLAUDE_CLI_PATH ?? "claude");
 const wane = new WaneTracker();
+const ocClient = createOpencodeClient({ baseUrl: "http://127.0.0.1:4096" });
 
 // Drone: self-governing observer — opt-in via droned:true in clwnd.json
 // When off, the hum is a raw pipe. When on, the sentinel watches everything.
@@ -665,8 +664,8 @@ const drone = DRONED ? new Drone("daemon", (action: DroneAction) => {
         if (sigil(sid) === action.sigil) {
           nest.fell(sid, sid);
           session.needsRespawn = true;
+          session.lastSyncedPetal = null;
           saveSessions(sid);
-          // Signal plugin to retry — the next prompt will re-seed and respawn
           hum(sid, { chi: "drone-retrofit", sid, reason: action.reason });
           break;
         }
@@ -702,6 +701,7 @@ const drone = DRONED ? new Drone("daemon", (action: DroneAction) => {
         if (sigil(sid) === s) {
           nest.fell(sid, sid);
           session.needsRespawn = true;
+          session.lastSyncedPetal = null;
           saveSessions(sid);
           hum(sid, { chi: "drone-retrofit", sid, reason: judgment.reason });
           break;
@@ -763,15 +763,14 @@ function humBreath(client: Reach): void {
   const sessionList: BreathSession[] = [];
   for (const [sid, session] of sessions) {
     // Only sync sessions with meaningful state
-    if ((session.turnsSent ?? -1) < 0 && !session.claudeSessionId) continue;
+    if (!session.claudeSessionId && !session.lastSyncedPetal) continue;
     const s = sigil(sid);
     sessionList.push({
       sigil: s,
       sid,
       claudeSessionId: session.claudeSessionId,
       claudeSessionPath: session.claudeSessionPath,
-      turnsSent: session.turnsSent ?? -1,
-      wane: wane.get(s),
+            wane: wane.get(s),
       modelId: session.modelId,
       cwd: session.cwd,
       roostAlive: !!nest.roost(sid),
@@ -817,6 +816,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
     case "prompt": {
       const sid = msg.sid as string;
       const client = humClients.get(clientId);
+      (async () => {
       if (client) client.sigils.add(sigil(sid));
 
       // Get or create session
@@ -828,7 +828,6 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           claudeSessionPath: null,
           cwd: (msg.cwd as string) ?? "/root",
           modelId: (msg.modelId as string) ?? "sonnet",
-          turnsSent: -1,
         };
         sessions.set(sid, session);
         saveSessions(sid);
@@ -851,18 +850,27 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       // Update model — prompt always carries the current model
       if (msg.modelId) session.modelId = msg.modelId as string;
 
-      // Seed info fallback — if chi:"seeded" was lost, prompt carries it
-      if (msg.seedClaudeId && msg.seedClaudePath) {
-        session.claudeSessionId = msg.seedClaudeId as string;
-        session.claudeSessionPath = msg.seedClaudePath as string;
-        session.needsRespawn = true;
-        saveSessions(sid);
-      }
-
-      // Persist turnsSent from plugin — survives daemon/plugin restarts
-      if (typeof msg.turnsSent === "number") {
-        session.turnsSent = msg.turnsSent;
-        saveSessions(sid);
+      // Graft: sync OC petals into Claude JSONL before spawning
+      if (!msg.listenOnly) {
+        try {
+          // Cold start: no Claude JSONL yet
+          if (!session.claudeSessionId) {
+            session.claudeSessionId = randomUUID();
+            session.claudeSessionPath = createClaudeSession(cwd ?? session.cwd, session.claudeSessionId);
+            saveSessions(sid);
+          }
+          // Graft petals since the last synced one
+          const sinceId = session.lastSyncedPetal?.[1] ?? null;
+          const result = await graft(ocClient, sid, sinceId, null, session.claudeSessionPath!, session.claudeSessionId, cwd ?? session.cwd);
+          if (result.grafted > 0) {
+            session.lastSyncedPetal = result.lastPetal;
+            session.needsRespawn = true;
+            saveSessions(sid);
+            trace("graft.done", { sid, grafted: result.grafted, lastPetal: result.lastPetal });
+          }
+        } catch (e) {
+          trace("graft.failed", { sid, err: String(e) });
+        }
       }
 
       // Capture prompt content for deferred murmur
@@ -935,6 +943,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         // Murmur immediately — stdin is buffered, Claude CLI processes when ready
         nest.murmur(sid, poolKey, promptContent);
       }
+      })().catch(e => trace("prompt.failed", { sid, err: String(e) }));
       break;
     }
 
@@ -942,8 +951,15 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       const sid = msg.sid as string;
       const session = sessions.get(sid);
       if (session) {
-        trace("nest.cancelled", { sid });
+        trace("nest.cancelled", { sid, reason: msg.reason });
         nest.fell(sid, sid);
+        // Compaction: reset anchor — next prompt does full graft
+        if (msg.reason === "compaction") {
+          session.lastSyncedPetal = null;
+          session.claudeSessionId = null;
+          session.claudeSessionPath = null;
+          saveSessions(sid);
+        }
       }
       break;
     }
@@ -975,21 +991,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       break;
     }
 
-    case "seeded": {
-      // Plugin wrote the JSONL directly — just update session state
-      const sid = msg.sid as string;
-      let session = sessions.get(sid);
-      if (!session) {
-        session = { opencodeSessionId: sid, claudeSessionId: null, claudeSessionPath: null, cwd: (msg.cwd as string) ?? process.env.HOME ?? "/", modelId: "sonnet" };
-        sessions.set(sid, session);
-      }
-      if (msg.claudeSessionId) session.claudeSessionId = msg.claudeSessionId as string;
-      if (msg.claudeSessionPath) session.claudeSessionPath = msg.claudeSessionPath as string;
-      session.needsRespawn = true;
-      saveSessions(sid);
-      trace("seed.received", { sid, claudeId: session.claudeSessionId, needsRespawn: true });
-      break;
-    }
+    // "seeded" handler removed — daemon owns seeding via graft()
 
     case "log": {
       const level = msg.level as string;
@@ -1017,7 +1019,6 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           claudeSessionPath: null,
           cwd: process.env.HOME ?? "/",
           modelId: model ?? "sonnet",
-          turnsSent: -1,
         };
         sessions.set(sid, session);
       }
