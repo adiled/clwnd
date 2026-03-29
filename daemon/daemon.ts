@@ -1007,6 +1007,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       const model = msg.model as string;
       const provider = msg.provider as string;
       const messageId = msg.messageId as string | undefined;
+      const parentId = msg.parentId as string | undefined;
       trace("session.event", { sid, event: msg.event, role, model, provider, messageId });
       let session = sessions.get(sid);
       if (!session) {
@@ -1021,6 +1022,12 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         sessions.set(sid, session);
       }
       session.lastAccessed = Date.now();
+      // Track last OC petal — but only update lastSyncedPetal for clwnd's own turns.
+      // For other providers, graft() updates lastSyncedPetal when it actually syncs.
+      if (role === "assistant" && messageId && parentId && provider?.startsWith("opencode-clwnd")) {
+        session.lastSyncedPetal = [parentId, messageId];
+        saveSessions(sid);
+      }
       break;
     }
 

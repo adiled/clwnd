@@ -87,8 +87,10 @@ export const clwndPlugin: Plugin = async (input) => {
         const role = props.info.role;
         const model = props.info.modelID;
         const provider = props.info.providerID;
+        const messageId = props.info.id;
+        const parentId = props.info.parentID;
         if (sid && role) {
-          hum({ chi: "session-event", sid, event: etype, role, model, provider });
+          hum({ chi: "session-event", sid, event: etype, role, model, provider, messageId, parentId });
         }
       }
 
