@@ -305,12 +305,27 @@ function updateLeafUuid(path: string, uuid: string): void {
 }
 
 // ─── Timestamp Generator ───────────────────────────────────────────────────
-// Sequential timestamps 10s apart — prevents --resume ghost generation.
+// Grafted entries must have timestamps AFTER existing JSONL entries.
+// Claude CLI resolves chain tip by timestamp — older entries become sidechains.
 
-function makeTimestamps(count: number): () => string {
-  const base = Date.now() - count * 10_000;
+function makeTimestamps(count: number, afterPath?: string): () => string {
+  let base: number;
+  if (afterPath) {
+    const entries = readEntries(afterPath);
+    let latest = 0;
+    for (const e of entries) {
+      const ts = (e as unknown as Record<string, unknown>).timestamp;
+      if (typeof ts === "string") {
+        const t = new Date(ts).getTime();
+        if (t > latest) latest = t;
+      }
+    }
+    base = latest > 0 ? latest + 1000 : Date.now() - count * 1000;
+  } else {
+    base = Date.now() - count * 1000;
+  }
   let idx = 0;
-  return () => new Date(base + (idx++) * 10_000).toISOString();
+  return () => new Date(base + (idx++) * 1000).toISOString();
 }
 
 // ─── AI SDK Prompt → Claude JSONL ──────────────────────────────────────────
@@ -324,7 +339,7 @@ export function fromPrompt(
   cwd: string,
 ): void {
   let parentUuid: string | null = lastUuid(path);
-  const ts = makeTimestamps(history.length);
+  const ts = makeTimestamps(history.length, path);
 
   for (const msg of history) {
     const raw = msg.content;
@@ -486,6 +501,12 @@ export function graft(
 
   const delta = history.slice(deltaStart);
 
+  // Log delta content for debugging
+  const deltaPreview = delta.slice(0, 4).map(m => {
+    const t = promptText(m);
+    return `${m.role}:${t.slice(0, 40)}`;
+  }).join(" | ");
+
   trace("graft.chain", {
     promptUsers: promptChain.length,
     jsonlUsers: jsonlChain.length,
@@ -493,6 +514,7 @@ export function graft(
     deltaLen: delta.length,
     roles: delta.map(m => m.role).join(",") || "none",
     tip: jsonlChain.length > 0 ? jsonlChain[jsonlChain.length - 1] : "empty",
+    delta: deltaPreview || "none",
   });
 
   if (delta.length === 0 || delta.every(m => m.role === "user")) return { grafted: 0, lastPetal: null };
