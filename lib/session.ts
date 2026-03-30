@@ -473,6 +473,8 @@ function chainFromJSONL(entries: ClaudeEntry[]): string[] {
         .filter(c => c.type === "text")
         .map(c => (c as ClaudeContentText).text)
         .join("");
+      if (!text) continue; // skip tool_result-only user entries
+      if (text === "Continue from where you left off.") continue; // skip --resume ghost
       prev = chainLink(prev, text);
       chain.push(prev);
     }

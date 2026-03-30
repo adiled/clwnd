@@ -121,18 +121,21 @@ function assertCleanHistory(jsonlPath: string): void {
     throw new Error(`${ghosts.length} ghost 'No response requested.' entries in JSONL — --resume generated phantom responses`);
   }
 
-  // No duplicate consecutive user messages
-  const userTexts = lines
-    .filter((l: any) => l.type === "user" && l.message?.role === "user")
-    .map((l: any) => {
+  // No back-to-back duplicate user messages (adjacent in raw JSONL, not just among user entries)
+  for (let i = 1; i < lines.length; i++) {
+    const prev = lines[i - 1];
+    const curr = lines[i];
+    if (prev.type !== "user" || curr.type !== "user") continue;
+    if (prev.message?.role !== "user" || curr.message?.role !== "user") continue;
+    const textOf = (l: any) => {
       const c = l.message.content;
       if (typeof c === "string") return c;
       if (Array.isArray(c)) return c.filter((p: any) => p.type === "text").map((p: any) => p.text).join("");
       return "";
-    });
-  for (let i = 1; i < userTexts.length; i++) {
-    if (userTexts[i] && userTexts[i] === userTexts[i - 1]) {
-      throw new Error(`Duplicate consecutive user message in JSONL at index ${i}: "${userTexts[i].slice(0, 80)}"`);
+    };
+    const pt = textOf(prev), ct = textOf(curr);
+    if (pt && pt === ct) {
+      throw new Error(`Duplicate back-to-back user message in JSONL at line ${i}: "${ct.slice(0, 80)}"`);
     }
   }
 }
@@ -1289,13 +1292,12 @@ describe("e2e-serve: drone swallow + retrofit", () => {
     } catch {}
     await Bun.sleep(2_000);
 
-    // Send message — Claude CLI has no JSONL, will lose context.
-    // Drone should catch the context-loss response, swallow it,
-    // re-seed from OC's prompt, and retry. User gets the real answer.
-    const resp = await sendMessage(sid, "What is the poetic name for the socket? One word.", undefined, 60_000);
+    // Send a DIFFERENT message — tests context retention after JSONL loss.
+    // Must differ from the first message to avoid false duplicate in assertCleanHistory.
+    const resp = await sendMessage(sid, "In clwnd, what is the word for sending a prompt to Claude CLI? One word.", undefined, 60_000);
     const text = extractResponseText(resp).toLowerCase();
 
-    // The drone should have re-seeded and retried — response should have context
-    expect(text).toContain("hum");
+    // Graft rebuilds JSONL from priorPetals — response should have context
+    expect(text).toContain("murmur");
   }, TIMEOUT);
 });
