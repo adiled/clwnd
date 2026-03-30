@@ -199,12 +199,14 @@ function execRead(args: { file_path: string; offset?: number; limit?: number }):
     const content = readFileSync(p, "utf-8");
     const lines = content.split("\n");
     const offset = (args.offset ?? 1) - 1;
-    const limit = args.limit ?? 2000;
+    const limit = Math.min(args.limit ?? 500, 1000);
+    const totalLines = lines.length;
     const slice = lines.slice(offset, offset + limit);
-    const truncated = lines.length > offset + limit;
+    const truncated = totalLines > offset + limit;
     const numbered = slice.map((line, i) => `${offset + i + 1}\t${line}`).join("\n");
+    const suffix = truncated ? `\n[... truncated — showing ${slice.length} of ${totalLines} lines. Use offset to read more.]` : "";
     return {
-      output: numbered,
+      output: numbered + suffix,
       title: relative(CWD, p) || p,
       metadata: { truncated, loaded: [p] },
     };
@@ -262,6 +264,12 @@ function execWrite(args: { file_path: string; content: string }): ToolResult {
   };
 }
 
+const BASH_MAX_OUTPUT = 50 * 1024; // 50KB
+
+function stripAnsi(s: string): string {
+  return s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+}
+
 function execBash(args: { command: string; description?: string; timeout?: number }): ToolResult {
   checkPermission("bash", args.command);
   const timeout = args.timeout ?? 120_000;
@@ -270,12 +278,16 @@ function execBash(args: { command: string; description?: string; timeout?: numbe
   try {
     output = execSync(args.command, {
       encoding: "utf-8", timeout, cwd: CWD,
-      env: { ...process.env, TERM: "xterm-256color" },
+      env: { ...process.env, TERM: "dumb" },
       maxBuffer: 10 * 1024 * 1024,
     });
   } catch (e: any) {
     output = (e.stdout ?? "") + (e.stderr ? "\n" + e.stderr : "");
     exitCode = e.status ?? 1;
+  }
+  output = stripAnsi(output);
+  if (output.length > BASH_MAX_OUTPUT) {
+    output = output.slice(0, BASH_MAX_OUTPUT) + `\n[... output truncated at ${Math.round(BASH_MAX_OUTPUT / 1024)}KB — pipe to file for full output]`;
   }
   return {
     output,
@@ -292,14 +304,14 @@ function execGlob(args: { pattern: string; path?: string }): ToolResult {
   checkPermission("glob", dir);
   try {
     const out = execSync(
-      `shopt -s globstar nullglob; cd "${dir}" && printf '%s\\n' ${args.pattern} 2>/dev/null | head -200`,
+      `shopt -s globstar nullglob; cd "${dir}" && printf '%s\\n' ${args.pattern} 2>/dev/null | head -100`,
       { encoding: "utf-8", timeout: 10000, shell: "/bin/bash" },
     );
     const files = out.trim().split("\n").filter(Boolean);
     return {
       output: files.join("\n") || "No matches found",
       title: relative(CWD, dir) || args.pattern,
-      metadata: { count: files.length, truncated: files.length >= 200 },
+      metadata: { count: files.length, truncated: files.length >= 100 },
     };
   } catch {
     return { output: "No matches found", title: args.pattern, metadata: { count: 0, truncated: false } };
@@ -311,26 +323,26 @@ function execGrep(args: { pattern: string; path?: string; include?: string }): T
   checkPermission("grep", dir);
   let cmd = `rg --no-heading --line-number`;
   if (args.include) cmd += ` --glob "${args.include}"`;
-  cmd += ` "${args.pattern}" "${dir}" 2>/dev/null | head -500`;
+  cmd += ` "${args.pattern}" "${dir}" 2>/dev/null | head -100`;
   try {
     const out = execSync(cmd, { encoding: "utf-8", timeout: 15000 });
     const lines = out.trim().split("\n").filter(Boolean);
     return {
       output: out.trim() || "No matches found",
       title: args.pattern,
-      metadata: { matches: lines.length, truncated: lines.length >= 500 },
+      metadata: { matches: lines.length, truncated: lines.length >= 100 },
     };
   } catch {
     try {
       let gcmd = `grep -rn "${args.pattern}" "${dir}"`;
       if (args.include) gcmd += ` --include="${args.include}"`;
-      gcmd += " 2>/dev/null | head -500";
+      gcmd += " 2>/dev/null | head -100";
       const out = execSync(gcmd, { encoding: "utf-8", timeout: 15000 });
       const lines = out.trim().split("\n").filter(Boolean);
       return {
         output: out.trim() || "No matches found",
         title: args.pattern,
-        metadata: { matches: lines.length, truncated: lines.length >= 500 },
+        metadata: { matches: lines.length, truncated: lines.length >= 100 },
       };
     } catch {
       return { output: "No matches found", title: args.pattern, metadata: { matches: 0, truncated: false } };
