@@ -8,7 +8,7 @@ import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
 import { sigil, rid as makeRid, echo, pulse, isDusk, classifySuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type DroneState, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
 import { droneThink, setDroneWorkspace, releaseDroneSession } from "../lib/drone-llm.ts";
-import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, type GraftResult } from "../lib/session.ts";
+import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, lastUuid, type GraftResult } from "../lib/session.ts";
 
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
@@ -553,7 +553,7 @@ interface Session {
   modelId: string;
   needsRespawn?: boolean;
   lastAccessed?: number;
-  lastSyncedPetal?: [string, string] | null; // [userMessageId, assistantMessageId]
+  lastSyncedPetal?: string | null; // uuid of last synced JSONL entry
   ocServerUrl?: string;
   thorns?: number; // consecutive error count — circuit breaker
   externalToolNames?: string[]; // sorted names of external MCP tools — respawn on change
@@ -934,9 +934,10 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           const effectiveCwd = cwd ?? session.cwd;
           if (session.claudeSessionId && session.claudeSessionPath) {
             // Existing JSONL — graft any new petals
-            const result = graft(priorPetals ?? [], session.claudeSessionPath, session.claudeSessionId, effectiveCwd);
+            const result = graft(priorPetals ?? [], session.claudeSessionPath, session.claudeSessionId, effectiveCwd, session.lastSyncedPetal);
+            // Always update anchor — even grafted=0, the JSONL may have grown from Claude's native entries
+            if (result.lastPetal) session.lastSyncedPetal = result.lastPetal;
             if (result.grafted > 0) {
-              session.lastSyncedPetal = result.lastPetal;
               session.needsRespawn = true;
               saveSessions(sid);
               trace("graft.done", { sid, grafted: result.grafted });
@@ -1118,6 +1119,11 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         onWilt(harvest) {
           if (withered) return; // withered petal — don't send finish for bad petals
           session.thorns = 0; // reset circuit breaker on success
+          // Advance anchor to last JSONL entry — Claude finished writing
+          if (session.claudeSessionPath) {
+            const tip = lastUuid(session.claudeSessionPath);
+            if (tip) session.lastSyncedPetal = tip;
+          }
           trace("nest.wilt", { sid, finishReason: harvest.finishReason });
           if (uncup) uncup(); // uncup any remaining petals before finish
           hum(sid, {
@@ -1252,11 +1258,14 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         sessions.set(sid, session);
       }
       session.lastAccessed = Date.now();
-      // Only advance anchor on completed clwnd assistant petals —
-      // completed means Claude finished writing to the JSONL
-      if (role === "assistant" && completed && messageId && parentId && provider?.startsWith("opencode-clwnd")) {
-        session.lastSyncedPetal = [parentId, messageId];
-        saveSessions(sid);
+      // Advance anchor on completed clwnd assistant petals —
+      // completed means Claude finished writing to the JSONL, read the last uuid
+      if (role === "assistant" && completed && provider?.startsWith("opencode-clwnd") && session.claudeSessionPath) {
+        const tip = lastUuid(session.claudeSessionPath);
+        if (tip) {
+          session.lastSyncedPetal = tip;
+          saveSessions(sid);
+        }
       }
       break;
     }
