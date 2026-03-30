@@ -147,6 +147,10 @@ export const clwndPlugin: Plugin = async (input) => {
         },
       }),
     },
+    "experimental.session.compacting": async (input, _output) => {
+      trace("compaction.started", { sessionId: input.sessionID });
+      hum({ chi: "cancel", sid: input.sessionID, reason: "compaction" });
+    },
   };
 };
 
