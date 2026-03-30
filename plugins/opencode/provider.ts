@@ -539,19 +539,8 @@ export class ClwndModel implements LanguageModelV3 {
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
-    // Auxiliary — empty response
+    // Auxiliary calls (compaction, title gen) — no tools, pass through to Claude
     const isAux = isAuxiliaryCall(opts);
-    if (isAux && !loadConfig().ocCompaction) {
-      trace("auxiliary.reject", { method: "doStream" });
-      return {
-        stream: new ReadableStream<LanguageModelV3StreamPart>({
-          start(controller) {
-            controller.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: zeroUsage() });
-            controller.close();
-          },
-        }),
-      };
-    }
     if (isAux) trace("auxiliary.passthrough", { method: "doStream", sid });
 
     // Brokered tool return — permission returns must listen for Claude's remaining output

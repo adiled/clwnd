@@ -4,7 +4,6 @@ import { join } from "path";
 export interface ClwndConfig {
   maxProcs: number;
   idleTimeout: number;
-  ocCompaction: boolean;
   smallModel: string;
   permissionDusk: number;
   droned: boolean;
@@ -14,7 +13,6 @@ export interface ClwndConfig {
 const DEFAULTS: ClwndConfig = {
   maxProcs: 4,
   idleTimeout: 30000,
-  ocCompaction: false,
   smallModel: "",
   permissionDusk: 60_000,
   droned: false,
@@ -36,7 +34,6 @@ export function loadConfig(): ClwndConfig {
       cached = {
         maxProcs: raw.maxProcs ?? DEFAULTS.maxProcs,
         idleTimeout: raw.idleTimeout ?? DEFAULTS.idleTimeout,
-        ocCompaction: raw.ocCompaction ?? DEFAULTS.ocCompaction,
         smallModel: raw.smallModel ?? DEFAULTS.smallModel,
         permissionDusk: raw.permissionDusk ?? DEFAULTS.permissionDusk,
         droned: raw.droned ?? DEFAULTS.droned,

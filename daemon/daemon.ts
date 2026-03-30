@@ -64,7 +64,6 @@ interface Roost {
 const cfg = loadConfig();
 const MAX_PROCS = cfg.maxProcs;
 const IDLE_TIMEOUT = cfg.idleTimeout;
-const OC_COMPACTION = cfg.ocCompaction;
 
 class ClaudeNest {
   private roosts = new Map<string, Roost>();
@@ -1602,7 +1601,7 @@ process.on("SIGTERM", () => { nest.silence(); process.exit(0); });
 process.on("uncaughtException",  e => info("process.uncaught", { err: String(e) }));
 process.on("unhandledRejection", e => info("process.unhandled", { err: String(e) }));
 
-info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid, version: CURRENT_VERSION, maxProcs: MAX_PROCS, idleTimeout: IDLE_TIMEOUT, ocCompaction: OC_COMPACTION, droned: DRONED });
+info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid, version: CURRENT_VERSION, maxProcs: MAX_PROCS, idleTimeout: IDLE_TIMEOUT, droned: DRONED });
 
 // ─── Session Reaper ─────────────────────────────────────────────────────────
 // Remove stale sessions that haven't been accessed in a while.
