@@ -540,7 +540,8 @@ export class ClwndModel implements LanguageModelV3 {
     const allowedTools = deriveAllowedTools(sid, opts);
 
     // Auxiliary — empty response
-    if (isAuxiliaryCall(opts) && !loadConfig().ocCompaction) {
+    const isAux = isAuxiliaryCall(opts);
+    if (isAux && !loadConfig().ocCompaction) {
       trace("auxiliary.reject", { method: "doStream" });
       return {
         stream: new ReadableStream<LanguageModelV3StreamPart>({
@@ -551,6 +552,7 @@ export class ClwndModel implements LanguageModelV3 {
         }),
       };
     }
+    if (isAux) trace("auxiliary.passthrough", { method: "doStream", sid });
 
     // Brokered tool return — permission returns must listen for Claude's remaining output
     let permAskId: string | null = null;
@@ -632,6 +634,7 @@ export class ClwndModel implements LanguageModelV3 {
         modelId: self.modelId,
         content, text, systemPrompt,
         permissions, allowedTools, listenOnly,
+        auxiliary: isAux || undefined, // skip graft for compaction/title gen
         ocServerUrl: self.config.pluginInput?.serverUrl?.toString(),
         priorPetals,
         externalTools: externalTools.length > 0 ? externalTools : undefined,
