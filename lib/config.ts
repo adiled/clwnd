@@ -6,6 +6,9 @@ export interface ClwndConfig {
   idleTimeout: number;
   ocCompaction: boolean;
   smallModel: string;
+  permissionDusk: number;
+  droned: boolean;
+  droneModel: { providerID: string; modelID: string };
 }
 
 const DEFAULTS: ClwndConfig = {
@@ -13,6 +16,9 @@ const DEFAULTS: ClwndConfig = {
   idleTimeout: 30000,
   ocCompaction: false,
   smallModel: "",
+  permissionDusk: 60_000,
+  droned: false,
+  droneModel: { providerID: "opencode-clwnd", modelID: "claude-haiku-4-5" },
 };
 
 const CONFIG_PATHS = [
@@ -32,6 +38,9 @@ export function loadConfig(): ClwndConfig {
         idleTimeout: raw.idleTimeout ?? DEFAULTS.idleTimeout,
         ocCompaction: raw.ocCompaction ?? DEFAULTS.ocCompaction,
         smallModel: raw.smallModel ?? DEFAULTS.smallModel,
+        permissionDusk: raw.permissionDusk ?? DEFAULTS.permissionDusk,
+        droned: raw.droned ?? DEFAULTS.droned,
+        droneModel: raw.droneModel ?? DEFAULTS.droneModel,
       };
       return cached;
     } catch {}

@@ -23,7 +23,7 @@
     "test:smoke": "bun test tests/smoke.test.ts",
     "test:e2e": "bun test tests/e2e.test.ts",
     "test:e2e-serve": "bun test tests/e2e-serve.test.ts",
-    "typecheck": "tsc --noEmit",
+    "tc": "tsc --noEmit",
     "version:patch": "bun run scripts/version.sh patch",
     "version:minor": "bun run scripts/version.sh minor",
     "version:major": "bun run scripts/version.sh major"
@@ -41,10 +41,12 @@
     "url": "git+https://github.com/adiled/clwnd.git"
   },
   "devDependencies": {
+    "bun-types": "^1.3.11",
     "tsup": "^8.0.0",
     "typescript": "^5.7.0"
   },
   "dependencies": {
+    "@opencode-ai/sdk": "^1.3.5",
     "diff": "^8.0.3"
   }
 }

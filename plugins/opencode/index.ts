@@ -3,8 +3,9 @@ import { tool } from "@opencode-ai/plugin";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
-import { createClwnd, setSharedClient, setLogClient, hum, trace, log, resetTurnsSent } from "./provider.ts";
+import { createClwnd, setSharedClient, setSharedPluginInput, setLogClient, hum, trace, log } from "./provider.ts";
 import { loadConfig, type ClwndConfig } from "../../lib/config.ts";
+import { duskIn } from "../../lib/hum.ts";
 
 // ─── Small Model Discovery ──────────────────────────────────────────────────
 // Provider config lives in opencode.json (managed by install script).
@@ -46,6 +47,7 @@ async function syncSmallModel(client: any, cfg: ClwndConfig): Promise<void> {
 
 export const clwndPlugin: Plugin = async (input) => {
   setSharedClient(input.client);
+  setSharedPluginInput(input);
   setLogClient(input.client);
   const provider = createClwnd({ client: input.client, pluginInput: input });
 
@@ -61,7 +63,7 @@ export const clwndPlugin: Plugin = async (input) => {
     try { lastVersion = readFileSync(versionFile, "utf8").trim(); } catch {}
     if (lastVersion && lastVersion !== version) {
       input.client.tui.showToast({
-        body: { title: "clwnd updated", message: `v${lastVersion} → v${version}`, variant: "success", duration: 5000 },
+        body: { title: "clwnd updated", message: `v${lastVersion} → v${version} ~ clwnd`, variant: "success", duration: 5000 },
       }).catch(() => {});
     }
     try { mkdirSync(stateDir, { recursive: true }); writeFileSync(versionFile, version); } catch {}
@@ -76,10 +78,27 @@ export const clwndPlugin: Plugin = async (input) => {
       clwnd: provider,
     },
     event: async ({ event }) => {
-      // OC-handled compaction: opt-in via clwnd.json { "ocCompaction": true }
-      // When off (default), Claude CLI handles its own context management.
-      if (loadConfig().ocCompaction && event.type === "session.compacted") {
-        const sid = (event as any).properties?.sessionID;
+      // The sentinel's ears — hum every session event to the daemon
+      const etype = event.type;
+      const props = (event as any).properties ?? {};
+
+      // Message events — daemon tracks full conversation across all providers
+      if (etype === "message.updated" && props.info) {
+        const sid = props.info.sessionID ?? props.info.metadata?.sessionID;
+        const role = props.info.role;
+        const model = props.info.modelID ?? props.info.metadata?.assistant?.modelID;
+        const provider = props.info.providerID ?? props.info.metadata?.assistant?.providerID;
+        const messageId = props.info.id;
+        const parentId = props.info.parentID;
+        const completed = props.info.metadata?.time?.completed;
+        if (sid && role) {
+          hum({ chi: "petal-cell", sid, event: etype, role, model, provider, messageId, parentId, completed });
+        }
+      }
+
+      // OC-handled compaction: opt-in via clwnd.json
+      if (loadConfig().ocCompaction && etype === "session.compacted") {
+        const sid = props.sessionID;
         if (sid) {
           // Deduplicate — multiple plugin instances receive the same event
           const key = `compacted:${sid}`;
@@ -88,8 +107,7 @@ export const clwndPlugin: Plugin = async (input) => {
           setTimeout(() => delete (globalThis as any)[key], 5000);
 
           trace("session.compacted", { sid });
-          resetTurnsSent(sid);
-          hum({ chi: "cancel", sid });
+          hum({ chi: "cancel", sid, reason: "compaction", dusk: duskIn(5_000) });
         }
       }
     },
@@ -132,4 +150,4 @@ export const clwndPlugin: Plugin = async (input) => {
   };
 };
 
-export { createClwnd };
+export { createClwnd } from "./provider.ts";
