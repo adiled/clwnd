@@ -212,10 +212,10 @@ class ClaudeNest {
     mcpSetAllowed(allowedTools);
     if (sessionCwd) mcpSetCwd(sessionCwd);
 
-    // MCP config — point Claude CLI to our persistent HTTP MCP server
+    // MCP config — session-scoped URL so tools/list returns correct external tools
     const mcpConfig = JSON.stringify({
       mcpServers: {
-        clwnd: { type: "http", url: MCP_URL },
+        clwnd: { type: "http", url: `${MCP_URL}/s/${poolKey}` },
       },
     });
 
@@ -557,6 +557,7 @@ interface Session {
   lastSyncedPetal?: [string, string] | null; // [userMessageId, assistantMessageId]
   ocServerUrl?: string;
   thorns?: number; // consecutive error count — circuit breaker
+  externalToolNames?: string[]; // sorted names of external MCP tools — respawn on change
 }
 
 const STATE_DIR = process.env.XDG_STATE_HOME
@@ -884,6 +885,40 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       if (cwd) session.cwd = cwd;
       if (ocServerUrl !== DEFAULT_OC_URL) session.ocServerUrl = ocServerUrl;
 
+      // Skip tool registration on listenOnly (permission return) — avoid spurious respawn
+      if (!msg.listenOnly) {
+        // External MCP tools — register for this session, respawn if changed
+        const extTools = (msg.externalTools as ExternalToolDef[] | undefined) ?? [];
+        const prevNames = (session.externalToolNames ?? []).join(",");
+        const currNames = extTools.map(t => t.name).sort().join(",");
+        if (extTools.length > 0) setExternalTools(sid, extTools);
+        else clearExternalTools(sid);
+        if (currNames !== prevNames) {
+          session.externalToolNames = extTools.map(t => t.name).sort();
+          if (prevNames) {
+            session.needsRespawn = true;
+            trace("external.tools.changed", { sid, prev: prevNames, curr: currNames });
+          } else if (extTools.length > 0) {
+            trace("external.tools.registered", { sid, count: extTools.length, names: currNames });
+          }
+        }
+
+        // External MCP server configs — daemon connects directly for tool execution
+        const mcpConfigs = (msg.mcpServerConfigs as Array<{ name: string; type: string; command: string[]; environment?: Record<string, string> }> | undefined) ?? [];
+        if (mcpConfigs.length > 0) {
+          setMcpServerConfigs(sid, mcpConfigs as Array<{ name: string; type: "local"; command: string[]; environment?: Record<string, string> }>);
+          trace("mcp.configs.registered", { sid, servers: mcpConfigs.map(c => c.name).join(",") });
+        } else {
+          clearMcpServerConfigs(sid);
+        }
+
+        // Visible tools — OC decides what Claude sees (filtered by agent permissions)
+        const visibleToolNames = msg.visibleTools as string[] | undefined;
+        if (visibleToolNames && visibleToolNames.length > 0) {
+          setVisibleTools(sid, visibleToolNames);
+        }
+      }
+
       // Circuit breaker — stop after 3 consecutive errors
       const MAX_THORNS = 3;
       if ((session.thorns ?? 0) >= MAX_THORNS) {
@@ -1153,6 +1188,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       const askId = msg.askId as string;
       const decision = msg.decision as "allow" | "deny";
       const hold = CLWND_PERMIT_HOLD.get(askId);
+      trace("hum.permit.releasing", { askId, decision, holdExists: !!hold, pendingHolds: CLWND_PERMIT_HOLD.size });
       if (hold) {
         CLWND_PERMIT_HOLD.delete(askId);
         hold.resolve(decision);
@@ -1170,6 +1206,9 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       if (session) {
         nest.fell(sid, sid);
         releaseDroneSession(sigil(sid));
+        clearExternalTools(sid);
+        clearMcpServerConfigs(sid);
+        clearVisibleTools(sid);
         sessions.delete(sid);
         saveSessions(sid);
         trace("hum.session.cleaned", { sid });
@@ -1329,7 +1368,7 @@ Bun.serve({
 
 // ─── MCP HTTP Server (persistent, no cold start) ────────────────────────────
 
-import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms, setAllowedTools as mcpSetAllowed, setPermissionCallback, setMetaCallback } from "../mcp/tools.ts";
+import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms, setAllowedTools as mcpSetAllowed, setPermissionCallback, setMetaCallback, setExternalTools, clearExternalTools, setMcpServerConfigs, clearMcpServerConfigs, setVisibleTools, clearVisibleTools, type ExternalToolDef } from "../mcp/tools.ts";
 
 const MCP_PORT = parseInt(process.env.CLWND_MCP_PORT ?? "0") || 0;
 
@@ -1434,12 +1473,13 @@ const mcpServer = Bun.serve({
       }
     }
 
-    // MCP JSON-RPC
+    // MCP JSON-RPC — extract session ID from /s/{poolKey} path
     if (req.method !== "POST") return new Response("clwnd-mcp", { status: 200 });
+    const mcpSessionId = url.pathname.match(/^\/s\/([^/]+)/)?.[1] ?? undefined;
     try {
       const body = await req.json() as { jsonrpc: string; id?: number | string; method: string; params?: unknown };
-      trace("mcp.request.received", { method: body.method });
-      const result = await handleMcpRequest(body);
+      trace("mcp.request.received", { method: body.method, sid: mcpSessionId });
+      const result = await handleMcpRequest(body, mcpSessionId);
       if (!result) return new Response("", { status: 204 });
       return Response.json(result);
     } catch (e: unknown) {
@@ -1454,11 +1494,11 @@ const MCP_URL = `http://${MCP_HOST}:${mcpServer.port}`;
 mcpSetCwd(process.env.CLWND_CWD ?? process.env.HOME ?? "/");
 
 // Wire permission prompt MCP tool to daemon's permission logic
-setPermissionCallback(async (toolName: string, input: Record<string, unknown>) => {
+setPermissionCallback(async (toolName: string, input: Record<string, unknown>, sessionId?: string) => {
   const tool = toolName.replace("mcp__clwnd__", "");
   const path = (input?.file_path ?? input?.path ?? input?.pattern) as string | undefined;
   const action = getPermissionAction(tool, path);
-  trace("permission.mcp.checked", { tool, path, action });
+  trace("permission.mcp.checked", { tool, path, action, sessionId });
 
   if (action === "allow") return { decision: "allow" as const };
   if (action === "deny") return { decision: "deny" as const };
@@ -1466,27 +1506,29 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>) =
   // "ask" — hold MCP response, send permission_ask via the hum
   // so the provider can emit a clwnd_permission tool call to trigger OC's ctx.ask() dialog
   const askId = randomUUID();
-  trace("permission.ask.hold", { id: askId, tool, path });
+  trace("permission.ask.hold", { id: askId, tool, path, sessionId });
 
-  // Send via hum — if no hum clients, permit hold times out and defaults to allow
-  hum("", { chi: "permission-ask", askId, tool, path, input, dusk: Date.now() + cfg.permissionDusk });
+  // Route to the session's hum client — sessionId comes from MCP URL path
+  hum(sessionId ?? "", { chi: "permission-ask", askId, tool, path, input, dusk: Date.now() + cfg.permissionDusk });
 
   return new Promise<{ decision: "allow" | "deny" }>((resolve) => {
     CLWND_PERMIT_HOLD.set(askId, {
       resolve: (decision) => resolve({ decision }),
-      tool, path, sessionId: "",
+      tool, path, sessionId: sessionId ?? "",
     });
 
-    // If nobody handles the ask within 10s (no hum client with
-    // clwnd_permission tool), default to allow. The user-facing dialog
-    // flow resolves much faster (~1-3s) when active.
+    // Auto-allow after 5s. The MCP permission_prompt blocks Claude CLI's stream,
+    // creating a deadlock: provider can't emit clwnd_permission tool-call until
+    // the stream flows, but the stream can't flow until MCP returns.
+    // The timeout breaks the deadlock. 5s is enough for release-permit to arrive
+    // if OC's ctx.ask() resolves quickly (which it does when agent auto-allows).
     setTimeout(() => {
       if (CLWND_PERMIT_HOLD.has(askId)) {
         CLWND_PERMIT_HOLD.delete(askId);
-        trace("permission.hold.timeout.ok", { id: askId });
+        trace("permission.hold.timeout.allow", { id: askId });
         resolve({ decision: "allow" });
       }
-    }, 10_000);
+    }, 5_000);
   });
 });
 

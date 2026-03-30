@@ -9,7 +9,7 @@ const MODEL = { providerID: "opencode-clwnd", modelID: "claude-sonnet-4-5" };
 const HOME = process.env.HOME ?? "/tmp";
 const SUITE_DIR = join(HOME, ".clwnd-e2e-serve-asks");
 const PROJECT_DIR = join(SUITE_DIR, "project");
-const TIMEOUT = 240_000;
+const TIMEOUT = 180_000;
 const activeSessions: string[] = [];
 const DAEMON_SOCK = (process.env.CLWND_SOCKET ?? `${process.env.XDG_RUNTIME_DIR ?? "/tmp"}/clwnd/clwnd.sock`) + ".http";
 
@@ -53,16 +53,16 @@ beforeAll(async () => {
   await Bun.write(join(PROJECT_DIR, "hello.txt"), "hello world\n");
 
   mkdirSync(join(PROJECT_DIR, ".claude"), { recursive: true });
+  // write NOT in allow list — forces Claude CLI to ask via permission_prompt
+  // bash IS allowed so Claude can fall back to echo/redirect if it avoids write
   await Bun.write(join(PROJECT_DIR, ".claude", "settings.json"), JSON.stringify({
     permissions: { allow: [
-      "mcp__clwnd__read(*)", "mcp__clwnd__edit(*)", "mcp__clwnd__write(*)",
+      "mcp__clwnd__read(*)", "mcp__clwnd__edit(*)",
       "mcp__clwnd__bash(*)", "mcp__clwnd__glob(*)", "mcp__clwnd__grep(*)",
     ] },
   }, null, 2));
 
-  await Bun.write(join(PROJECT_DIR, "opencode.json"), JSON.stringify({
-    permission: { edit: "ask" },
-  }, null, 2));
+  await Bun.write(join(PROJECT_DIR, "opencode.json"), JSON.stringify({}));
 
   const gitAdd = spawn({ cmd: ["git", "add", "."], cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe" });
   await gitAdd.exited;
@@ -92,85 +92,68 @@ afterAll(async () => {
 
 afterEach(async () => {
   while (activeSessions.length > 0) await deleteSession(activeSessions.pop()!);
-  if (existsSync(PROJECT_DIR)) await Bun.write(join(PROJECT_DIR, "hello.txt"), "hello world\n");
 });
 
 function skipIfDead() {
   if (server?.exitCode !== null) throw new Error("opencode serve is no longer running");
 }
 
-describe("e2e-serve-asks: permission dialog via phantom tool call", () => {
-  // Skipped: permission ask flow nerfed — 10s timeout defaults to allow.
-  test.skip("edit with ask permission creates OC permission prompt and proceeds on approval", async () => {
+describe("e2e-serve-asks: write tool through permission pipeline", () => {
+  test("write tool creates file and responds with text", async () => {
     skipIfDead();
     const sid = await createSession();
+    const targetPath = join(PROJECT_DIR, "perm-test.txt");
 
-    // Fire edit — triggers permission_prompt MCP → daemon holds →
-    // phantom clwnd_permission tool call → OC ctx.ask() → pending permission
-    const editPromise = fetch(`${BASE}/session/${sid}/message`, {
+    // Auto-approve permissions in background
+    let approvedCount = 0;
+    let done = false;
+    const approver = (async () => {
+      while (!done) {
+        await Bun.sleep(500);
+        try {
+          const pending = await fetch(`${BASE}/permission`).then(r => r.json()) as any[];
+          for (const perm of (pending ?? [])) {
+            await fetch(`${BASE}/permission/${perm.id}/reply`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ reply: "once" }),
+            });
+            approvedCount++;
+          }
+        } catch {}
+      }
+    })();
+
+    await fetch(`${BASE}/session/${sid}/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: MODEL,
-        parts: [{ type: "text", text: `Edit ${join(PROJECT_DIR, "hello.txt")} — change "hello" to "hi"` }],
+        parts: [{ type: "text", text: `You MUST use the write tool (not bash) to create the file ${targetPath} with the exact content "permission-granted". Permission will be granted automatically. Do not use any other tool. Do not ask for confirmation.` }],
       }),
-      signal: AbortSignal.timeout(180_000),
+      signal: AbortSignal.timeout(90_000),
     }).then(r => r.json()).catch(() => null);
+    done = true;
 
-    // Keep approving ALL permission prompts until editPromise resolves.
-    // Claude's turn may trigger multiple ask permissions (edit, read, etc.)
-    let approvedCount = 0;
-    const approver = (async () => {
-      while (true) {
-        await Bun.sleep(1_000);
-        try {
-          const pending = await fetch(`${BASE}/permission`).then(r => r.json()) as any[];
-          if (pending && pending.length > 0) {
-            for (const perm of pending) {
-              await fetch(`${BASE}/permission/${perm.id}/reply`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ reply: "once" }),
-              });
-              approvedCount++;
-            }
-          }
-        } catch { break; }
-      }
-    })();
-
-    const resp = await editPromise;
-    // Stop the approver
-    approver.catch(() => {});
-
-    // At least one permission dialog was created and approved
+    // Permission was asked and approved via the OC permission API
     expect(approvedCount).toBeGreaterThan(0);
 
-    // Claude responded with a message (not hung, not empty)
-    const respObj = resp as { parts?: Array<{ type: string; text?: string }> } | null;
-    const text = (respObj?.parts ?? [])
-      .filter((p) => p.type === "text")
-      .map((p) => p.text ?? "")
-      .join("");
-    expect(text.length).toBeGreaterThan(0);
+    // File should be written — wait a moment for Claude to finish after permission
+    await Bun.sleep(2_000);
+    expect(existsSync(targetPath)).toBe(true);
+    const content = await Bun.file(targetPath).text();
+    expect(content).toContain("permission-granted");
 
-    // OC session has tool activity in its message history
+    // Check OC messages — should have write tool part visible
+    await Bun.sleep(1_000);
     const msgs = await api(`/session/${sid}/message`);
     const allParts = (msgs as any[]).flatMap((m: any) => m.parts ?? []);
-    // Should have tool parts (clwnd_permission and/or edit)
     const toolParts = allParts.filter((p: any) => p.type === "tool");
-    expect(toolParts.length).toBeGreaterThan(0);
-
-    // No pending permissions left — session is clean
-    const pendingAfter = await fetch(`${BASE}/permission`).then(r => r.json()) as any[];
-    expect(pendingAfter.length).toBe(0);
-
-    // Session exists and is accessible (not stuck)
-    const session = await api(`/session/${sid}`) as any;
-    expect(session.id).toBe(sid);
-
-    // File should be edited
-    const content = await Bun.file(join(PROJECT_DIR, "hello.txt")).text();
-    expect(content).toContain("hi");
+    const toolNames = toolParts.map((p: any) => p.tool);
+    console.log("Tool parts:", toolNames);
+    // Should have both clwnd_permission and write
+    expect(toolNames).toContain("clwnd_permission");
+    // write tool should be visible in OC
+    expect(toolNames).toContain("write");
   }, TIMEOUT);
 });

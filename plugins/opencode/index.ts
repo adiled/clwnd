@@ -129,21 +129,21 @@ export const clwndPlugin: Plugin = async (input) => {
         async execute(args, ctx) {
           trace("permission.tool.invoked", { tool: args.tool, path: args.path });
 
+          const t0 = Date.now();
           await ctx.ask({
             permission: args.tool === "edit" || args.tool === "write" ? "edit" : args.tool,
             patterns: [args.path ?? "*"],
             metadata: { tool: args.tool, filepath: args.path },
             always: [args.path ?? "*"],
           });
+          const elapsed = Date.now() - t0;
 
-          // User approved — release the permit hold via hum
+          // Return askId in result — provider's doStream releases the hold
+          // AFTER registering its listener, so Claude's post-permission events are captured
           const askId = args.askId;
-          trace("permission.tool.approved", { tool: args.tool, askId });
-          if (askId) {
-            hum({ chi: "release-permit", askId, decision: "allow" });
-          }
+          trace("permission.tool.approved", { tool: args.tool, askId, elapsed, autoAllowed: elapsed < 100 });
 
-          return `Permission granted for ${args.tool}`;
+          return JSON.stringify({ granted: true, tool: args.tool, askId });
         },
       }),
     },

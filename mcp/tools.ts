@@ -161,7 +161,7 @@ export const TOOLS = [
 // ─── Permission Prompt ──────────────────────────────────────────────────────
 
 // Callback for permission decisions — set by the daemon
-let permissionCallback: ((tool: string, input: Record<string, unknown>) => Promise<{ decision: "allow" | "deny" }>) | null = null;
+let permissionCallback: ((tool: string, input: Record<string, unknown>, sessionId?: string) => Promise<{ decision: "allow" | "deny" }>) | null = null;
 
 export function setPermissionCallback(cb: typeof permissionCallback): void {
   permissionCallback = cb;
@@ -338,19 +338,216 @@ function execGrep(args: { pattern: string; path?: string; include?: string }): T
   }
 }
 
-async function execPermissionPrompt(args: { tool_name: string; input?: Record<string, unknown> }): Promise<ToolResult> {
-  trace("mcp.permission.prompted", { tool: args.tool_name });
+async function execPermissionPrompt(args: { tool_name: string; input?: Record<string, unknown> }, sessionId?: string): Promise<ToolResult> {
+  trace("mcp.permission.prompted", { tool: args.tool_name, sessionId });
   if (!permissionCallback) {
     return { output: JSON.stringify({ behavior: "allow", updatedInput: args.input ?? {} }) };
   }
-  const result = await permissionCallback(args.tool_name, args.input ?? {});
+  const result = await permissionCallback(args.tool_name, args.input ?? {}, sessionId);
   if (result.decision === "allow") {
     return { output: JSON.stringify({ behavior: "allow", updatedInput: args.input ?? {} }) };
   }
   return { output: JSON.stringify({ behavior: "deny", message: "Permission denied by user" }) };
 }
 
-export async function executeTool(name: string, args: Record<string, unknown>, _callId?: string): Promise<ToolResult> {
+// ─── External MCP tools (session-scoped) ───────────────────────────────────
+
+export interface ExternalToolDef {
+  name: string;
+  description?: string;
+  inputSchema: Record<string, unknown>;
+}
+
+const externalTools = new Map<string, ExternalToolDef[]>();
+
+export function setExternalTools(sessionId: string, tools: ExternalToolDef[]): void {
+  externalTools.set(sessionId, tools);
+}
+
+export function clearExternalTools(sessionId: string): void {
+  externalTools.delete(sessionId);
+}
+
+export function getExternalToolNames(sessionId: string): string[] {
+  return (externalTools.get(sessionId) ?? []).map(t => t.name);
+}
+
+// ─── Session-scoped visible tools (OC decides what Claude sees) ─────────────
+
+// OC tool name → clwnd MCP tool name
+const OC_TO_CLWND: Record<string, string> = {
+  read: "read", edit: "edit", write: "write", bash: "bash", glob: "glob", grep: "grep",
+};
+const CLWND_NATIVE = new Set(Object.values(OC_TO_CLWND));
+
+const sessionVisibleTools = new Map<string, Set<string>>();
+
+/** Set the visible tool set for a session — derived from OC's opts.tools */
+export function setVisibleTools(sessionId: string, ocToolNames: string[]): void {
+  const visible = new Set<string>();
+  visible.add("permission_prompt"); // always available — internal to clwnd
+  for (const name of ocToolNames) {
+    const clwndName = OC_TO_CLWND[name];
+    if (clwndName) visible.add(clwndName);
+    // External tools are added by name as-is
+    const ext = externalTools.get(sessionId) ?? [];
+    if (ext.some(t => t.name === name)) visible.add(name);
+  }
+  sessionVisibleTools.set(sessionId, visible);
+}
+
+export function clearVisibleTools(sessionId: string): void {
+  sessionVisibleTools.delete(sessionId);
+}
+
+function getVisibleToolSet(sessionId: string | undefined): Set<string> | null {
+  if (!sessionId) return null;
+  return sessionVisibleTools.get(sessionId) ?? null;
+}
+
+// ─── External MCP client — daemon executes tools directly ──────────────────
+
+import { spawn as spawnProc, type Subprocess } from "bun";
+
+interface McpServerConfig {
+  name: string;
+  type: "local";
+  command: string[];
+  environment?: Record<string, string>;
+}
+
+interface McpClient {
+  config: McpServerConfig;
+  proc: Subprocess;
+  pending: Map<number, { resolve: (v: unknown) => void; timer: ReturnType<typeof setTimeout> }>;
+  nextId: number;
+  buffer: string;
+}
+
+const mcpClients = new Map<string, McpClient>(); // keyed by server name
+
+async function getMcpClient(config: McpServerConfig): Promise<McpClient> {
+  const existing = mcpClients.get(config.name);
+  if (existing && !existing.proc.killed) return existing;
+
+  trace("mcp.client.spawning", { server: config.name, cmd: config.command.join(" ") });
+  const proc = spawnProc({
+    cmd: config.command,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, ...config.environment },
+  });
+
+  const client: McpClient = { config, proc, pending: new Map(), nextId: 1, buffer: "" };
+  mcpClients.set(config.name, client);
+
+  // Read stdout line by line — MCP stdio uses JSONRPC over newline-delimited JSON
+  (async () => {
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        client.buffer += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = client.buffer.indexOf("\n")) !== -1) {
+          const line = client.buffer.slice(0, nl).trim();
+          client.buffer = client.buffer.slice(nl + 1);
+          if (!line) continue;
+          try {
+            const msg = JSON.parse(line);
+            if (msg.id !== undefined) {
+              const p = client.pending.get(msg.id);
+              if (p) {
+                clearTimeout(p.timer);
+                client.pending.delete(msg.id);
+                p.resolve(msg);
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  })();
+
+  // Initialize
+  await mcpRpc(client, "initialize", {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "clwnd", version: "0.11.0" },
+  });
+  mcpRpc(client, "notifications/initialized", undefined, true);
+  trace("mcp.client.ready", { server: config.name });
+  return client;
+}
+
+function mcpRpc(client: McpClient, method: string, params?: unknown, notification = false): Promise<unknown> {
+  const id = notification ? undefined : client.nextId++;
+  const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
+  client.proc.stdin.write(msg);
+  if (notification) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      client.pending.delete(id!);
+      resolve({ error: { message: "MCP call timed out" } });
+    }, 120_000);
+    client.pending.set(id!, { resolve, timer });
+  });
+}
+
+export function shutdownMcpClients(): void {
+  for (const [, client] of mcpClients) {
+    try { client.proc.kill(); } catch {}
+  }
+  mcpClients.clear();
+}
+
+// Server configs per session — set by daemon from plugin hum
+const mcpServerConfigs = new Map<string, McpServerConfig[]>();
+
+export function setMcpServerConfigs(sessionId: string, configs: McpServerConfig[]): void {
+  mcpServerConfigs.set(sessionId, configs);
+}
+
+export function clearMcpServerConfigs(sessionId: string): void {
+  mcpServerConfigs.delete(sessionId);
+}
+
+/** Find which MCP server owns a tool, by prefix: context7_resolve-library-id → context7 */
+function findServerForTool(sessionId: string, toolName: string): McpServerConfig | null {
+  const configs = mcpServerConfigs.get(sessionId) ?? [];
+  for (const cfg of configs) {
+    if (toolName.startsWith(cfg.name + "_")) return cfg;
+  }
+  return null;
+}
+
+/** Strip server prefix: context7_resolve-library-id → resolve-library-id */
+function stripServerPrefix(serverName: string, toolName: string): string {
+  return toolName.startsWith(serverName + "_") ? toolName.slice(serverName.length + 1) : toolName;
+}
+
+async function executeExternalTool(sessionId: string, toolName: string, args: Record<string, unknown>): Promise<string> {
+  const server = findServerForTool(sessionId, toolName);
+  if (!server) return `Error: no MCP server found for tool ${toolName}`;
+  try {
+    const client = await getMcpClient(server);
+    const rawName = stripServerPrefix(server.name, toolName);
+    const response = await mcpRpc(client, "tools/call", { name: rawName, arguments: args }) as {
+      result?: { content?: Array<{ type: string; text?: string }> };
+      error?: { message: string };
+    };
+    if (response.error) return `Error: ${response.error.message}`;
+    const content = response.result?.content ?? [];
+    return content.filter(c => c.type === "text").map(c => c.text ?? "").join("\n") || "(empty result)";
+  } catch (e) {
+    return `Error: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
+export async function executeTool(name: string, args: Record<string, unknown>, _callId?: string, sessionId?: string): Promise<ToolResult> {
   if (name !== "permission_prompt") trace("mcp.tool.executed", { tool: name });
   switch (name) {
     case "read": return execRead(args as any);
@@ -359,14 +556,14 @@ export async function executeTool(name: string, args: Record<string, unknown>, _
     case "bash": return execBash(args as any);
     case "glob": return execGlob(args as any);
     case "grep": return execGrep(args as any);
-    case "permission_prompt": return execPermissionPrompt(args as any);
+    case "permission_prompt": return execPermissionPrompt(args as any, sessionId);
     default: return { output: `Unknown tool: ${name}` };
   }
 }
 
 // ─── MCP JSON-RPC handler ───────────────────────────────────────────────────
 
-export async function handleMcpRequest(body: { jsonrpc: string; id?: number | string; method: string; params?: any }): Promise<unknown> {
+export async function handleMcpRequest(body: { jsonrpc: string; id?: number | string; method: string; params?: any }, sessionId?: string): Promise<unknown> {
   switch (body.method) {
     case "initialize":
       return {
@@ -381,15 +578,35 @@ export async function handleMcpRequest(body: { jsonrpc: string; id?: number | st
     case "notifications/initialized":
       return null; // no response for notifications
 
-    case "tools/list":
-      return { jsonrpc: "2.0", id: body.id, result: { tools: TOOLS } };
+    case "tools/list": {
+      const ext = sessionId ? (externalTools.get(sessionId) ?? []) : [];
+      const visible = getVisibleToolSet(sessionId);
+      // If visible set exists, filter — OC decides what Claude sees
+      const allTools = visible
+        ? [...TOOLS, ...ext].filter(t => visible.has(t.name))
+        : [...TOOLS, ...ext];
+      return { jsonrpc: "2.0", id: body.id, result: { tools: allTools } };
+    }
 
     case "tools/call": {
       const name = body.params?.name as string;
       const args = (body.params?.arguments ?? {}) as Record<string, unknown>;
+
+      // External tool — execute directly via MCP client connection
+      const ext = sessionId ? (externalTools.get(sessionId) ?? []) : [];
+      if (ext.some(t => t.name === name)) {
+        trace("mcp.tool.external", { tool: name, sessionId });
+        const result = await executeExternalTool(sessionId!, name, args);
+        trace("mcp.tool.external.done", { tool: name, sessionId, len: result.length });
+        return {
+          jsonrpc: "2.0", id: body.id,
+          result: { content: [{ type: "text", text: result }] },
+        };
+      }
+
       const callId = `mcp-${body.id ?? Date.now()}`;
       try {
-        const result = await executeTool(name, args, callId);
+        const result = await executeTool(name, args, callId, sessionId);
         // Metadata goes out-of-band via hum — Claude CLI never sees it
         if (metaCallback && (result.metadata || result.title)) {
           metaCallback(name, callId, result.title, result.metadata);

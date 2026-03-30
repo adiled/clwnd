@@ -82,6 +82,16 @@ function mapToolName(name: string): string {
 
 const BROKERED_TOOLS = new Set(["webfetch", "websearch", "todowrite"]);
 
+// Tools handled natively by clwnd — anything NOT in this set from opts.tools is external
+const KNOWN_TOOLS = new Set([
+  "read", "edit", "write", "bash", "glob", "grep",
+  "webfetch", "websearch", "todowrite",
+  "task", "skill", "todoread", "taskoutput", "taskstop",
+  "question", "clwnd_permission", "permission_prompt",
+  "cronCreate", "cronDelete", "cronList",
+  "notebookedit", "codesearch", "applypatch", "ls",
+]);
+
 const INPUT_FIELD_MAP: Record<string, Record<string, string>> = {
   read:  { file_path: "filePath" },
   edit:  { file_path: "filePath", old_string: "oldString", new_string: "newString", replace_all: "replaceAll" },
@@ -349,6 +359,7 @@ function isBrokeredToolReturn(prompt: LanguageModelV3Prompt): boolean {
   return false;
 }
 
+
 // ─── Agent + Session Helpers ─────────────────────────────────────────────
 
 const sessionLastAgent = new Map<string, string>();
@@ -391,6 +402,28 @@ async function getSessionPermissions(client: unknown, sessionId: string): Promis
     trace("permissions.error", { agent: agentName, err: e instanceof Error ? e.message : String(e) });
     return [];
   }
+}
+
+// Cache MCP configs — read once per OC lifecycle
+let mcpConfigCache: Array<{ name: string; type: "local"; command: string[]; environment?: Record<string, string> }> | null = null;
+
+async function getMcpServerConfigs(client: unknown): Promise<Array<{ name: string; type: "local"; command: string[]; environment?: Record<string, string> }>> {
+  if (mcpConfigCache) return mcpConfigCache;
+  if (!client) return [];
+  try {
+    const resp = await (client as any).config.get();
+    const mcp = resp.data?.mcp as Record<string, { type?: string; command?: string[]; environment?: Record<string, string> }> | undefined;
+    if (!mcp) return [];
+    const configs: Array<{ name: string; type: "local"; command: string[]; environment?: Record<string, string> }> = [];
+    for (const [name, cfg] of Object.entries(mcp)) {
+      if (cfg.type === "local" && Array.isArray(cfg.command)) {
+        configs.push({ name, type: "local", command: cfg.command, environment: cfg.environment });
+      }
+    }
+    mcpConfigCache = configs;
+    if (configs.length > 0) trace("mcp.configs.loaded", { servers: configs.map(c => c.name).join(",") });
+    return configs;
+  } catch { return []; }
 }
 
 const OC_TO_MCP: Record<string, string> = {
@@ -494,6 +527,8 @@ export class ClwndModel implements LanguageModelV3 {
 
   async doStream(opts: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
     const sid = opts.headers?.["x-opencode-session"] ?? makeSigil(Date.now().toString());
+    const lastRole = opts.prompt.length > 0 ? opts.prompt[opts.prompt.length - 1].role : "none";
+    trace("doStream.enter", { sid, promptLen: opts.prompt.length, lastRole });
     const content = extractContent(opts.prompt, sid);
     const text = content.filter((p): p is { type: "text"; text: string } => p.type === "text").map(p => p.text).join("\n\n");
     const systemPrompt = extractSystemPrompt(opts.prompt);
@@ -517,42 +552,80 @@ export class ClwndModel implements LanguageModelV3 {
       };
     }
 
-    // Brokered tool return — finish immediately unless permission return
-    if (isBrokeredToolReturn(opts.prompt)) {
-      trace("brokered.return", { sid });
-      let isPermissionReturn = false;
-      const lastTool = opts.prompt.findLast(m => m.role === "tool");
-      if (lastTool && Array.isArray(lastTool.content)) {
-        for (const part of lastTool.content) {
-          if (part.type === "tool-result" && part.toolCallId?.startsWith("perm-")) {
-            isPermissionReturn = true;
-          }
+    // Brokered tool return — permission returns must listen for Claude's remaining output
+    let permAskId: string | null = null;
+    const isPermReturn = isBrokeredToolReturn(opts.prompt) && (() => {
+      const lt = opts.prompt.findLast(m => m.role === "tool");
+      if (!lt || !Array.isArray(lt.content)) return false;
+      for (const p of lt.content) {
+        if (p.type === "tool-result" && p.toolCallId?.startsWith("perm-")) {
+          // V3 tool-result: output is {type:"text",value:"..."} envelope from OC
+          const rawOutput = (p as Record<string, unknown>).output ?? (p as Record<string, unknown>).result;
+          try {
+            const outer = typeof rawOutput === "string" ? JSON.parse(rawOutput) : rawOutput;
+            const inner = outer?.value ?? outer;
+            const str = typeof inner === "string" ? inner : JSON.stringify(inner ?? "");
+            const parsed = JSON.parse(str);
+            if (parsed.askId) permAskId = parsed.askId;
+          } catch {}
+
+          return true;
         }
       }
-      if (!isPermissionReturn) {
-        return {
-          stream: new ReadableStream<LanguageModelV3StreamPart>({
-            start(controller) {
-              controller.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: zeroUsage() });
-              controller.close();
-            },
-          }),
-        };
-      }
+      return false;
+    })();
+    if (isBrokeredToolReturn(opts.prompt) && !isPermReturn) {
+      trace("brokered.return", { sid });
+      return {
+        stream: new ReadableStream<LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: zeroUsage() });
+            controller.close();
+          },
+        }),
+      };
     }
 
-    const listenOnly = isBrokeredToolReturn(opts.prompt) && (() => {
-      const lt = opts.prompt.findLast(m => m.role === "tool");
-      return lt && Array.isArray(lt.content) && lt.content.some(p => p.type === "tool-result" && p.toolCallId?.startsWith("perm-"));
-    })();
+    // Permission return: listen-only — Claude is finishing after MCP unblocked
+    const listenOnly = !!isPermReturn;
 
     // Include prior petals — daemon compares with JSONL state and grafts only what's new
     const priorPetals = opts.prompt.filter(m => m.role === "user" || m.role === "assistant" || m.role === "tool");
     trace("priorPetals", { sid, count: priorPetals.length, roles: priorPetals.map(m => m.role).join(",") });
 
+    // Extract external tools from opts.tools — anything OC has that clwnd doesn't handle natively
+    const externalTools: Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }> = [];
+    const externalToolNames = new Set<string>();
+    if (opts.tools) {
+      for (const t of opts.tools) {
+        if (t.type !== "function") continue;
+        const name = t.name;
+        if (KNOWN_TOOLS.has(name)) continue;
+        externalTools.push({ name, description: t.description, inputSchema: t.inputSchema as Record<string, unknown> });
+        externalToolNames.add(name);
+      }
+    }
+    const allToolNames = opts.tools ? opts.tools.filter(t => t.type === "function").map(t => t.name) : [];
+    trace("tools.available", { sid, count: allToolNames.length, names: allToolNames.join(",") });
+    if (externalTools.length > 0) trace("external.tools.detected", { sid, names: [...externalToolNames].join(",") });
+
     // Send prompt before creating stream — survives OC plugin reload
     let promptSent = false;
-    if (!listenOnly && humAlive) {
+    if (listenOnly && humAlive) {
+      // Permission return: register listener FIRST, then release hold
+      // Order matters — Claude's post-permission events must have a listener
+      hum({
+        chi: "prompt", sid, cwd,
+        modelId: self.modelId,
+        listenOnly: true,
+        dusk: duskIn(30_000),
+      });
+      promptSent = true;
+      if (permAskId) {
+        trace("permission.hold.releasing", { sid, askId: permAskId });
+        hum({ chi: "release-permit", askId: permAskId, decision: "allow" });
+      }
+    } else if (!listenOnly && humAlive) {
       hum({
         chi: "prompt", sid, cwd,
         modelId: self.modelId,
@@ -560,6 +633,9 @@ export class ClwndModel implements LanguageModelV3 {
         permissions, allowedTools, listenOnly,
         ocServerUrl: self.config.pluginInput?.serverUrl?.toString(),
         priorPetals,
+        externalTools: externalTools.length > 0 ? externalTools : undefined,
+        mcpServerConfigs: await getMcpServerConfigs(this.config.client),
+        visibleTools: allToolNames,
         dusk: duskIn(30_000),
       });
       promptSent = true;
@@ -569,6 +645,9 @@ export class ClwndModel implements LanguageModelV3 {
       async start(controller) {
         let done = false;
         const tendrils = new Set<string>();
+        // Brokered set — only native brokered tools (webfetch etc.), NOT external MCP tools
+        // External tools are executed by daemon's MCP client — Claude gets real results
+        const streamBrokered = new Set(BROKERED_TOOLS);
         const buds: LanguageModelV3StreamPart[] = [];
         const metaQueue: Array<{ tool: string; title?: string; metadata?: Record<string, unknown> }> = [];
         let textId = "t0";
@@ -638,6 +717,7 @@ export class ClwndModel implements LanguageModelV3 {
             // Text
             if (ct === "text_start" || (ct === "text_delta" && !textStarted)) {
               if (!textStarted) {
+                textId = `t${Date.now()}`;
                 textStarted = true;
                 petal({ type: "text-start", id: textId });
               }
@@ -649,6 +729,7 @@ export class ClwndModel implements LanguageModelV3 {
             // Reasoning
             if (ct === "reasoning_start" || (ct === "reasoning_delta" && !reasoningStarted)) {
               if (!reasoningStarted) {
+                reasoningId = `r${Date.now()}`;
                 reasoningStarted = true;
                 petal({ type: "reasoning-start", id: reasoningId });
               }
@@ -661,8 +742,10 @@ export class ClwndModel implements LanguageModelV3 {
               reasoningStarted = false;
             }
 
-            // Tool events — buffer until we know if permission_ask follows
+            // Tool events — close open text/reasoning blocks first, then buffer
             if (ct === "tool_input_start" && raw.toolCallId && raw.toolName) {
+              if (textStarted) { petal({ type: "text-end", id: textId }); textStarted = false; }
+              if (reasoningStarted) { petal({ type: "reasoning-end", id: reasoningId }); reasoningStarted = false; }
               sap.set(raw.toolCallId as string, "");
               buds.push({ type: "tool-input-start", id: raw.toolCallId as string, toolName: mapToolName(raw.toolName as string) });
             }
@@ -685,7 +768,7 @@ export class ClwndModel implements LanguageModelV3 {
               } else {
                 rawInput = "{}";
               }
-              const isBrokered = BROKERED_TOOLS.has(ocToolName);
+              const isBrokered = streamBrokered.has(ocToolName);
               if (isBrokered) tendrils.add(raw.toolCallId as string);
               buds.push({
                 type: "tool-call",

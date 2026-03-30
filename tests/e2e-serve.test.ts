@@ -296,6 +296,12 @@ beforeAll(async () => {
         },
       },
     },
+    mcp: {
+      "context7": {
+        type: "local",
+        command: ["bunx", "@upstash/context7-mcp@latest"],
+      },
+    },
   }, null, 2));
 
   // Claude permissions for MCP tools
@@ -304,6 +310,7 @@ beforeAll(async () => {
     permissions: { allow: [
       "mcp__clwnd__read(*)", "mcp__clwnd__edit(*)", "mcp__clwnd__write(*)",
       "mcp__clwnd__bash(*)", "mcp__clwnd__glob(*)", "mcp__clwnd__grep(*)",
+      "mcp__clwnd__resolve_library_id(*)", "mcp__clwnd__get_library_docs(*)",
     ] },
   }, null, 2));
 
@@ -1299,5 +1306,31 @@ describe("e2e-serve: drone swallow + retrofit", () => {
 
     // Graft rebuilds JSONL from priorPetals — response should have context
     expect(text).toContain("murmur");
+  }, TIMEOUT);
+});
+
+// ─── External MCP Tools ─────────────────────────────────────────────────────
+
+describe("e2e-serve: external MCP tools", () => {
+  test("context7 tool is brokered through clwnd to OC", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Ask Claude to use the context7 resolve tool — it should discover it via MCP
+    const resp = await sendMessage(
+      sid,
+      "Use the context7 resolve_library_id tool to look up 'react'. Return the library ID.",
+      undefined,
+      60_000,
+    );
+    const text = extractResponseText(resp).toLowerCase();
+
+    // The response should contain a library ID (context7 returns IDs like "/npm/react")
+    expect(text).toMatch(/react/i);
+
+    // Check that the tool was actually called — should have tool-call parts
+    const parts = resp?.parts ?? [];
+    const toolCalls = parts.filter((p: any) => p.type === "tool" && p.state?.status === "completed");
+    expect(toolCalls.length).toBeGreaterThan(0);
   }, TIMEOUT);
 });

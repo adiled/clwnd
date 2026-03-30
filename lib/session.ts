@@ -464,16 +464,23 @@ function chainFromPrompt(history: Array<{ role: string; content: unknown }>): { 
 }
 
 /** Build user-only hash chain from Claude JSONL. */
+/** Strip Claude CLI system-reminder tags from user text for hash comparison */
+function stripSystemReminders(text: string): string {
+  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
+}
+
 function chainFromJSONL(entries: ClaudeEntry[]): string[] {
   const chain: string[] = [];
   let prev = "0";
   for (const e of entries) {
     if (e.type === "user" && "message" in e) {
-      const text = (e as ClaudeUserEntry).message.content
+      const raw = (e as ClaudeUserEntry).message.content
         .filter(c => c.type === "text")
         .map(c => (c as ClaudeContentText).text)
         .join("");
-      if (!text) continue; // skip tool_result-only user entries
+      if (!raw) continue; // skip tool_result-only user entries
+      const text = stripSystemReminders(raw);
+      if (!text) continue; // skip if only system-reminder content
       if (text === "Continue from where you left off.") continue; // skip --resume ghost
       prev = chainLink(prev, text);
       chain.push(prev);
