@@ -37,12 +37,6 @@ Core workflow is operational (more coming). See [compatibility](https://github.c
 | `droned` | `false` | Enable the drone — stream observer, context-loss detection, auto-recovery |
 | `droneModel` | `opencode-clwnd/claude-haiku-4-5` | Model for drone LLM assessments |
 
-**Permissions**
-
-clwnd routes Claude CLI's permission prompts through OpenCode's `ctx.ask()`. The OC TUI permission dialog appears when a tool call requires approval.
-
-Writes outside allowed directories are denied by clwnd's MCP path enforcement.
-
 **External MCP**
 
 MCP servers configured in `opencode.json` are available to Claude. clwnd's daemon spawns and proxies local MCP servers (e.g. context7). Auth-bound (OAuth) MCPs are not yet supported.
