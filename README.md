@@ -41,6 +41,8 @@ Core workflow is operational (more coming). See [compatibility](https://github.c
 
 MCP servers configured in `opencode.json` are available to Claude. clwnd's daemon spawns and proxies local MCP servers (e.g. context7). Auth-bound (OAuth) MCPs are not yet supported.
 
+clwnd denies file writes in directories parent to `cwd`. Until ask is supported for that, you can use [`opencode-dir`](https://github.com/adiled/opencode-dir) plugin's `/cd` and `/mv` commands to relocate your session to the desired directory.
+
 **Plugins**
 
 drop [`opencode-dir`](https://github.com/adiled/opencode-dir) into opencode config `plugins` for `/cd`, `/mv` session directory commands
