@@ -487,7 +487,7 @@ export function graft(
   jsonlPath: string,
   sessionId: string,
   cwd: string,
-  _lastSyncedPetal?: string | null,
+  lastSyncedPetal?: string | null,
 ): GraftResult {
   // Strip system messages and trailing user — murmur handles the current prompt
   const conversation = priorPetals.filter(m => m.role !== "system");
@@ -495,24 +495,33 @@ export function graft(
     ? conversation.slice(0, -1)
     : conversation;
   if (history.length === 0 || history.every(m => m.role === "user")) {
-    return { grafted: 0, lastPetal: lastUuid(jsonlPath) };
+    return { grafted: 0, lastPetal: lastSyncedPetal ?? lastUuid(jsonlPath) };
   }
 
   const existing = readEntries(jsonlPath);
-  const jTurns = countJsonlTurns(existing);
-  const pTurns = countTurns(history);
 
-  // JSONL already covers all prompt turns — nothing to graft
-  if (jTurns >= pTurns) {
-    trace("graft.noop", { jTurns, pTurns });
+  // Count user-text messages (not tool_results) — same filter both sides
+  const jUsers = countJsonlTurns(existing);
+  const pUsers = countTurns(history);
+  const anchored = lastSyncedPetal && existing.some(e => (e as Record<string, unknown>).uuid === lastSyncedPetal);
+
+  // Synced: anchor valid AND JSONL covers all prompt turns
+  if (anchored && jUsers >= pUsers) {
+    trace("graft.synced", { anchor: lastSyncedPetal, jUsers, pUsers });
+    return { grafted: 0, lastPetal: lastSyncedPetal };
+  }
+
+  // No gap: JSONL has enough turns even without anchor
+  if (jUsers >= pUsers) {
+    trace("graft.noop", { jUsers, pUsers });
     return { grafted: 0, lastPetal: lastUuid(jsonlPath) };
   }
 
-  // Delta: skip jTurns in history, graft the rest
-  const deltaStart = skipTurns(history, jTurns);
+  // Gap: skip past what JSONL already has, graft the rest
+  const deltaStart = skipTurns(history, jUsers);
   const delta = history.slice(deltaStart);
 
-  trace("graft.delta", { jTurns, pTurns, deltaStart, deltaLen: delta.length, roles: delta.map(m => m.role).join(",") });
+  trace("graft.delta", { jUsers, pUsers, deltaStart, deltaLen: delta.length, roles: delta.map(m => m.role).join(",") });
 
   if (delta.length === 0 || delta.every(m => m.role === "user")) {
     return { grafted: 0, lastPetal: lastUuid(jsonlPath) };
