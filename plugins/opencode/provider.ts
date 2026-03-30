@@ -363,6 +363,7 @@ function isBrokeredToolReturn(prompt: LanguageModelV3Prompt): boolean {
 // ─── Agent + Session Helpers ─────────────────────────────────────────────
 
 const sessionLastAgent = new Map<string, string>();
+const sessionPetalCounts = new Map<string, number>();
 
 function detectAgent(sid: string, headers?: Record<string, string | undefined>): string | null {
   const raw = headers?.["x-clwnd-agent"] ?? null;
@@ -592,6 +593,14 @@ export class ClwndModel implements LanguageModelV3 {
     // Include prior petals — daemon compares with JSONL state and grafts only what's new
     const priorPetals = opts.prompt.filter(m => m.role === "user" || m.role === "assistant" || m.role === "tool");
     trace("priorPetals", { sid, count: priorPetals.length, roles: priorPetals.map(m => m.role).join(",") });
+
+    // Detect compaction: petal count dropped significantly — OC compacted its DB
+    const prevPetalCount = sessionPetalCounts.get(sid) ?? 0;
+    sessionPetalCounts.set(sid, priorPetals.length);
+    if (prevPetalCount > 0 && priorPetals.length < prevPetalCount * 0.5) {
+      trace("compaction.detected", { sid, prev: prevPetalCount, now: priorPetals.length });
+      hum({ chi: "cancel", sid, reason: "compaction" });
+    }
 
     // Extract external tools from opts.tools — anything OC has that clwnd doesn't handle natively
     const externalTools: Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }> = [];

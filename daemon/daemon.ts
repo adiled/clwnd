@@ -1163,8 +1163,12 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       if (session) {
         trace("nest.cancelled", { sid, reason: msg.reason });
         if (msg.reason === "compaction") {
-          // Compaction: kill process, reset anchor — next prompt does full graft
+          // Compaction: kill process, delete JSONL, reset — next prompt cold-starts from compacted prompt
           nest.fell(sid, sid);
+          if (session.claudeSessionPath) {
+            try { unlinkSync(session.claudeSessionPath); } catch {}
+            trace("compaction.jsonl.deleted", { sid, path: session.claudeSessionPath });
+          }
           session.lastSyncedPetal = null;
           session.claudeSessionId = null;
           session.claudeSessionPath = null;
