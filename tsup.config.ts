@@ -5,5 +5,5 @@ export default defineConfig({
   format: "esm",
   platform: "node",
   target: "node18",
-  external: ["bun", "bun:sqlite"],
+  external: ["bun", "bun:sqlite", "tree-sitter", "tree-sitter-typescript", "tree-sitter-python", "tree-sitter-javascript", "tree-sitter-go", "tree-sitter-rust"],
 });

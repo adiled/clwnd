@@ -5,9 +5,10 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "fs";
 import { execSync } from "child_process";
-import { resolve, dirname, relative } from "path";
+import { resolve, dirname, relative, extname } from "path";
 
 import { trace } from "../log.ts";
+import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported } from "../lib/ast.ts";
 
 let CWD = process.env.CLWND_CWD ?? process.cwd();
 
@@ -69,13 +70,14 @@ function assertPath(p: string): string {
 export const TOOLS = [
   {
     name: "read",
-    description: "Read a file or directory listing. Returns file contents with line numbers, or directory listing.",
+    description: "Read a file, directory listing, or specific symbol. For code files, returns a symbol outline. Use `symbol` to read a specific function/class/method by name (e.g. 'Server.start').",
     inputSchema: {
       type: "object" as const,
       properties: {
         file_path: { type: "string", description: "Absolute path to the file or directory to read" },
         offset: { type: "number", description: "Line number to start reading from (1-indexed)" },
-        limit: { type: "number", description: "Maximum number of lines to read (default 2000)" },
+        limit: { type: "number", description: "Maximum number of lines to read (default 500)" },
+        symbol: { type: "string", description: "Read a specific symbol by name (e.g. 'graft', 'Server.start'). Dot-separated for nested symbols." },
       },
       required: ["file_path"],
     },
@@ -145,6 +147,17 @@ export const TOOLS = [
     },
   },
   {
+    name: "symbols",
+    description: "List all symbols (functions, classes, methods, interfaces, types) in a source file using AST parsing. Much faster and more precise than reading the full file. Supports TypeScript, JavaScript, Python, Go, Rust.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        file_path: { type: "string", description: "Absolute path to the source file" },
+      },
+      required: ["file_path"],
+    },
+  },
+  {
     name: "permission_prompt",
     description: "Handle permission prompts from Claude CLI. Called automatically via --permission-prompt-tool.",
     inputSchema: {
@@ -182,7 +195,7 @@ export interface ToolResult {
   metadata?: Record<string, unknown>;
 }
 
-function execRead(args: { file_path: string; offset?: number; limit?: number }): ToolResult {
+function execRead(args: { file_path: string; offset?: number; limit?: number; symbol?: string }): ToolResult {
   const p = assertPath(args.file_path);
   checkPermission("read", p);
   if (!existsSync(p)) return { output: `Error: ${p} does not exist`, title: p };
@@ -195,19 +208,44 @@ function execRead(args: { file_path: string; offset?: number; limit?: number }):
     }
   } catch {}
 
+  const relPath = relative(CWD, p) || p;
+
+  // Symbol-based read: extract just the requested symbol
+  if (args.symbol) {
+    const result = readSymbol(p, args.symbol);
+    if (!result) return { output: `Symbol "${args.symbol}" not found in ${relPath}`, title: relPath };
+    return {
+      output: result.source,
+      title: `${relPath}:${args.symbol}`,
+      metadata: { loaded: [p] },
+    };
+  }
+
   try {
     const content = readFileSync(p, "utf-8");
     const lines = content.split("\n");
+    const totalLines = lines.length;
+
+    // For supported code files without offset, prepend a symbol outline
+    let outline = "";
+    if (!args.offset && astSupported(p)) {
+      try {
+        const symbols = fileSymbols(p);
+        if (symbols && symbols.length > 0) {
+          outline = `--- symbols ---\n${formatSymbols(symbols)}\n--- source ---\n`;
+        }
+      } catch {}
+    }
+
     const offset = (args.offset ?? 1) - 1;
     const limit = Math.min(args.limit ?? 500, 1000);
-    const totalLines = lines.length;
     const slice = lines.slice(offset, offset + limit);
     const truncated = totalLines > offset + limit;
     const numbered = slice.map((line, i) => `${offset + i + 1}\t${line}`).join("\n");
-    const suffix = truncated ? `\n[... truncated — showing ${slice.length} of ${totalLines} lines. Use offset to read more.]` : "";
+    const suffix = truncated ? `\n[... truncated — showing ${slice.length} of ${totalLines} lines. Use offset/limit or symbol parameter to read specific sections.]` : "";
     return {
-      output: numbered + suffix,
-      title: relative(CWD, p) || p,
+      output: outline + numbered + suffix,
+      title: relPath,
       metadata: { truncated, loaded: [p] },
     };
   } catch (e: any) {
@@ -559,6 +597,20 @@ async function executeExternalTool(sessionId: string, toolName: string, args: Re
   }
 }
 
+function execSymbols(args: { file_path: string }): ToolResult {
+  const p = assertPath(args.file_path);
+  checkPermission("read", p);
+  if (!existsSync(p)) return { output: `Error: ${p} does not exist`, title: p };
+  if (!astSupported(p)) return { output: `AST parsing not supported for ${extname(p)} files. Supported: .ts, .tsx, .js, .jsx, .py, .go, .rs`, title: p };
+  const symbols = fileSymbols(p);
+  if (!symbols || symbols.length === 0) return { output: `No symbols found in ${relative(CWD, p) || p}`, title: p };
+  return {
+    output: formatSymbols(symbols),
+    title: relative(CWD, p) || p,
+    metadata: { count: symbols.length },
+  };
+}
+
 export async function executeTool(name: string, args: Record<string, unknown>, _callId?: string, sessionId?: string): Promise<ToolResult> {
   if (name !== "permission_prompt") trace("mcp.tool.executed", { tool: name });
   switch (name) {
@@ -568,6 +620,7 @@ export async function executeTool(name: string, args: Record<string, unknown>, _
     case "bash": return execBash(args as any);
     case "glob": return execGlob(args as any);
     case "grep": return execGrep(args as any);
+    case "symbols": return execSymbols(args as any);
     case "permission_prompt": return execPermissionPrompt(args as any, sessionId);
     default: return { output: `Unknown tool: ${name}` };
   }
