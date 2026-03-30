@@ -28,33 +28,25 @@ Core workflow is operational (more coming). See [compatibility](https://github.c
 
 **Config** `~/.config/clwnd/clwnd.json`
 
-```json
-{
-  "maxProcs": 4,
-  "idleTimeout": 30000,
-  "ocCompaction": false,
-  "smallModel": "",
-  "permissionDusk": 60000
-}
-```
-
 | Key | Default | Description |
 |---|---|---|
 | `maxProcs` | `4` | Max concurrent Claude CLI processes |
 | `idleTimeout` | `30000` | Kill idle process after ms (0 = disabled) |
-| `ocCompaction` | `false` | Let OpenCode handle session compaction |
 | `smallModel` | `""` | Override small model (empty = auto-discover free model) |
 | `permissionDusk` | `60000` | Permission prompt timeout in ms before auto-deny |
-| `droned` | `false` | Enable the drone — LLM-driven session health monitoring + auto-recovery |
+| `droned` | `false` | Enable the drone — stream observer, context-loss detection, auto-recovery |
+| `droneModel` | `opencode-clwnd/claude-haiku-4-5` | Model for drone LLM assessments |
 
 **Permissions**
 
-clwnd governs the file system operations.
+clwnd routes Claude CLI's permission prompts through OpenCode's `ctx.ask()`. The OC TUI permission dialog appears when a tool call requires approval.
 
-opencode permissions per session are taken into account.
+Writes outside allowed directories are denied by clwnd's MCP path enforcement.
 
-currently, `ask` is taken as `allow` due to some OC and CC limitations, preventing mid-prompt TUI dialogues.
+**External MCP**
 
-writes outside allowed directories are `deny`
+MCP servers configured in `opencode.json` are available to Claude. clwnd's daemon spawns and proxies local MCP servers (e.g. context7). Auth-bound (OAuth) MCPs are not yet supported.
 
-drop [`opencode-dir`](https://github.com/adiled/opencode-dir) into opencode config `plugins`, it allows you to `/cd`, `/mv` (soon `add-dir`) sessions
+**Plugins**
+
+drop [`opencode-dir`](https://github.com/adiled/opencode-dir) into opencode config `plugins` for `/cd`, `/mv` session directory commands
