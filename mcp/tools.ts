@@ -239,13 +239,13 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
     const lines = content.split("\n");
     const totalLines = lines.length;
 
-    // For supported code files without offset, prepend a symbol outline
+    // For supported code files without offset, prepend symbol outline (NOT counted against limit)
     let outline = "";
     if (!args.offset && astSupported(p)) {
       try {
         const symbols = fileSymbols(p);
         if (symbols && symbols.length > 0) {
-          outline = `--- symbols ---\n${formatSymbols(symbols)}\n--- source ---\n`;
+          outline = `--- symbols (${symbols.length}) ---\n${formatSymbols(symbols)}\n---\n`;
         }
       } catch {}
     }
