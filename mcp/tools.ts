@@ -8,7 +8,7 @@ import { execSync } from "child_process";
 import { resolve, dirname, relative, extname } from "path";
 
 import { trace } from "../log.ts";
-import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported } from "../lib/ast.ts";
+import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, astGrep, formatGrepMatches, searchSymbols, type Symbol } from "../lib/ast.ts";
 
 let CWD = process.env.CLWND_CWD ?? process.cwd();
 
@@ -148,11 +148,12 @@ export const TOOLS = [
   },
   {
     name: "symbols",
-    description: "List all symbols (functions, classes, methods, interfaces, types) in a source file using AST parsing. Much faster and more precise than reading the full file. Supports TypeScript, JavaScript, Python, Go, Rust.",
+    description: "List symbols (functions, classes, methods, interfaces, types) in a source file using AST parsing. Use `query` for fuzzy search by name. Much faster than reading the full file. Supports TypeScript, JavaScript, Python, Go, Rust.",
     inputSchema: {
       type: "object" as const,
       properties: {
         file_path: { type: "string", description: "Absolute path to the source file" },
+        query: { type: "string", description: "Fuzzy search symbols by name (e.g. 'handle', 'Config')" },
       },
       required: ["file_path"],
     },
@@ -357,43 +358,86 @@ function execGlob(args: { pattern: string; path?: string }): ToolResult {
 }
 
 function execGrep(args: { pattern: string; path?: string; include?: string }): ToolResult {
-  const dir = assertPath(args.path ?? CWD);
-  checkPermission("grep", dir);
+  const target = assertPath(args.path ?? CWD);
+  checkPermission("grep", target);
 
-  // Try ripgrep first, then grep fallback
-  for (const attempt of ["rg", "grep"] as const) {
-    let cmd: string;
-    if (attempt === "rg") {
-      cmd = `rg --no-heading --line-number`;
-      if (args.include) cmd += ` --glob "${args.include}"`;
-      cmd += ` "${args.pattern}" "${dir}" 2>&1 | head -100`;
-    } else {
-      cmd = `grep -rn "${args.pattern}" "${dir}"`;
-      if (args.include) cmd += ` --include="${args.include}"`;
-      cmd += " 2>&1 | head -100";
-    }
-    try {
-      const out = execSync(cmd, { encoding: "utf-8", timeout: 15000 });
-      const lines = out.trim().split("\n").filter(Boolean);
-      // rg/grep exit code 1 = no matches (not an error), output is empty
-      if (lines.length === 0) continue;
-      // Filter out error lines from rg (e.g. "No such file")
-      const matches = lines.filter(l => !l.startsWith("rg:") && !l.startsWith("grep:"));
-      if (matches.length === 0) continue;
+  // Single file + AST supported → AST grep with symbol context
+  try {
+    const stat = statSync(target);
+    if (stat.isFile() && astSupported(target)) {
+      const matches = astGrep(target, args.pattern);
+      const truncated = matches.length > 100;
+      const shown = truncated ? matches.slice(0, 100) : matches;
+      const output = formatGrepMatches(shown, CWD);
       return {
-        output: matches.join("\n"),
+        output: output + (truncated ? `\n[+${matches.length - 100} more matches]` : ""),
         title: args.pattern,
-        metadata: { matches: matches.length, truncated: matches.length >= 100 },
+        metadata: { matches: matches.length, truncated },
       };
-    } catch (e: any) {
-      // Exit code 1 = no matches for rg/grep — try next
-      if (e.status === 1) continue;
-      // Exit code 2+ = actual error — log and try next
-      trace("grep.error", { attempt, pattern: args.pattern, path: dir, err: (e.stderr ?? e.message ?? "").slice(0, 200) });
-      continue;
     }
+  } catch {}
+
+  // Directory or non-AST file → rg for raw search, then enrich code file hits with symbols
+  let cmd = `rg --no-heading --line-number`;
+  if (args.include) cmd += ` --glob "${args.include}"`;
+  cmd += ` -- "${args.pattern}" "${target}" | head -100`;
+  try {
+    const out = execSync(cmd, { encoding: "utf-8", timeout: 15000 });
+    const lines = out.trim().split("\n").filter(Boolean);
+    if (lines.length === 0) return { output: "No matches found", title: args.pattern, metadata: { matches: 0, truncated: false } };
+
+    // Enrich: for each hit in a code file, try to add the enclosing symbol
+    const enriched: string[] = [];
+    const fileSymbolCache = new Map<string, Map<number, { name: string; kind: string }>>();
+
+    for (const line of lines) {
+      // rg output: file:line:text or line:text (single file)
+      const match = line.match(/^(.+?):(\d+):(.*)$/);
+      if (!match) { enriched.push(line); continue; }
+
+      const [, file, lineNum, text] = match;
+      const absFile = resolve(target, file);
+      const num = parseInt(lineNum, 10);
+
+      if (astSupported(absFile) || astSupported(file)) {
+        // Build symbol map for this file (cached)
+        const filePath = existsSync(absFile) ? absFile : resolve(CWD, file);
+        if (!fileSymbolCache.has(filePath)) {
+          try {
+            const syms = fileSymbols(filePath);
+            const map = new Map<number, { name: string; kind: string }>();
+            if (syms) {
+              const fill = (ss: Symbol[], parent = "") => {
+                for (const s of ss) {
+                  const full = parent ? `${parent}.${s.name}` : s.name;
+                  for (let l = s.startLine; l <= s.endLine; l++) map.set(l, { name: full, kind: s.kind });
+                  if (s.children) fill(s.children, full);
+                }
+              };
+              fill(syms);
+            }
+            fileSymbolCache.set(filePath, map);
+          } catch {
+            fileSymbolCache.set(filePath, new Map());
+          }
+        }
+        const sym = fileSymbolCache.get(filePath)?.get(num);
+        if (sym) {
+          enriched.push(`${file}:${lineNum}: [${sym.kind} ${sym.name}] ${text.trim()}`);
+          continue;
+        }
+      }
+      enriched.push(line);
+    }
+
+    return {
+      output: enriched.join("\n"),
+      title: args.pattern,
+      metadata: { matches: lines.length, truncated: lines.length >= 100 },
+    };
+  } catch {
+    return { output: "No matches found", title: args.pattern, metadata: { matches: 0, truncated: false } };
   }
-  return { output: "No matches found", title: args.pattern, metadata: { matches: 0, truncated: false } };
 }
 
 async function execPermissionPrompt(args: { tool_name: string; input?: Record<string, unknown> }, sessionId?: string): Promise<ToolResult> {
@@ -605,11 +649,25 @@ async function executeExternalTool(sessionId: string, toolName: string, args: Re
   }
 }
 
-function execSymbols(args: { file_path: string }): ToolResult {
+function execSymbols(args: { file_path: string; query?: string }): ToolResult {
   const p = assertPath(args.file_path);
   checkPermission("read", p);
   if (!existsSync(p)) return { output: `Error: ${p} does not exist`, title: p };
   if (!astSupported(p)) return { output: `AST parsing not supported for ${extname(p)} files. Supported: .ts, .tsx, .js, .jsx, .py, .go, .rs`, title: p };
+
+  if (args.query) {
+    const results = searchSymbols(p, args.query);
+    if (results.length === 0) return { output: `No symbols matching "${args.query}" in ${relative(CWD, p) || p}`, title: p };
+    return {
+      output: results.map(s => {
+        const range = s.startLine === s.endLine ? `L${s.startLine}` : `L${s.startLine}-${s.endLine}`;
+        return `${s.kind} ${s.name} ${range}`;
+      }).join("\n"),
+      title: `${relative(CWD, p) || p} ? ${args.query}`,
+      metadata: { count: results.length },
+    };
+  }
+
   const symbols = fileSymbols(p);
   if (!symbols || symbols.length === 0) return { output: `No symbols found in ${relative(CWD, p) || p}`, title: p };
   return {

@@ -4,7 +4,7 @@
  * Used by MCP tools for smart read (by symbol) and structured grep.
  */
 
-import { readFileSync } from "fs";
+import { readFileSync, statSync } from "fs";
 import { extname } from "path";
 
 // Lazy-loaded parser and languages
@@ -124,18 +124,28 @@ function extractSymbols(node: any, depth = 0): Symbol[] {
  * Extract all symbols from a file.
  * Returns null if the language isn't supported.
  */
+const MAX_FILE_SIZE = 500 * 1024; // 500KB — skip huge files
+
 export function fileSymbols(filePath: string): Symbol[] | null {
   const ext = extname(filePath).toLowerCase();
   const lang = getLanguage(ext);
   if (!lang) return null;
 
-  const P = getParser();
-  const parser = new P();
-  parser.setLanguage(lang);
+  try {
+    const stat = statSync(filePath);
+    if (stat.size > MAX_FILE_SIZE) return null;
+  } catch { return null; }
 
-  const source = readFileSync(filePath, "utf-8");
-  const tree = parser.parse(source);
-  return extractSymbols(tree.rootNode);
+  try {
+    const P = getParser();
+    const parser = new P();
+    parser.setLanguage(lang);
+    const source = readFileSync(filePath, "utf-8");
+    const tree = parser.parse(source);
+    return extractSymbols(tree.rootNode);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -184,4 +194,123 @@ export function formatSymbols(symbols: Symbol[], indent = 0): string {
  */
 export function isSupported(filePath: string): boolean {
   return extname(filePath).toLowerCase() in EXT_TO_GRAMMAR;
+}
+
+/**
+ * Fuzzy search symbols by name across a file.
+ * Matches substrings case-insensitively. Returns matching symbols with context.
+ */
+export function searchSymbols(filePath: string, query: string): Symbol[] {
+  const symbols = fileSymbols(filePath);
+  if (!symbols) return [];
+  const q = query.toLowerCase();
+  const results: Symbol[] = [];
+
+  function search(syms: Symbol[], parentName = "") {
+    for (const s of syms) {
+      const fullName = parentName ? `${parentName}.${s.name}` : s.name;
+      if (fullName.toLowerCase().includes(q) || s.name.toLowerCase().includes(q)) {
+        results.push({ ...s, name: fullName });
+      }
+      if (s.children) search(s.children, fullName);
+    }
+  }
+  search(symbols);
+  return results;
+}
+
+// ─── AST Grep ─────────────────────────────────────────────────────────────
+
+export interface GrepMatch {
+  file: string;
+  line: number;
+  text: string;
+  symbol: string; // enclosing symbol name (e.g. "Server.start")
+  kind: string;   // enclosing symbol kind (e.g. "method")
+}
+
+/**
+ * Search a file for a pattern using tree-sitter AST context.
+ * Returns matches with their enclosing symbol — not just line numbers.
+ */
+export function astGrep(filePath: string, pattern: string): GrepMatch[] {
+  const ext = extname(filePath).toLowerCase();
+  const lang = getLanguage(ext);
+  if (!lang) return [];
+
+  const P = getParser();
+  const parser = new P();
+  parser.setLanguage(lang);
+
+  let source: string;
+  try {
+    source = readFileSync(filePath, "utf-8");
+  } catch {
+    return [];
+  }
+
+  const tree = parser.parse(source);
+  const lines = source.split("\n");
+  const regex = new RegExp(pattern, "i");
+
+  // Build symbol map: line → enclosing symbol
+  const symbols = extractSymbols(tree.rootNode);
+  const lineSymbol = new Map<number, { name: string; kind: string }>();
+
+  function mapLines(syms: Symbol[], parentName = "") {
+    for (const s of syms) {
+      const fullName = parentName ? `${parentName}.${s.name}` : s.name;
+      for (let l = s.startLine; l <= s.endLine; l++) {
+        lineSymbol.set(l, { name: fullName, kind: s.kind });
+      }
+      if (s.children) mapLines(s.children, fullName);
+    }
+  }
+  mapLines(symbols);
+
+  const matches: GrepMatch[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (regex.test(lines[i])) {
+      const lineNum = i + 1;
+      const sym = lineSymbol.get(lineNum) ?? { name: "(top-level)", kind: "module" };
+      matches.push({
+        file: filePath,
+        line: lineNum,
+        text: lines[i],
+        symbol: sym.name,
+        kind: sym.kind,
+      });
+    }
+  }
+  return matches;
+}
+
+/**
+ * Format AST grep matches — grouped by symbol for readability.
+ */
+export function formatGrepMatches(matches: GrepMatch[], relativeTo?: string): string {
+  if (matches.length === 0) return "No matches found";
+
+  // Group by file, then by symbol
+  const byFile = new Map<string, Map<string, GrepMatch[]>>();
+  for (const m of matches) {
+    const file = relativeTo ? m.file.replace(relativeTo + "/", "") : m.file;
+    if (!byFile.has(file)) byFile.set(file, new Map());
+    const bySymbol = byFile.get(file)!;
+    const key = `${m.kind} ${m.symbol}`;
+    if (!bySymbol.has(key)) bySymbol.set(key, []);
+    bySymbol.get(key)!.push(m);
+  }
+
+  const lines: string[] = [];
+  for (const [file, bySymbol] of byFile) {
+    lines.push(file);
+    for (const [sym, matches] of bySymbol) {
+      lines.push(`  ${sym}:`);
+      for (const m of matches) {
+        lines.push(`    ${m.line}: ${m.text.trim()}`);
+      }
+    }
+  }
+  return lines.join("\n");
 }
