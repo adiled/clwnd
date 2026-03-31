@@ -328,7 +328,7 @@ function execBash(args: { command: string; description?: string; timeout?: numbe
     output = output.slice(0, BASH_MAX_OUTPUT) + `\n[... output truncated at ${Math.round(BASH_MAX_OUTPUT / 1024)}KB — pipe to file for full output]`;
   }
   return {
-    output,
+    output: output || `(exit ${exitCode ?? 0})`,
     title: args.description ?? args.command.slice(0, 80),
     metadata: {
       exit: exitCode,
@@ -665,7 +665,7 @@ export async function handleMcpRequest(body: { jsonrpc: string; id?: number | st
         trace("mcp.tool.external.done", { tool: name, sessionId, len: result.length });
         return {
           jsonrpc: "2.0", id: body.id,
-          result: { content: [{ type: "text", text: result }] },
+          result: { content: [{ type: "text", text: result || "(no output)" }] },
         };
       }
 
@@ -678,7 +678,7 @@ export async function handleMcpRequest(body: { jsonrpc: string; id?: number | st
         }
         return {
           jsonrpc: "2.0", id: body.id,
-          result: { content: [{ type: "text", text: result.output }] },
+          result: { content: [{ type: "text", text: result.output || "(no output)" }] },
         };
       } catch (e: any) {
         return {
