@@ -359,33 +359,41 @@ function execGlob(args: { pattern: string; path?: string }): ToolResult {
 function execGrep(args: { pattern: string; path?: string; include?: string }): ToolResult {
   const dir = assertPath(args.path ?? CWD);
   checkPermission("grep", dir);
-  let cmd = `rg --no-heading --line-number`;
-  if (args.include) cmd += ` --glob "${args.include}"`;
-  cmd += ` "${args.pattern}" "${dir}" 2>/dev/null | head -100`;
-  try {
-    const out = execSync(cmd, { encoding: "utf-8", timeout: 15000 });
-    const lines = out.trim().split("\n").filter(Boolean);
-    return {
-      output: out.trim() || "No matches found",
-      title: args.pattern,
-      metadata: { matches: lines.length, truncated: lines.length >= 100 },
-    };
-  } catch {
+
+  // Try ripgrep first, then grep fallback
+  for (const attempt of ["rg", "grep"] as const) {
+    let cmd: string;
+    if (attempt === "rg") {
+      cmd = `rg --no-heading --line-number`;
+      if (args.include) cmd += ` --glob "${args.include}"`;
+      cmd += ` "${args.pattern}" "${dir}" 2>&1 | head -100`;
+    } else {
+      cmd = `grep -rn "${args.pattern}" "${dir}"`;
+      if (args.include) cmd += ` --include="${args.include}"`;
+      cmd += " 2>&1 | head -100";
+    }
     try {
-      let gcmd = `grep -rn "${args.pattern}" "${dir}"`;
-      if (args.include) gcmd += ` --include="${args.include}"`;
-      gcmd += " 2>/dev/null | head -100";
-      const out = execSync(gcmd, { encoding: "utf-8", timeout: 15000 });
+      const out = execSync(cmd, { encoding: "utf-8", timeout: 15000 });
       const lines = out.trim().split("\n").filter(Boolean);
+      // rg/grep exit code 1 = no matches (not an error), output is empty
+      if (lines.length === 0) continue;
+      // Filter out error lines from rg (e.g. "No such file")
+      const matches = lines.filter(l => !l.startsWith("rg:") && !l.startsWith("grep:"));
+      if (matches.length === 0) continue;
       return {
-        output: out.trim() || "No matches found",
+        output: matches.join("\n"),
         title: args.pattern,
-        metadata: { matches: lines.length, truncated: lines.length >= 100 },
+        metadata: { matches: matches.length, truncated: matches.length >= 100 },
       };
-    } catch {
-      return { output: "No matches found", title: args.pattern, metadata: { matches: 0, truncated: false } };
+    } catch (e: any) {
+      // Exit code 1 = no matches for rg/grep — try next
+      if (e.status === 1) continue;
+      // Exit code 2+ = actual error — log and try next
+      trace("grep.error", { attempt, pattern: args.pattern, path: dir, err: (e.stderr ?? e.message ?? "").slice(0, 200) });
+      continue;
     }
   }
+  return { output: "No matches found", title: args.pattern, metadata: { matches: 0, truncated: false } };
 }
 
 async function execPermissionPrompt(args: { tool_name: string; input?: Record<string, unknown> }, sessionId?: string): Promise<ToolResult> {
