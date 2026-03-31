@@ -70,7 +70,7 @@ function assertPath(p: string): string {
 export const TOOLS = [
   {
     name: "read",
-    description: "Read a file, directory, or code symbols. For code files (ts/js/py/go/rs), returns a symbol outline + source. Use `symbol` to read a specific function/class/method (e.g. 'Server.start'). Use `query` to fuzzy-search symbols by name (e.g. 'handle') and get their source.",
+    description: "Read a file, directory, or code symbols. For code files (ts/js/py/go/rs), automatically returns a symbol outline showing all functions/classes/methods with line ranges, followed by the source. Use `symbol` to read ONLY a specific function/class (e.g. 'Server.start') — much cheaper than reading the whole file. Use `query` to fuzzy-search symbols and get their source (e.g. query='handle' finds handleRequest, handleAuth etc). Always print tool results to the user — they cannot see tool output directly.",
     inputSchema: {
       type: "object" as const,
       properties: {
