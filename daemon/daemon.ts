@@ -250,7 +250,7 @@ class ClaudeNest {
     const proc = spawn({
       cmd,
       cwd: spawnCwd,
-      env: { ...process.env, TERM: "xterm-256color", DIRENV_DISABLE: "1" },
+      env: { ...process.env, TERM: "xterm-256color", DIRENV_DISABLE: "1", ENABLE_TOOL_SEARCH: "false" },
       stdout: "pipe",
       stdin: "pipe",
       stderr: "pipe",
