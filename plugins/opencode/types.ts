@@ -5,4 +5,5 @@ export interface ClwndConfig {
   cwd?: string;
   client?: ReturnType<typeof createOpencodeClient>;
   pluginInput?: PluginInput;
+  enableTitleGen?: boolean;
 }

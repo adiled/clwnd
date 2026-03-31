@@ -340,7 +340,7 @@ function extractSystemPrompt(prompt: LanguageModelV3Prompt): string {
 // ─── Detection Helpers ───────────────────────────────────────────────────
 
 function isAuxiliaryCall(opts: LanguageModelV3CallOptions): boolean {
-  return !opts.tools || !Array.isArray(opts.tools) || opts.tools.length === 0;
+  return opts.tools === undefined;
 }
 
 function isBrokeredToolReturn(prompt: LanguageModelV3Prompt): boolean {
@@ -495,6 +495,19 @@ export class ClwndModel implements LanguageModelV3 {
   }
 
   async doGenerate(opts: LanguageModelV3CallOptions): Promise<LanguageModelV3GenerateResult> {
+    // Check for title generation - return empty
+    const rawAgent = opts.headers?.["x-clwnd-agent"] ?? "";
+    let agentName = rawAgent;
+    try { const p = JSON.parse(rawAgent); if (p?.name) agentName = p.name; } catch {}
+    if (agentName === "title") {
+      return {
+        content: [{ type: "text", text: "" }],
+        usage: zeroUsage(),
+        finishReason: { unified: "stop", raw: "stop" },
+        warnings: [],
+      };
+    }
+    
     if (isAuxiliaryCall(opts)) {
       return {
         content: [{ type: "text", text: "" }],
@@ -540,9 +553,28 @@ export class ClwndModel implements LanguageModelV3 {
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
-    // Auxiliary calls (compaction, title gen) — no tools, pass through to Claude
-    const isAux = isAuxiliaryCall(opts);
-    if (isAux) trace("auxiliary.passthrough", { method: "doStream", sid });
+    // Detect title generation (agent=title) vs regular calls
+    const rawAgent = opts.headers?.["x-clwnd-agent"] ?? "";
+    let agentName = rawAgent;
+    try { const p = JSON.parse(rawAgent); if (p?.name) agentName = p.name; } catch {}
+    const isTitleGen = agentName === "title";
+    const isEmptyTools = !opts.tools || opts.tools.length === 0;
+    
+    // Skip title generation entirely - return empty, don't pass to Claude
+    if (isTitleGen) {
+      trace("title.skip", { method: "doStream", sid });
+      return {
+        stream: new ReadableStream<LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: zeroUsage() });
+            controller.close();
+          },
+        }),
+      };
+    }
+    
+    const skipGraft = isEmptyTools;
+    if (skipGraft) trace("graft.skip", { method: "doStream", sid, reason: "emptyTools", toolsLen: opts.tools?.length ?? "undefined" });
 
     // Brokered tool return — permission returns must listen for Claude's remaining output
     let permAskId: string | null = null;
@@ -586,7 +618,7 @@ export class ClwndModel implements LanguageModelV3 {
     trace("priorPetals", { sid, count: priorPetals.length, roles: priorPetals.map(m => m.role).join(",") });
 
     // Detect compaction: petal count dropped >50% — OC compacted, reset Claude JSONL
-    if (!isAux) {
+    if (!skipGraft) {
       const prev = sessionPetalCounts.get(sid) ?? 0;
       sessionPetalCounts.set(sid, priorPetals.length);
       if (prev > 0 && priorPetals.length < prev * 0.5) {
@@ -633,7 +665,7 @@ export class ClwndModel implements LanguageModelV3 {
         modelId: self.modelId,
         content, text, systemPrompt,
         permissions, allowedTools, listenOnly,
-        auxiliary: isAux || undefined, // skip graft for compaction/title gen
+        skipGraft: skipGraft || undefined,
         ocServerUrl: self.config.pluginInput?.serverUrl?.toString(),
         priorPetals,
         externalTools: externalTools.length > 0 ? externalTools : undefined,
@@ -695,6 +727,7 @@ export class ClwndModel implements LanguageModelV3 {
             modelId: self.modelId,
             content, text, systemPrompt,
             permissions, allowedTools, listenOnly,
+            skipGraft: skipGraft || undefined,
             ocServerUrl: self.config.pluginInput?.serverUrl?.toString(),
             priorPetals,
             dusk: duskIn(30_000),

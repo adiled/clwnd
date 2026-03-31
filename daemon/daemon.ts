@@ -926,9 +926,9 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         return;
       }
 
-      // Graft: sync OC petals into Claude JSONL before spawning (skip for auxiliary/compaction calls)
+      // Graft: sync OC petals into Claude JSONL before spawning (skip for title gen / empty tools)
       const priorPetals = msg.priorPetals as Array<{ role: string; content: unknown }> | undefined;
-      if (!msg.listenOnly && !msg.auxiliary && priorPetals && priorPetals.length > 0) {
+      if (!msg.listenOnly && !msg.skipGraft && priorPetals && priorPetals.length > 0) {
         trace("graft.enter", { sid, petals: priorPetals.length });
         try {
           const effectiveCwd = cwd ?? session.cwd;
