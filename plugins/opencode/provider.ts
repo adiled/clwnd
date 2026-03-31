@@ -84,7 +84,7 @@ const BROKERED_TOOLS = new Set(["webfetch", "websearch", "todowrite"]);
 
 // Tools handled natively by clwnd — anything NOT in this set from opts.tools is external
 const KNOWN_TOOLS = new Set([
-  "read", "edit", "write", "bash", "glob", "grep", "symbols",
+  "read", "edit", "write", "bash", "glob", "grep",
   "webfetch", "websearch", "todowrite",
   "task", "skill", "todoread", "taskoutput", "taskstop",
   "question", "clwnd_permission", "permission_prompt",

@@ -70,14 +70,15 @@ function assertPath(p: string): string {
 export const TOOLS = [
   {
     name: "read",
-    description: "Read a file, directory listing, or specific symbol. For code files, returns a symbol outline. Use `symbol` to read a specific function/class/method by name (e.g. 'Server.start').",
+    description: "Read a file, directory, or code symbols. For code files (ts/js/py/go/rs), returns a symbol outline + source. Use `symbol` to read a specific function/class/method (e.g. 'Server.start'). Use `query` to fuzzy-search symbols by name (e.g. 'handle') and get their source.",
     inputSchema: {
       type: "object" as const,
       properties: {
         file_path: { type: "string", description: "Absolute path to the file or directory to read" },
         offset: { type: "number", description: "Line number to start reading from (1-indexed)" },
         limit: { type: "number", description: "Maximum number of lines to read (default 500)" },
-        symbol: { type: "string", description: "Read a specific symbol by name (e.g. 'graft', 'Server.start'). Dot-separated for nested symbols." },
+        symbol: { type: "string", description: "Read a specific symbol by name (e.g. 'graft', 'Server.start'). Dot-separated for nested." },
+        query: { type: "string", description: "Fuzzy search symbols by name (e.g. 'handle', 'Config'). Returns matching symbols with source." },
       },
       required: ["file_path"],
     },
@@ -147,18 +148,6 @@ export const TOOLS = [
     },
   },
   {
-    name: "symbols",
-    description: "List symbols (functions, classes, methods, interfaces, types) in a source file using AST parsing. Use `query` for fuzzy search by name. Much faster than reading the full file. Supports TypeScript, JavaScript, Python, Go, Rust.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        file_path: { type: "string", description: "Absolute path to the source file" },
-        query: { type: "string", description: "Fuzzy search symbols by name (e.g. 'handle', 'Config')" },
-      },
-      required: ["file_path"],
-    },
-  },
-  {
     name: "permission_prompt",
     description: "Handle permission prompts from Claude CLI. Called automatically via --permission-prompt-tool.",
     inputSchema: {
@@ -196,7 +185,7 @@ export interface ToolResult {
   metadata?: Record<string, unknown>;
 }
 
-function execRead(args: { file_path: string; offset?: number; limit?: number; symbol?: string }): ToolResult {
+function execRead(args: { file_path: string; offset?: number; limit?: number; symbol?: string; query?: string }): ToolResult {
   const p = assertPath(args.file_path);
   checkPermission("read", p);
   if (!existsSync(p)) return { output: `Error: ${p} does not exist`, title: p };
@@ -219,6 +208,29 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
       output: result.source,
       title: `${relPath}:${args.symbol}`,
       metadata: { loaded: [p] },
+    };
+  }
+
+  // Fuzzy symbol search: find matching symbols and return their source
+  if (args.query && astSupported(p)) {
+    const allResults = searchSymbols(p, args.query);
+    // Prefer functions/classes/methods over individual properties
+    const results = allResults.filter(s => s.kind !== "property") .length > 0
+      ? allResults.filter(s => s.kind !== "property")
+      : allResults;
+    if (results.length === 0) return { output: `No symbols matching "${args.query}" in ${relPath}`, title: relPath };
+    const source = readFileSync(p, "utf-8").split("\n");
+    const sections: string[] = [];
+    for (const s of results.slice(0, 10)) {
+      const range = s.startLine === s.endLine ? `L${s.startLine}` : `L${s.startLine}-${s.endLine}`;
+      const lines = source.slice(s.startLine - 1, s.endLine).map((l, i) => `${s.startLine + i}\t${l}`).join("\n");
+      sections.push(`--- ${s.kind} ${s.name} ${range} ---\n${lines}`);
+    }
+    const suffix = results.length > 10 ? `\n[+${results.length - 10} more matches]` : "";
+    return {
+      output: sections.join("\n\n") + suffix,
+      title: `${relPath} ? ${args.query}`,
+      metadata: { count: results.length, loaded: [p] },
     };
   }
 
@@ -649,33 +661,6 @@ async function executeExternalTool(sessionId: string, toolName: string, args: Re
   }
 }
 
-function execSymbols(args: { file_path: string; query?: string }): ToolResult {
-  const p = assertPath(args.file_path);
-  checkPermission("read", p);
-  if (!existsSync(p)) return { output: `Error: ${p} does not exist`, title: p };
-  if (!astSupported(p)) return { output: `AST parsing not supported for ${extname(p)} files. Supported: .ts, .tsx, .js, .jsx, .py, .go, .rs`, title: p };
-
-  if (args.query) {
-    const results = searchSymbols(p, args.query);
-    if (results.length === 0) return { output: `No symbols matching "${args.query}" in ${relative(CWD, p) || p}`, title: p };
-    return {
-      output: results.map(s => {
-        const range = s.startLine === s.endLine ? `L${s.startLine}` : `L${s.startLine}-${s.endLine}`;
-        return `${s.kind} ${s.name} ${range}`;
-      }).join("\n"),
-      title: `${relative(CWD, p) || p} ? ${args.query}`,
-      metadata: { count: results.length },
-    };
-  }
-
-  const symbols = fileSymbols(p);
-  if (!symbols || symbols.length === 0) return { output: `No symbols found in ${relative(CWD, p) || p}`, title: p };
-  return {
-    output: formatSymbols(symbols),
-    title: relative(CWD, p) || p,
-    metadata: { count: symbols.length },
-  };
-}
 
 export async function executeTool(name: string, args: Record<string, unknown>, _callId?: string, sessionId?: string): Promise<ToolResult> {
   if (name !== "permission_prompt") trace("mcp.tool.executed", { tool: name });
@@ -686,7 +671,6 @@ export async function executeTool(name: string, args: Record<string, unknown>, _
     case "bash": return execBash(args as any);
     case "glob": return execGlob(args as any);
     case "grep": return execGrep(args as any);
-    case "symbols": return execSymbols(args as any);
     case "permission_prompt": return execPermissionPrompt(args as any, sessionId);
     default: return { output: `Unknown tool: ${name}` };
   }
