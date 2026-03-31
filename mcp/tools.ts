@@ -85,7 +85,7 @@ export const TOOLS = [
   },
   {
     name: "edit",
-    description: "Make exact string replacements in a file. old_string must be unique in the file.",
+    description: "Make exact string replacements in a file. old_string must be unique in the file. Use read with symbol parameter first to get the exact text to replace.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -111,11 +111,11 @@ export const TOOLS = [
   },
   {
     name: "bash",
-    description: "Execute a bash command and return its output.",
+    description: "Execute a shell command. Use ONLY for running programs, scripts, git, tests, package managers, and system commands. Do NOT use for searching code or reading files — use the read and grep tools instead, they have AST-powered symbol search.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        command: { type: "string", description: "The bash command to execute" },
+        command: { type: "string", description: "The shell command to execute" },
         description: { type: "string", description: "Short description of what the command does" },
         timeout: { type: "number", description: "Timeout in milliseconds (default 120000)" },
       },
@@ -124,7 +124,7 @@ export const TOOLS = [
   },
   {
     name: "glob",
-    description: "Find files matching a glob pattern. Returns matching file paths.",
+    description: "Find files matching a glob pattern. Returns matching file paths. Use this to discover files, then use read with symbol/query to explore their contents — do NOT use bash for file discovery.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -136,7 +136,7 @@ export const TOOLS = [
   },
   {
     name: "grep",
-    description: "Search file contents using regex. Returns matching lines or file paths.",
+    description: "Search file contents using regex. For code files, returns matches with enclosing function/class context. For directories, searches recursively. Do NOT use bash grep — this tool is AST-aware and shows which symbol each match belongs to.",
     inputSchema: {
       type: "object" as const,
       properties: {
