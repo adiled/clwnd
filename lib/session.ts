@@ -532,6 +532,140 @@ export function graft(
   return { grafted: count, lastPetal: lastUuid(jsonlPath) };
 }
 
+// ─── JSONL Sanitizer ──────────────────────────────────────────────────────
+// Runs before every --resume. Fixes structural violations that cause
+// "API Error: 400 due to tool use concurrency issues".
+
+export interface SanitizeResult {
+  removed: number;
+  fixed: number;
+  rules: string[];
+}
+
+export function sanitizeJsonl(path: string): SanitizeResult {
+  let entries: ClaudeEntry[];
+  try { entries = readEntries(path); } catch { return { removed: 0, fixed: 0, rules: [] }; }
+  if (entries.length === 0) return { removed: 0, fixed: 0, rules: [] };
+
+  const rules: string[] = [];
+  const original = entries.length;
+  let clean: ClaudeEntry[] = [];
+
+  // Pass 1: filter out ghosts, API errors, fix empty tool_results
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    const next = entries[i + 1];
+
+    // Rule 2: skip ghost pairs ("Continue from where you left off" + "No response requested")
+    if (e.type === "user" && "message" in e) {
+      const text = (e as ClaudeUserEntry).message.content
+        .filter(c => c.type === "text").map(c => (c as ClaudeContentText).text).join("");
+      if (text.trim() === "Continue from where you left off." && next?.type === "assistant") {
+        const nextText = "message" in next
+          ? (next as ClaudeAssistantEntry).message.content
+              .filter(c => c.type === "text").map(c => (c as ClaudeContentText).text).join("")
+          : "";
+        if (nextText.includes("No response requested")) {
+          rules.push("ghost");
+          i++; // skip both
+          continue;
+        }
+      }
+    }
+
+    // Rule 3: skip API error entries
+    if (e.type === "assistant" && "message" in e) {
+      const text = (e as ClaudeAssistantEntry).message.content
+        .filter(c => c.type === "text").map(c => (c as ClaudeContentText).text).join("");
+      if (text.includes("API Error:")) {
+        rules.push("api-error");
+        continue;
+      }
+    }
+
+    // Rule 6: fix empty tool_results
+    if (e.type === "user" && "message" in e) {
+      const content = (e as ClaudeUserEntry).message.content;
+      let fixed = false;
+      for (const c of content) {
+        if (c.type === "tool_result") {
+          const tr = c as ClaudeContentToolResult;
+          if (!tr.content || tr.content === "" || tr.content === "[Old tool result content cleared]") {
+            tr.content = "(tool result unavailable)";
+            fixed = true;
+          }
+        }
+      }
+      if (fixed) rules.push("empty-result");
+    }
+
+    clean.push(e);
+  }
+
+  // Pass 2: remove trailing incomplete turn (assistant with tool_use, no following tool_result)
+  while (clean.length > 0) {
+    const last = clean[clean.length - 1];
+    if (last.type === "assistant" && "message" in last) {
+      const hasToolUse = (last as ClaudeAssistantEntry).message.content
+        .some(c => c.type === "tool_use");
+      if (hasToolUse) {
+        clean.pop();
+        rules.push("trailing-tool-use");
+        continue;
+      }
+    }
+    // Also remove trailing last-prompt, queue-operation
+    if (last.type === "last-prompt" || last.type === "queue-operation") {
+      clean.pop();
+      continue;
+    }
+    break;
+  }
+
+  // Pass 3: validate tool_use/tool_result pairing
+  const validated: ClaudeEntry[] = [];
+  for (let i = 0; i < clean.length; i++) {
+    const e = clean[i];
+
+    if (e.type === "assistant" && "message" in e) {
+      const toolUseIds = (e as ClaudeAssistantEntry).message.content
+        .filter(c => c.type === "tool_use")
+        .map(c => (c as ClaudeContentToolUse).id);
+
+      if (toolUseIds.length > 0) {
+        // Find the next user entry with tool_results
+        const nextUser = clean[i + 1];
+        if (nextUser?.type === "user" && "message" in nextUser) {
+          const resultIds = new Set(
+            (nextUser as ClaudeUserEntry).message.content
+              .filter(c => c.type === "tool_result")
+              .map(c => (c as ClaudeContentToolResult).tool_use_id)
+          );
+          const allMatched = toolUseIds.every(id => resultIds.has(id));
+          if (!allMatched) {
+            // Mismatch — remove both
+            rules.push("tool-mismatch");
+            i++; // skip the user entry too
+            continue;
+          }
+        } else if (!nextUser || nextUser.type !== "user") {
+          // No user entry following tool_use — dangling
+          rules.push("dangling-tool-use");
+          continue;
+        }
+      }
+    }
+
+    validated.push(e);
+  }
+
+  if (rules.length === 0) return { removed: 0, fixed: 0, rules: [] };
+
+  // Write back
+  writeFileSync(path, validated.map(e => JSON.stringify(e)).join("\n") + "\n");
+  return { removed: original - validated.length, fixed: rules.length, rules: [...new Set(rules)] };
+}
+
 // ─── JSONL → Messages ──────────────────────────────────────────────────────
 
 export function toMessages(path: string): Array<{ role: string; content: ClaudeContent[] }> {

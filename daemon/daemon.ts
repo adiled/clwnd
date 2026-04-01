@@ -8,7 +8,7 @@ import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
 import { sigil, rid as makeRid, echo, pulse, isDusk, classifySuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type DroneState, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
 import { droneThink, setDroneWorkspace, releaseDroneSession } from "../lib/drone-llm.ts";
-import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, lastUuid, type GraftResult } from "../lib/session.ts";
+import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, lastUuid, sanitizeJsonl, type GraftResult } from "../lib/session.ts";
 
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
@@ -244,6 +244,19 @@ class ClaudeNest {
     }
     // Resume from seeded JSONL session (cold-start history export)
     if (claudeSessionId) {
+      // Sanitize JSONL before resume — fix structural violations that cause 400 errors
+      const spawnCwd2 = sessionCwd ?? process.env.CLWND_CWD ?? process.env.HOME ?? "/";
+      const jsonlPath = getSessionPath(spawnCwd2, claudeSessionId);
+      try {
+        if (existsSync(jsonlPath)) {
+          const result = sanitizeJsonl(jsonlPath);
+          if (result.fixed > 0) {
+            trace("sanitize.applied", { poolKey, removed: result.removed, fixed: result.fixed, rules: result.rules });
+          }
+        }
+      } catch (e) {
+        trace("sanitize.error", { poolKey, err: String(e) });
+      }
       cmd.push("--resume", claudeSessionId);
     }
     const spawnCwd = sessionCwd ?? process.env.CLWND_CWD ?? process.env.HOME ?? "/";
