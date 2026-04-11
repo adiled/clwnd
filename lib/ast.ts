@@ -1,80 +1,136 @@
 /**
- * AST-powered symbol extraction using tree-sitter.
- * Language-agnostic — grammars loaded per file extension.
- * Used by MCP tools for smart read (by symbol) and structured grep.
+ * AST-powered code analysis using tree-sitter Queries.
+ *
+ * Refactored from a hand-rolled SYMBOL_TYPES walker to the maintainer-blessed
+ * Query API. Each grammar ships a `queries/tags.scm` file written by the
+ * grammar author that captures definitions and references in S-expression
+ * patterns — exactly what GitHub's code navigation uses. We load those at
+ * runtime, compile them into tree-sitter Query objects, and run them
+ * against parsed trees. The output gives us byte ranges, capture names,
+ * and language-specific definition shapes for free.
+ *
+ * Two architectural shifts vs the previous version:
+ *
+ *   1. SYMBOLS — extracted via Query.matches() instead of an ad-hoc tree
+ *      walker over a hand-maintained SYMBOL_TYPES dict. The dict was
+ *      brittle (Ruby `class` keyword collision, missing struct/enum/union
+ *      types per language, no constructor coverage, etc.) and only as
+ *      good as I happened to remember to update it. Queries are owned by
+ *      the grammar maintainer and cover their language's edge cases for us.
+ *
+ *   2. RANGES — symbols carry byte offsets (startIndex/endIndex) in
+ *      addition to lines. do_code now splices by byte range instead of
+ *      line range, which makes single-line code (`def f(): pass; def g(): pass`)
+ *      safe to edit, and lets us extend a symbol's range to include
+ *      leading comments / decorators / `export` wrappers without losing
+ *      precision.
  */
 
 import { readFileSync, statSync } from "fs";
-import { extname } from "path";
+import { extname, join, dirname } from "path";
+import { fileURLToPath } from "url";
 
-// Lazy-loaded parser and languages.
+// ─── Lazy-loaded parser, languages, and queries ────────────────────────────
 //
 // IMPORTANT: do NOT add `import "tree-sitter-X"` at the top of this file
 // for any grammar. Grammars are loaded ON DEMAND inside getLanguage() via
 // require(grammar) — a daemon process that only ever sees TypeScript
 // will never pull tree-sitter-python / -java / -cpp / etc. into memory.
-// Each grammar package is a few MB of compiled state machines + queries;
-// loading all 12 eagerly would add 30-50MB to the daemon RSS for no
-// benefit. The tsup config (tsup.config.ts) lists every grammar in its
-// `external` array so the bundler won't ever inline them either.
+// The tsup config (tsup.config.ts) lists every grammar in its `external`
+// array so the bundler won't ever inline them either.
 let Parser: any = null;
 const languages = new Map<string, any>();
+const queries = new Map<string, any>();
 
-const EXT_TO_GRAMMAR: Record<string, string> = {
-  // TypeScript / JavaScript
-  ".ts": "tree-sitter-typescript/typescript",
-  ".tsx": "tree-sitter-typescript/tsx",
-  ".js": "tree-sitter-javascript",
-  ".jsx": "tree-sitter-javascript",
-  ".mjs": "tree-sitter-javascript",
-  ".cjs": "tree-sitter-javascript",
-  // Python
-  ".py": "tree-sitter-python",
-  ".pyi": "tree-sitter-python",
-  // Go / Rust
-  ".go": "tree-sitter-go",
-  ".rs": "tree-sitter-rust",
-  // Java
-  ".java": "tree-sitter-java",
-  // C
-  ".c": "tree-sitter-c",
-  ".h": "tree-sitter-c",
-  // C++
-  ".cc": "tree-sitter-cpp",
-  ".cpp": "tree-sitter-cpp",
-  ".cxx": "tree-sitter-cpp",
-  ".hpp": "tree-sitter-cpp",
-  ".hxx": "tree-sitter-cpp",
-  // Ruby / PHP / C# — note php uses sub-export
-  ".rb": "tree-sitter-ruby",
-  ".php": "tree-sitter-php/php",
-  ".cs": "tree-sitter-c-sharp",
-  // Shell — bash grammar handles .sh and .bash. .zsh and .fish are too
-  // divergent (zsh-only constructs throw parse errors in tree-sitter-bash)
-  // so they fall through to do_code's text-only validation path.
-  ".sh": "tree-sitter-bash",
-  ".bash": "tree-sitter-bash",
+interface LanguageEntry {
+  /** What `require()` resolves to for this language's grammar binary. */
+  requirePath: string;
+  /**
+   * tags.scm file paths (relative to node_modules) to compile into the
+   * query for this language. Listed in order — JS+TS combine because TS
+   * inherits from JS, and we extend a few with vendored extras.
+   */
+  queryPaths: string[];
+  /** Optional vendored extra .scm in lib/queries/ that we add to the query. */
+  vendoredExtra?: string;
+  /**
+   * Parent node types whose presence around a captured definition node
+   * should EXPAND the symbol's byte range to cover them. Examples: a
+   * Python class is wrapped in `decorated_definition` when it has any
+   * decorators; a TypeScript class can be wrapped in `export_statement`.
+   * Without expansion, replace would leave dangling decorators/`export`
+   * keywords in front of the new code.
+   */
+  expandWrappers?: string[];
+}
+
+const EXT_TO_LANG: Record<string, LanguageEntry> = {
+  ".ts":   { requirePath: "tree-sitter-typescript/typescript", queryPaths: ["tree-sitter-javascript/queries/tags.scm", "tree-sitter-typescript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".tsx":  { requirePath: "tree-sitter-typescript/tsx",        queryPaths: ["tree-sitter-javascript/queries/tags.scm", "tree-sitter-typescript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".js":   { requirePath: "tree-sitter-javascript",            queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".jsx":  { requirePath: "tree-sitter-javascript",            queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".mjs":  { requirePath: "tree-sitter-javascript",            queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".cjs":  { requirePath: "tree-sitter-javascript",            queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".py":   { requirePath: "tree-sitter-python",                queryPaths: ["tree-sitter-python/queries/tags.scm"],     expandWrappers: ["decorated_definition"] },
+  ".pyi":  { requirePath: "tree-sitter-python",                queryPaths: ["tree-sitter-python/queries/tags.scm"],     expandWrappers: ["decorated_definition"] },
+  ".go":   { requirePath: "tree-sitter-go",                    queryPaths: ["tree-sitter-go/queries/tags.scm"] },
+  ".rs":   { requirePath: "tree-sitter-rust",                  queryPaths: ["tree-sitter-rust/queries/tags.scm"] },
+  ".java": { requirePath: "tree-sitter-java",                  queryPaths: ["tree-sitter-java/queries/tags.scm"], vendoredExtra: "java.scm" },
+  ".c":    { requirePath: "tree-sitter-c",                     queryPaths: ["tree-sitter-c/queries/tags.scm"] },
+  ".h":    { requirePath: "tree-sitter-c",                     queryPaths: ["tree-sitter-c/queries/tags.scm"] },
+  ".cc":   { requirePath: "tree-sitter-cpp",                   queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
+  ".cpp":  { requirePath: "tree-sitter-cpp",                   queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
+  ".cxx":  { requirePath: "tree-sitter-cpp",                   queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
+  ".hpp":  { requirePath: "tree-sitter-cpp",                   queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
+  ".hxx":  { requirePath: "tree-sitter-cpp",                   queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
+  ".rb":   { requirePath: "tree-sitter-ruby",                  queryPaths: ["tree-sitter-ruby/queries/tags.scm"] },
+  ".php":  { requirePath: "tree-sitter-php/php",               queryPaths: ["tree-sitter-php/queries/tags.scm"] },
+  ".cs":   { requirePath: "tree-sitter-c-sharp",               queryPaths: ["tree-sitter-c-sharp/queries/tags.scm"] },
+  // Bash ships no tags.scm — we vendor a minimal one.
+  ".sh":   { requirePath: "tree-sitter-bash",                  queryPaths: [], vendoredExtra: "bash.scm" },
+  ".bash": { requirePath: "tree-sitter-bash",                  queryPaths: [], vendoredExtra: "bash.scm" },
 };
 
-function getParser(): any {
-  if (!Parser) {
-    Parser = require("tree-sitter");
+// Locate vendored query files at runtime. We try a few candidate paths
+// because the source layout (lib/queries/) doesn't match the bundled
+// layout (dist/daemon/queries/) and we want both dev mode (running .ts
+// directly via Bun) and production (the tsup-bundled daemon) to work.
+//
+// tsup's onSuccess hook (tsup.config.ts) copies lib/queries/*.scm into
+// dist/daemon/queries/, so the first candidate hits in production. The
+// second candidate covers running .ts source directly. The third is a
+// safety net in case the daemon was bundled but onSuccess didn't run.
+import { existsSync } from "fs";
+const HERE = dirname(fileURLToPath(import.meta.url));
+function findVendoredQueryDir(): string {
+  const candidates = [
+    join(HERE, "queries"),               // dist/daemon/queries (post-tsup) OR lib/queries (dev)
+    join(HERE, "..", "lib", "queries"),  // dist/daemon → ../lib/queries (fallback)
+    join(HERE, "..", "..", "lib", "queries"),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
   }
+  // Last resort: return the first candidate so reads fail loudly with a
+  // useful path in the error, instead of silently swallowing the lookup.
+  return candidates[0];
+}
+const VENDORED_QUERY_DIR = findVendoredQueryDir();
+
+function getParser(): any {
+  if (!Parser) Parser = require("tree-sitter");
   return Parser;
 }
 
 function getLanguage(ext: string): any | null {
   if (languages.has(ext)) return languages.get(ext)!;
-  const grammar = EXT_TO_GRAMMAR[ext];
-  if (!grammar) return null;
+  const entry = EXT_TO_LANG[ext];
+  if (!entry) return null;
   try {
-    const mod = require(grammar);
-    // Real tree-sitter grammar packages export an object with a `language`
-    // property (the native binding). Some older wrappers used `.default` or
-    // the module itself — accept both. This was broken for months because
-    // `.default ?? .typescript ?? mod` fell through to the raw module
-    // object, which parser.setLanguage silently rejected and every code
-    // file then returned empty symbols.
+    const mod = require(entry.requirePath);
+    // Real tree-sitter grammar packages export `{ language }` (the native
+    // binding). Some older wrappers used `.default` or the module itself.
+    // The lookup chain handles all observed shapes.
     const lang = mod.language ?? mod.default?.language ?? mod.default ?? mod;
     languages.set(ext, lang);
     return lang;
@@ -83,189 +139,77 @@ function getLanguage(ext: string): any | null {
   }
 }
 
+// Strip directive predicates (`#xxx!`) from a .scm source. node-tree-sitter
+// at our pinned host (0.21.1) only knows filter predicates ending in `?`
+// (#eq?, #not-eq?, #match?, #not-match?, #any-of?). Directives like
+// #strip!, #set-adjacent!, #select-adjacent! are post-processing hints
+// used by the `tree-sitter tags` CLI for cosmetic comment stripping; the
+// query engine raises "Unknown query predicate" if they're present.
+// We don't need them for symbol extraction — we associate doc comments
+// ourselves via tree walks below.
+function stripDirectives(scm: string): string {
+  return scm.replace(/\(#[a-z-]+![^)]*\)/g, "");
+}
+
+function getQuery(ext: string): any | null {
+  if (queries.has(ext)) return queries.get(ext)!;
+  const entry = EXT_TO_LANG[ext];
+  const lang = getLanguage(ext);
+  if (!entry || !lang) return null;
+  try {
+    const parts: string[] = [];
+    for (const rel of entry.queryPaths) {
+      const path = require.resolve(rel, { paths: [process.cwd(), HERE, join(HERE, "..")] });
+      parts.push(stripDirectives(readFileSync(path, "utf-8")));
+    }
+    if (entry.vendoredExtra) {
+      const path = join(VENDORED_QUERY_DIR, entry.vendoredExtra);
+      parts.push(stripDirectives(readFileSync(path, "utf-8")));
+    }
+    const scm = parts.join("\n");
+    const P = getParser();
+    const q = new P.Query(lang, scm);
+    queries.set(ext, q);
+    return q;
+  } catch (e) {
+    // Surface the failure on first call, then cache the null so we don't
+    // re-throw on every parse. Misconfigured query files should be loud
+    // during development but quiet in production.
+    process.stderr.write?.(`[clwnd] failed to compile query for ${ext}: ${(e as Error).message}\n`);
+    queries.set(ext, null);
+    return null;
+  }
+}
+
+// ─── Public types ───────────────────────────────────────────────────────────
+
 export interface Symbol {
   name: string;
-  kind: string; // function, class, method, interface, type, property, enum
+  /**
+   * Definition kind from the @definition.X capture (function, method,
+   * class, interface, type, namespace, module, macro, constant, …).
+   * Whatever the language's tags.scm calls it.
+   */
+  kind: string;
+  /** 1-based inclusive line range, kept for display + legacy callers. */
   startLine: number;
   endLine: number;
+  /** 0-based byte offsets — primary range used for splicing edits. */
+  startIndex: number;
+  endIndex: number;
   children?: Symbol[];
 }
 
-/** Node types that represent named symbols */
-const SYMBOL_TYPES: Record<string, string> = {
-  // ── TypeScript / JavaScript ────────────────────────────────────────────
-  function_declaration: "function",
-  arrow_function: "function",
-  generator_function_declaration: "function",
-  class_declaration: "class",
-  interface_declaration: "interface",
-  type_alias_declaration: "type",
-  enum_declaration: "enum",
-  method_definition: "method",
-  method_declaration: "method",
-  public_field_definition: "property",
-  property_declaration: "property",
-  property_signature: "property",
-  // ── Python ─────────────────────────────────────────────────────────────
-  function_definition: "function", // also C, C++, PHP, Bash
-  class_definition: "class",
-  // ── Rust ───────────────────────────────────────────────────────────────
-  function_item: "function",
-  struct_item: "struct",
-  impl_item: "impl",
-  enum_item: "enum",
-  trait_item: "trait",
-  // ── Go ─────────────────────────────────────────────────────────────────
-  function_type: "function",
-  // ── Java / C# (also use class_declaration / method_declaration above) ──
-  constructor_declaration: "constructor",
-  // ── C / C++ ────────────────────────────────────────────────────────────
-  // function_definition reused. struct/enum/union_specifier are C/C++.
-  struct_specifier: "struct",
-  enum_specifier: "enum",
-  union_specifier: "union",
-  type_definition: "type",
-  class_specifier: "class", // C++
-  namespace_definition: "namespace", // C++
-  // ── C# ─────────────────────────────────────────────────────────────────
-  namespace_declaration: "namespace",
-  struct_declaration: "struct",
-  // ── Ruby ───────────────────────────────────────────────────────────────
-  // Ruby uses bare `class`, `module`, `method` as the AST node type names.
-  method: "method",
-  singleton_method: "method",
-  class: "class",
-  module: "module",
-  // ── PHP ────────────────────────────────────────────────────────────────
-  // function_definition / class_declaration / method_declaration reused.
-  trait_declaration: "trait",
-};
-
-/** Container types whose children we recurse into */
-const CONTAINERS = new Set([
-  // TS/JS
-  "class_declaration", "class_definition", "class_body",
-  "interface_declaration", "interface_body",
-  "enum_declaration", "enum_body",
-  "export_statement",
-  // Rust
-  "impl_item", "struct_item", "trait_item",
-  // Python
-  "decorated_definition", "block",
-  // Java / C# / PHP — declaration_list wraps members inside class/namespace
-  "declaration_list",
-  // C / C++ — field_declaration_list wraps struct/class members; namespace
-  // and class specifiers themselves are also containers so their members
-  // surface as nested children of the parent symbol.
-  "field_declaration_list",
-  "namespace_definition",
-  "class_specifier",
-  "struct_specifier",
-  // C#
-  "namespace_declaration",
-  "struct_declaration",
-  // Ruby — body_statement holds methods inside class/module; the bare
-  // `class` and `module` node types are themselves containers because
-  // their children include the methods.
-  "body_statement", "class", "module",
-  // PHP
-  "trait_declaration",
-]);
-
-// Resolve a symbol's display name from a tree-sitter node. Most languages
-// expose the name via a `name` field (childForFieldName("name")), so the
-// fast path is a single lookup. C and C++ are the exception: their
-// function_definition wraps the name inside a function_declarator (and
-// possibly a pointer_declarator on top), so we walk the declarator chain
-// down to the leaf identifier.
-function getSymbolName(node: any): string | null {
-  const direct = node.childForFieldName?.("name")?.text;
-  if (direct) return direct;
-  if (node.type === "function_definition") {
-    // C / C++: function_definition.declarator → (pointer_declarator)? →
-    // function_declarator → declarator → identifier
-    let cur = node.childForFieldName?.("declarator");
-    while (cur) {
-      if (cur.type === "function_declarator") {
-        cur = cur.childForFieldName?.("declarator") ?? null;
-        continue;
-      }
-      if (cur.type === "pointer_declarator" || cur.type === "parenthesized_declarator") {
-        cur = cur.childForFieldName?.("declarator") ?? null;
-        continue;
-      }
-      if (cur.type === "identifier" || cur.type === "field_identifier") {
-        return cur.text;
-      }
-      break;
-    }
-  }
-  return null;
-}
-
-function extractSymbols(node: any, depth = 0): Symbol[] {
-  const symbols: Symbol[] = [];
-  // Iterate NAMED children only — `child(i)` / `childCount` includes
-  // anonymous keyword tokens like `class`, `def`, `function`, `end`,
-  // and Ruby's tree-sitter grammar happens to give the literal keyword
-  // token the same type name as the wrapping node ("class"). With raw
-  // childCount iteration, the keyword gets matched against SYMBOL_TYPES
-  // and emits a phantom `class:anonymous` symbol inside every Ruby class.
-  // namedChild() skips those tokens.
-  const count = node.namedChildCount as number;
-  for (let i = 0; i < count; i++) {
-    const child = node.namedChild(i);
-    const type = child.type as string;
-    const kind = SYMBOL_TYPES[type];
-
-    if (kind) {
-      const name = getSymbolName(child);
-      // Skip unnamed matches that aren't containers — they're usually
-      // tree-sitter artifacts (anonymous structs, lambda bodies, etc.)
-      // we don't want cluttering the outline.
-      if (!name) {
-        if (CONTAINERS.has(type)) {
-          symbols.push(...extractSymbols(child, depth + 1));
-        }
-        continue;
-      }
-      const sym: Symbol = {
-        name,
-        kind,
-        startLine: child.startPosition.row + 1,
-        endLine: child.endPosition.row + 1,
-      };
-
-      // Recurse into class/interface/enum bodies for members
-      if (CONTAINERS.has(type)) {
-        const children = extractSymbols(child, depth + 1);
-        if (children.length > 0) sym.children = children;
-      }
-
-      symbols.push(sym);
-    } else if (CONTAINERS.has(type)) {
-      // Container without its own symbol (class_body, export_statement)
-      symbols.push(...extractSymbols(child, depth + 1));
-    }
-  }
-  return symbols;
-}
-
-/**
- * Extract all symbols from a file.
- * Returns null if the language isn't supported.
- */
-const MAX_FILE_SIZE = 500 * 1024; // 500KB — skip huge files
-
 // ─── Parsed-file cache ─────────────────────────────────────────────────────
-// Every symbol query, source slice, and AST grep used to re-run readFileSync
-// + tree-sitter parse + symbol extraction on every call. That's 2-5ms per
-// file for a 1500-line TS source, paid on every repeat call. Cache the
-// parsed result by absolute path and auto-invalidate on mtime change.
 //
-// Insertion order = LRU order (Map preserves it). Over AST_CACHE_MAX, drop
-// the oldest. A cache hit refreshes the entry's position so hot files stick.
-// Memory budget at 100 entries × ~50KB source + small symbol tree ≈ 5-6 MB.
+// Avoid re-parsing the same file every time fileSymbols / readSymbol /
+// astGrep is called. Keyed by absolute path, invalidated on mtime change.
+// LRU eviction at AST_CACHE_MAX entries.
+
+const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB — was 500KB, lifted because
+                                        // tree-sitter handles megabytes
+                                        // fine and real codebases have
+                                        // generated files past 500KB.
 
 interface AstCacheEntry {
   mtime: number;
@@ -293,6 +237,8 @@ function cachedParse(filePath: string): AstCacheEntry | null {
   const ext = extname(filePath).toLowerCase();
   const lang = getLanguage(ext);
   if (!lang) return null;
+  const query = getQuery(ext);
+  if (!query) return null;
 
   let source: string;
   try { source = readFileSync(filePath, "utf-8"); } catch { return null; }
@@ -302,15 +248,12 @@ function cachedParse(filePath: string): AstCacheEntry | null {
     const parser = new P();
     parser.setLanguage(lang);
     // tree-sitter 0.21 default bufferSize trips on files over ~32KB and
-    // throws "Invalid argument". We raise it to 1MB (plenty of headroom
-    // and still bounded by MAX_FILE_SIZE above). Before this fix every
-    // file larger than ~32KB silently returned null, so fileSymbols/
-    // readSymbol/astGrep were all no-ops on anything non-trivial.
-    const tree = parser.parse(source, null, { bufferSize: 1024 * 1024 });
-    const symbols = extractSymbols(tree.rootNode);
+    // throws "Invalid argument". Raise to 4MB (covers anything below
+    // MAX_FILE_SIZE with headroom).
+    const tree = parser.parse(source, null, { bufferSize: 4 * 1024 * 1024 });
+    const symbols = extractSymbolsViaQuery(tree.rootNode, query, EXT_TO_LANG[ext]);
     const entry: AstCacheEntry = { mtime, symbols, source };
 
-    // Evict oldest if at cap
     if (astCache.size >= AST_CACHE_MAX) {
       const oldest = astCache.keys().next().value;
       if (oldest) astCache.delete(oldest);
@@ -321,6 +264,142 @@ function cachedParse(filePath: string): AstCacheEntry | null {
     return null;
   }
 }
+
+// ─── Query-driven symbol extraction ─────────────────────────────────────────
+//
+// 1. Run the language's compiled tags.scm Query against the parsed tree.
+// 2. For each match, find the @definition.X capture (the symbol's node)
+//    and the @name capture (the identifier).
+// 3. Walk parent wrappers if the language registers any (Python's
+//    decorated_definition, TS's export_statement) so the byte range
+//    covers the decorators / `export` keyword.
+// 4. Walk preceding adjacent comment siblings to extend the start of the
+//    range backward — leading JSDoc / Go-style doc comments / Python
+//    block comments above a function become part of its symbol range,
+//    so do_code's replace operation doesn't strand them.
+// 5. Sort matches by (startIndex asc, endIndex desc) and reconstruct
+//    parent/child nesting from byte-range containment. Two matches with
+//    the same start come out parent-first because the parent has the
+//    larger endIndex.
+// 6. Dedupe identical (startIndex, endIndex, name) symbols — some
+//    grammars match the same node from multiple patterns (e.g., a Rust
+//    method captured as both definition.function and definition.method
+//    via the impl-block pattern).
+
+function expandWithWrappers(node: any, wrappers?: string[]): any {
+  if (!wrappers || wrappers.length === 0) return node;
+  let cur = node;
+  // Walk up while the parent is a registered wrapper. We move OUTWARD,
+  // not inward — the symbol's effective root is the outermost wrapper.
+  while (cur.parent && wrappers.includes(cur.parent.type)) {
+    cur = cur.parent;
+  }
+  return cur;
+}
+
+function expandForLeadingComments(node: any): { startIndex: number; startLine: number } {
+  // Walk previousNamedSibling chain back through `comment` nodes that are
+  // immediately adjacent (no blank line between them and the current
+  // start). Returns the new start index/line. Handles JSDoc, Go-style
+  // // comments, Python block comments above a def, etc. The comment
+  // node's text isn't transformed — we just include its bytes in the
+  // symbol range so an edit/delete preserves or removes the doc together
+  // with the symbol.
+  let cur = node;
+  let startIndex = node.startIndex as number;
+  let startLine = (node.startPosition.row as number) + 1;
+  while (true) {
+    const prev = cur.previousNamedSibling;
+    if (!prev) break;
+    if (prev.type !== "comment") break;
+    // Adjacent if the comment ends on the line immediately above (or
+    // same line as) the current start. One blank line between is allowed
+    // for JSDoc-style separation; two blank lines means it's a different
+    // section.
+    const commentEndLine = (prev.endPosition.row as number) + 1;
+    const gap = startLine - commentEndLine;
+    if (gap > 2) break;
+    startIndex = prev.startIndex as number;
+    startLine = (prev.startPosition.row as number) + 1;
+    cur = prev;
+  }
+  return { startIndex, startLine };
+}
+
+function extractSymbolsViaQuery(rootNode: any, query: any, langEntry: LanguageEntry): Symbol[] {
+  const matches = query.matches(rootNode);
+  // Flat list of {node, kind, name, startIndex, endIndex, startLine, endLine}.
+  // We post-process into a tree by byte-range containment.
+  type Hit = {
+    node: any;
+    kind: string;
+    name: string;
+    startIndex: number;
+    endIndex: number;
+    startLine: number;
+    endLine: number;
+  };
+  const hits: Hit[] = [];
+  const seen = new Set<string>();
+
+  for (const match of matches) {
+    let defCapture: any = null;
+    let nameCapture: any = null;
+    let kind = "";
+    for (const cap of match.captures) {
+      if (cap.name.startsWith("definition.")) {
+        defCapture = cap;
+        kind = cap.name.slice("definition.".length);
+      } else if (cap.name === "name") {
+        nameCapture = cap;
+      }
+    }
+    if (!defCapture || !nameCapture) continue;
+    const expandedRoot = expandWithWrappers(defCapture.node, langEntry.expandWrappers);
+    const { startIndex, startLine } = expandForLeadingComments(expandedRoot);
+    const endIndex = expandedRoot.endIndex as number;
+    const endLine = (expandedRoot.endPosition.row as number) + 1;
+    const name = nameCapture.node.text as string;
+    const dedupKey = `${startIndex}:${endIndex}:${name}:${kind}`;
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
+    hits.push({ node: expandedRoot, kind, name, startIndex, endIndex, startLine, endLine });
+  }
+
+  // Sort: outer first (smaller startIndex, then larger endIndex breaks ties).
+  hits.sort((a, b) => a.startIndex - b.startIndex || b.endIndex - a.endIndex);
+
+  // Build tree by containment. A hit is a child of the topmost ancestor
+  // whose range strictly contains it.
+  const top: Symbol[] = [];
+  type StackEntry = { hit: Hit; sym: Symbol };
+  const stack: StackEntry[] = [];
+  for (const hit of hits) {
+    const sym: Symbol = {
+      name: hit.name,
+      kind: hit.kind,
+      startLine: hit.startLine,
+      endLine: hit.endLine,
+      startIndex: hit.startIndex,
+      endIndex: hit.endIndex,
+    };
+    // Pop ancestors that don't contain this hit.
+    while (stack.length > 0 && stack[stack.length - 1].hit.endIndex <= hit.startIndex) {
+      stack.pop();
+    }
+    if (stack.length === 0) {
+      top.push(sym);
+    } else {
+      const parent = stack[stack.length - 1].sym;
+      if (!parent.children) parent.children = [];
+      parent.children.push(sym);
+    }
+    stack.push({ hit, sym });
+  }
+  return top;
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────────
 
 export function fileSymbols(filePath: string): Symbol[] | null {
   return cachedParse(filePath)?.symbols ?? null;
@@ -337,16 +416,18 @@ export function fileSymbols(filePath: string): Symbol[] | null {
 export function validateSyntax(filePath: string, source: string): { ok: true } | { ok: false; error: string } {
   const ext = extname(filePath).toLowerCase();
   const lang = getLanguage(ext);
-  if (!lang) return { ok: true }; // unsupported language, skip validation
+  if (!lang) return { ok: true };
   try {
     const P = getParser();
     const parser = new P();
     parser.setLanguage(lang);
-    const tree = parser.parse(source, null, { bufferSize: 1024 * 1024 });
+    const tree = parser.parse(source, null, { bufferSize: 4 * 1024 * 1024 });
     if (tree.rootNode.hasError) {
-      // Find the first ERROR or MISSING node for a useful message.
+      // Walk the tree for the first ERROR or MISSING node and surface its
+      // location. tree-sitter is error-recovering — `parse()` almost
+      // never throws — so the only meaningful syntax check is hasError +
+      // a walk for the offending node.
       const cursor = tree.walk();
-      const path: string[] = [];
       const visit = (): string | null => {
         const node = cursor.currentNode;
         if (node.type === "ERROR" || node.isMissing) {
@@ -374,76 +455,78 @@ export function validateSyntax(filePath: string, source: string): { ok: true } |
 
 /**
  * Locate a symbol by dot-separated name and return its inclusive line range.
- * Used by do_code for splice-based symbol replacement. Unlike readSymbol
- * which returns the source text, this returns just the numeric range so
- * the caller can do line-based splicing without re-reading the file.
+ * Kept for legacy callers that work in line space. Prefer symbolByteRange
+ * for new code — line-based splicing is unsafe on single-line constructs.
  */
 export function symbolLineRange(filePath: string, symbolPath: string): { startLine: number; endLine: number } | null {
-  const entry = cachedParse(filePath);
-  if (!entry) return null;
-  const parts = symbolPath.split(".");
-  let current: Symbol[] = entry.symbols;
-  let found: Symbol | null = null;
-  for (const part of parts) {
-    found = current.find(s => s.name === part) ?? null;
-    if (!found) return null;
-    current = found.children ?? [];
-  }
+  const found = findSymbol(filePath, symbolPath);
   if (!found) return null;
   return { startLine: found.startLine, endLine: found.endLine };
 }
 
 /**
- * Find a specific symbol by name (dot-separated for nested: "Server.start").
- * Returns the source lines for that symbol, or null if not found.
+ * Locate a symbol and return its byte range. This is the primary lookup
+ * for do_code splicing — operating in byte space instead of line space
+ * means single-line constructs (`def f(): pass; def g(): pass`), trailing
+ * inline comments, and unusual whitespace all work correctly.
  */
-export function readSymbol(filePath: string, symbolPath: string): { source: string; startLine: number; endLine: number } | null {
+export function symbolByteRange(filePath: string, symbolPath: string): { startIndex: number; endIndex: number; startLine: number; endLine: number } | null {
+  const found = findSymbol(filePath, symbolPath);
+  if (!found) return null;
+  return { startIndex: found.startIndex, endIndex: found.endIndex, startLine: found.startLine, endLine: found.endLine };
+}
+
+function findSymbol(filePath: string, symbolPath: string): Symbol | null {
   const entry = cachedParse(filePath);
   if (!entry) return null;
-
   const parts = symbolPath.split(".");
   let current: Symbol[] = entry.symbols;
   let found: Symbol | null = null;
-
   for (const part of parts) {
     found = current.find(s => s.name === part) ?? null;
     if (!found) return null;
     current = found.children ?? [];
   }
-
-  if (!found) return null;
-
-  const lines = entry.source.split("\n");
-  const source = lines.slice(found.startLine - 1, found.endLine).map((l, i) => `${found!.startLine + i}\t${l}`).join("\n");
-  return { source, startLine: found.startLine, endLine: found.endLine };
+  return found;
 }
 
 /**
- * Format symbols as a compact outline string.
+ * Find a specific symbol by name (dot-separated for nested: "Server.start").
+ * Returns the source lines for that symbol with line-number prefixes.
  */
+export function readSymbol(filePath: string, symbolPath: string): { source: string; startLine: number; endLine: number } | null {
+  const entry = cachedParse(filePath);
+  if (!entry) return null;
+  const found = findSymbol(filePath, symbolPath);
+  if (!found) return null;
+
+  const lines = entry.source.split("\n");
+  const source = lines.slice(found.startLine - 1, found.endLine).map((l, i) => `${found.startLine + i}\t${l}`).join("\n");
+  return { source, startLine: found.startLine, endLine: found.endLine };
+}
+
+/** Format symbols as a compact outline string. */
 export function formatSymbols(symbols: Symbol[], indent = 0): string {
   const lines: string[] = [];
   for (const s of symbols) {
     const pad = "  ".repeat(indent);
     const range = s.startLine === s.endLine ? `L${s.startLine}` : `L${s.startLine}-${s.endLine}`;
     lines.push(`${pad}${s.kind} ${s.name} ${range}`);
-    if (s.children) {
+    if (s.children && s.children.length > 0) {
       lines.push(formatSymbols(s.children, indent + 1));
     }
   }
   return lines.join("\n");
 }
 
-/**
- * Check if a file extension is supported by tree-sitter.
- */
 export function isSupported(filePath: string): boolean {
-  return extname(filePath).toLowerCase() in EXT_TO_GRAMMAR;
+  return extname(filePath).toLowerCase() in EXT_TO_LANG;
 }
 
 /**
  * Fuzzy search symbols by name across a file.
- * Matches substrings case-insensitively. Returns matching symbols with context.
+ * Matches substrings case-insensitively. Returns matching symbols with
+ * their parent path joined by dots ("Class.method").
  */
 export function searchSymbols(filePath: string, query: string): Symbol[] {
   const entry = cachedParse(filePath);
@@ -485,9 +568,7 @@ export function astGrep(filePath: string, pattern: string): GrepMatch[] {
   const lines = entry.source.split("\n");
   const regex = new RegExp(pattern, "i");
 
-  // Build symbol map: line → enclosing symbol
   const lineSymbol = new Map<number, { name: string; kind: string }>();
-
   function mapLines(syms: Symbol[], parentName = "") {
     for (const s of syms) {
       const fullName = parentName ? `${parentName}.${s.name}` : s.name;
@@ -516,13 +597,10 @@ export function astGrep(filePath: string, pattern: string): GrepMatch[] {
   return matches;
 }
 
-/**
- * Format AST grep matches — grouped by symbol for readability.
- */
+/** Format AST grep matches — grouped by symbol for readability. */
 export function formatGrepMatches(matches: GrepMatch[], relativeTo?: string): string {
   if (matches.length === 0) return "No matches found";
 
-  // Group by file, then by symbol
   const byFile = new Map<string, Map<string, GrepMatch[]>>();
   for (const m of matches) {
     const file = relativeTo ? m.file.replace(relativeTo + "/", "") : m.file;
@@ -536,9 +614,9 @@ export function formatGrepMatches(matches: GrepMatch[], relativeTo?: string): st
   const lines: string[] = [];
   for (const [file, bySymbol] of byFile) {
     lines.push(file);
-    for (const [sym, matches] of bySymbol) {
+    for (const [sym, ms] of bySymbol) {
       lines.push(`  ${sym}:`);
-      for (const m of matches) {
+      for (const m of ms) {
         lines.push(`    ${m.line}: ${m.text.trim()}`);
       }
     }

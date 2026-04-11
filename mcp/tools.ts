@@ -9,7 +9,7 @@ import { resolve, dirname, relative, extname, join as pathJoin } from "path";
 
 import { trace } from "../log.ts";
 import { penny } from "../lib/penny.ts";
-import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, astGrep, searchSymbols, validateSyntax, symbolLineRange, type Symbol } from "../lib/ast.ts";
+import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, astGrep, searchSymbols, validateSyntax, symbolByteRange, type Symbol } from "../lib/ast.ts";
 
 let CWD = process.env.CLWND_CWD ?? process.cwd();
 
@@ -1089,7 +1089,6 @@ function execDoCode(
   if (stale) return stale;
 
   const original = readFileSync(p, "utf-8");
-  const lines = original.split("\n");
 
   // ── replace without symbol: whole-file rewrite. Syntax-validated. ──
   if (op === "replace" && !args.symbol) {
@@ -1113,7 +1112,7 @@ function execDoCode(
   if (!args.symbol) {
     return { output: `Error: operation '${op}' requires a symbol.`, title: relPath };
   }
-  const range = symbolLineRange(p, args.symbol);
+  const range = symbolByteRange(p, args.symbol);
   if (!range) {
     return {
       output: `Error: symbol '${args.symbol}' not found in ${p}. Run read(${p}) to see the symbol outline first, then call do_code with an exact symbol name.`,
@@ -1121,49 +1120,44 @@ function execDoCode(
     };
   }
 
-  let updated: string[];
+  // Byte-range splice. The symbol's [startIndex, endIndex] covers its
+  // full extent INCLUDING leading comments / decorators / `export`
+  // wrappers (the ast.ts query expansion did the heavy lifting). Single-
+  // line constructs (`def f(): pass; def g(): pass`) work because we no
+  // longer round to whole lines.
+  const before = original.slice(0, range.startIndex);
+  const after = original.slice(range.endIndex);
+  let newContent: string;
+
   if (op === "replace") {
     if (args.new_source == null) {
       return { output: `Error: operation 'replace' with symbol requires new_source (the new source for that symbol).`, title: relPath };
     }
-    const newLines = args.new_source.split("\n");
-    updated = [
-      ...lines.slice(0, range.startLine - 1),
-      ...newLines,
-      ...lines.slice(range.endLine),
-    ];
+    newContent = before + args.new_source + after;
   } else if (op === "insert_before") {
     if (args.new_source == null) {
       return { output: `Error: operation 'insert_before' requires new_source.`, title: relPath };
     }
-    const newLines = args.new_source.split("\n");
-    updated = [
-      ...lines.slice(0, range.startLine - 1),
-      ...newLines,
-      "",
-      ...lines.slice(range.startLine - 1),
-    ];
+    // Insert at the symbol's start. Include a separator newline so the
+    // new code doesn't fuse with the symbol's leading text.
+    newContent = before + args.new_source + "\n\n" + original.slice(range.startIndex);
   } else if (op === "insert_after") {
     if (args.new_source == null) {
       return { output: `Error: operation 'insert_after' requires new_source.`, title: relPath };
     }
-    const newLines = args.new_source.split("\n");
-    updated = [
-      ...lines.slice(0, range.endLine),
-      "",
-      ...newLines,
-      ...lines.slice(range.endLine),
-    ];
+    // Insert immediately after the symbol's end. Same separator concern.
+    newContent = original.slice(0, range.endIndex) + "\n\n" + args.new_source + after;
   } else if (op === "delete") {
-    updated = [
-      ...lines.slice(0, range.startLine - 1),
-      ...lines.slice(range.endLine),
-    ];
+    // Trim a single trailing newline so deleting a symbol doesn't leave
+    // a gratuitous blank line. We don't try to be cleverer than that —
+    // formatters can sort the rest out.
+    let cleanAfter = after;
+    if (before.endsWith("\n") && cleanAfter.startsWith("\n")) cleanAfter = cleanAfter.slice(1);
+    newContent = before + cleanAfter;
   } else {
     return { output: `Error: unknown operation '${op}'. Valid: create, replace, insert_before, insert_after, delete.`, title: relPath };
   }
 
-  const newContent = updated.join("\n");
   const validation = validateSyntax(p, newContent);
   if (!validation.ok) {
     return {
@@ -1177,7 +1171,7 @@ function execDoCode(
   return {
     output: `${op === "delete" ? "Deleted" : op === "replace" ? "Replaced" : "Inserted"} symbol '${args.symbol}' in ${p} (was lines ${range.startLine}-${range.endLine}).`,
     title: relPath,
-    metadata: { operation: op, symbol: args.symbol, was: range, lines: updated.length },
+    metadata: { operation: op, symbol: args.symbol, was: range, length: newContent.length },
   };
 }
 

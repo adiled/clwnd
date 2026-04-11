@@ -35,4 +35,26 @@ export default defineConfig({
   platform: "node",
   target: "node18",
   external: ["bun", "bun:sqlite", ...TREE_SITTER_GRAMMARS],
+  // tsup doesn't copy non-source files. lib/queries/*.scm is loaded by
+  // lib/ast.ts at runtime via require/readFileSync — without this hook
+  // the daemon would crash on first .cpp/.bash/.java edit because the
+  // vendored query file wouldn't be next to dist/daemon/index.js.
+  async onSuccess() {
+    const fs = await import("fs/promises");
+    const path = await import("path");
+    const src = path.resolve("lib/queries");
+    const dst = path.resolve("dist/daemon/queries");
+    try {
+      await fs.mkdir(dst, { recursive: true });
+      const files = await fs.readdir(src);
+      for (const f of files) {
+        if (f.endsWith(".scm")) {
+          await fs.copyFile(path.join(src, f), path.join(dst, f));
+        }
+      }
+      console.log(`[onSuccess] copied ${files.filter(f => f.endsWith(".scm")).length} query files → dist/daemon/queries/`);
+    } catch (e) {
+      console.error("[onSuccess] failed to copy queries:", e);
+    }
+  },
 });
