@@ -33,32 +33,60 @@ version_gte() {
   printf '%s\n%s\n' "$2" "$1" | sort -V -C
 }
 
+# Extract a semver from `<binary> --version` output. Used for both before
+# and after probes around an upgrade attempt.
+read_version() {
+  local BIN=$1
+  "$BIN" --version 2>/dev/null | sed -n 's/.*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1
+}
+
+# Bring a prerequisite up to (or past) our minimum pin. Tries the upstream
+# updater for the given binary, then re-checks the version. Exits the
+# install script if the binary is still below the minimum after the update
+# attempt — the auto-update path NEEDS this to self-heal, otherwise the
+# 6-hour daemon timer keeps invoking clwnd update silently and failing
+# silently and the user never knows they're stuck.
+ensure_min_version() {
+  local NAME=$1   # human label, e.g. "Claude CLI"
+  local BIN=$2    # binary path / command
+  local MIN=$3    # minimum required version
+
+  local CUR
+  CUR=$(read_version "$BIN")
+  if [ -z "$CUR" ]; then
+    echo "  ${NAME}: could not read version from \`$BIN --version\`, skipping"
+    return 0
+  fi
+
+  if version_gte "$CUR" "$MIN"; then
+    return 0
+  fi
+
+  echo "  ${NAME} ${CUR} is below required ${MIN} — running self-update..."
+  "$BIN" update 2>&1 | sed 's/^/    /' || true
+
+  CUR=$(read_version "$BIN")
+  if [ -z "$CUR" ] || ! version_gte "$CUR" "$MIN"; then
+    echo ""
+    echo "  ${NAME} is still ${CUR:-unknown} after \`${BIN} update\` (need ${MIN})."
+    echo "  clwnd cannot proceed. Update ${NAME} manually and re-run \`clwnd update\`."
+    echo ""
+    exit 1
+  fi
+  echo "  ${NAME} is now ${CUR} (>= ${MIN})."
+}
+
 check_prereqs() {
   [ -x "$(command -v bun)" ]    || { echo "error: bun required"; exit 1; }
   [ -x "$(command -v claude)" ] || { echo "error: claude CLI required"; exit 1; }
   [ -x "$(command -v git)" ]    || { echo "error: git required"; exit 1; }
 
-  # Check Claude CLI version (minimum $MIN_CLAUDE for --bare support)
-  CLAUDE_VER=$(claude --version 2>/dev/null | sed -n 's/.*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)
-  if [ -n "$CLAUDE_VER" ] && ! version_gte "$CLAUDE_VER" "$MIN_CLAUDE"; then
-    echo ""
-    echo "  Claude CLI $CLAUDE_VER is too old (minimum: $MIN_CLAUDE)"
-    echo "  Run: claude update"
-    echo ""
-    exit 1
-  fi
+  ensure_min_version "Claude CLI" "claude" "$MIN_CLAUDE"
 
-  # Check OpenCode version (minimum $MIN_OPENCODE)
+  local OC_BIN
   OC_BIN=$(command -v opencode 2>/dev/null || echo "")
   if [ -n "$OC_BIN" ]; then
-    OC_VER=$($OC_BIN --version 2>/dev/null | sed -n 's/.*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)
-    if [ -n "$OC_VER" ] && ! version_gte "$OC_VER" "$MIN_OPENCODE"; then
-      echo ""
-      echo "  OpenCode $OC_VER is too old (minimum: $MIN_OPENCODE)"
-      echo "  Run: opencode update"
-      echo ""
-      exit 1
-    fi
+    ensure_min_version "OpenCode" "$OC_BIN" "$MIN_OPENCODE"
   fi
 }
 
