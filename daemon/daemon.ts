@@ -9,7 +9,7 @@ import { loadConfig } from "../lib/config.ts";
 import { sigil, rid as makeRid, echo, pulse, isDusk, classifySuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type DroneState, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
 import { droneThink, setDroneWorkspace, releaseDroneSession } from "../lib/drone-llm.ts";
 import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, lastUuid, sanitizeJsonl, type GraftResult } from "../lib/session.ts";
-import { penny } from "../lib/penny.ts";
+import { penny, pennyAdd, pennyLoad, pennySave, pennyReset, type PennyDelta } from "../lib/penny.ts";
 
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
@@ -603,6 +603,14 @@ const STATE_DIR = process.env.XDG_STATE_HOME
   ? `${process.env.XDG_STATE_HOME}/clwnd`
   : `${process.env.HOME}/.local/state/clwnd`;
 const SESSIONS_FILE = `${STATE_DIR}/sessions.json`;
+const PENNY_FILE = `${STATE_DIR}/penny.json`;
+
+// Load persisted penny counters (lifetime view) and start a write-back timer.
+pennyLoad(PENNY_FILE);
+const pennyPersistInterval = setInterval(() => pennySave(PENNY_FILE), 60_000);
+pennyPersistInterval.unref?.();
+process.on("SIGTERM", () => { try { pennySave(PENNY_FILE); } catch {} });
+process.on("SIGINT", () => { try { pennySave(PENNY_FILE); } catch {} });
 
 function loadSessions(): Map<string, Session> {
   try {
@@ -885,6 +893,10 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
 
   switch (chi) {
     case "prompt": {
+      // Plugin piggybacks its counter delta on every prompt — ingest before
+      // anything else so counts don't miss on errors/early returns below.
+      if (msg.pennyDelta) pennyAdd(msg.pennyDelta as PennyDelta);
+
       const sid = msg.sid as string;
       const client = humClients.get(clientId);
       (async () => {
@@ -1438,7 +1450,7 @@ Bun.serve({
       });
     }
 
-    // /savings — penny-pincher counters since daemon start
+    // /savings — penny-pincher counters (lifetime, persisted across restarts)
     if (req.method === "GET" && url.pathname === "/savings") {
       const sessionCtx: Array<{ sid: string; maxContextTokens: number }> = [];
       for (const [sid, sess] of sessions) {
@@ -1447,12 +1459,22 @@ Bun.serve({
         }
       }
       sessionCtx.sort((a, b) => b.maxContextTokens - a.maxContextTokens);
+      // Snapshot disk on every query so `clwnd savings` always reflects the
+      // freshest counters even between the 60s periodic writes.
+      pennySave(PENNY_FILE);
       return Response.json({
         uptimeMs: Date.now() - penny.started,
         counters: penny,
         rotateThreshold: Number(process.env.CLWND_CONTEXT_ROTATE ?? "300000"),
         topContextSessions: sessionCtx.slice(0, 10),
       });
+    }
+
+    // /savings/reset — zero the counters (and persist)
+    if (req.method === "POST" && url.pathname === "/savings/reset") {
+      pennyReset();
+      pennySave(PENNY_FILE);
+      return Response.json({ ok: true, resetAt: penny.started });
     }
 
     if (req.method === "GET" && url.pathname === "/sessions") {

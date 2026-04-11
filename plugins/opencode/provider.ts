@@ -316,6 +316,7 @@ function extractContent(prompt: LanguageModelV3Prompt, sessionId?: string): Cont
                 const stripped = (parts[j] as { type: "text"; text: string }).text.replace(reminder, "").trim();
                 if (stripped) { parts[j] = { type: "text", text: stripped }; }
                 else { parts.splice(j, 1); }
+                pendingPenny.reminderStripped++;
                 trace("reminder.stripped", { sid: sessionId });
               } else {
                 lastReminder.set(sessionId, key);
@@ -568,6 +569,29 @@ const lastSystemPromptHash = new Map<string, string>();
 const lastPermissionsHash = new Map<string, string>();
 const lastAllowedToolsHash = new Map<string, string>();
 
+// Local plugin-side penny counters. Accumulate between hum sends, flush as
+// `pennyDelta` piggyback on every prompt hum. Daemon merges into its global
+// counters. Keeps the wire traffic to one field per turn instead of a separate
+// hum tone per event.
+const pendingPenny = {
+  humDedup: 0,
+  reminderStripped: 0,
+  priorPetalsElided: 0,
+  auxModelRouted: 0,
+};
+function flushPenny(): Record<string, number> | undefined {
+  if (pendingPenny.humDedup === 0 && pendingPenny.reminderStripped === 0
+      && pendingPenny.priorPetalsElided === 0 && pendingPenny.auxModelRouted === 0) {
+    return undefined;
+  }
+  const snap = { ...pendingPenny };
+  pendingPenny.humDedup = 0;
+  pendingPenny.reminderStripped = 0;
+  pendingPenny.priorPetalsElided = 0;
+  pendingPenny.auxModelRouted = 0;
+  return snap;
+}
+
 function cheapHash(s: string): string {
   // Non-cryptographic, fast, sufficient for same-content detection.
   let h = 5381;
@@ -729,7 +753,10 @@ export class ClwndModel implements LanguageModelV3 {
     // the swap costs nothing extra. Only affects this single turn's hum — the
     // session's primary modelId in OC is untouched.
     const effectiveModel = isEmptyTools ? pickAuxModel(self.modelId) : self.modelId;
-    if (effectiveModel !== self.modelId) trace("aux.model.routed", { sid, primary: self.modelId, aux: effectiveModel });
+    if (effectiveModel !== self.modelId) {
+      pendingPenny.auxModelRouted++;
+      trace("aux.model.routed", { sid, primary: self.modelId, aux: effectiveModel });
+    }
 
     // Hash-dedup of per-turn hygiene fields. systemPrompt / permissions /
     // allowedTools rarely change during a session — the daemon falls back to
@@ -744,6 +771,7 @@ export class ClwndModel implements LanguageModelV3 {
     if (sendSystemPrompt) lastSystemPromptHash.set(sid, systemPromptHash);
     if (sendPermissions) lastPermissionsHash.set(sid, permissionsHash);
     if (sendAllowedTools) lastAllowedToolsHash.set(sid, allowedToolsHash);
+    if (!sendSystemPrompt || !sendPermissions || !sendAllowedTools) pendingPenny.humDedup++;
     trace("hum.dedup", { sid, sp: sendSystemPrompt, perm: sendPermissions, tools: sendAllowedTools });
 
     // Brokered tool return — permission returns must listen for Claude's remaining output
@@ -815,6 +843,7 @@ export class ClwndModel implements LanguageModelV3 {
         hum({ chi: "cancel", sid, reason: "compaction" });
       } else if (prevPetalCount === priorPetals.length && prevPetalCount > 0) {
         elidePriorPetals = true;
+        pendingPenny.priorPetalsElided++;
         trace("priorPetals.elided", { sid, count: priorPetals.length });
       }
     }
@@ -840,10 +869,12 @@ export class ClwndModel implements LanguageModelV3 {
     if (listenOnly && humAlive) {
       // Permission return: register listener FIRST, then release hold
       // Order matters — Claude's post-permission events must have a listener
+      const pd = flushPenny();
       hum({
         chi: "prompt", sid, cwd,
         modelId: effectiveModel,
         listenOnly: true,
+        ...(pd ? { pennyDelta: pd } : {}),
         dusk: duskIn(30_000),
       });
       promptSent = true;
@@ -852,6 +883,7 @@ export class ClwndModel implements LanguageModelV3 {
         hum({ chi: "release-permit", askId: permAskId, decision: "allow" });
       }
     } else if (!listenOnly && humAlive) {
+      const pd = flushPenny();
       hum({
         chi: "prompt", sid, cwd,
         modelId: effectiveModel,
@@ -866,6 +898,7 @@ export class ClwndModel implements LanguageModelV3 {
         externalTools: externalTools.length > 0 ? externalTools : undefined,
         mcpServerConfigs: await getMcpServerConfigs(this.config.client),
         visibleTools: allToolNames,
+        ...(pd ? { pennyDelta: pd } : {}),
         dusk: duskIn(30_000),
       });
       promptSent = true;

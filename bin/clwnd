@@ -94,6 +94,12 @@ except: print('error reading sessions')
       echo "daemon not running (socket $SOCK not found)"
       exit 1
     fi
+    SUB="${1:-}"
+    if [ "$SUB" = "reset" ]; then
+      curl -s -X POST --unix-socket "$SOCK" http://localhost/savings/reset >/dev/null
+      echo "counters reset"
+      exit 0
+    fi
     curl -s --unix-socket "$SOCK" http://localhost/savings | python3 -c "
 import sys, json
 try:
@@ -101,21 +107,23 @@ try:
     c = d.get('counters', {})
     uptime = d.get('uptimeMs', 0) / 1000
     h = int(uptime // 3600); m = int((uptime % 3600) // 60); s = int(uptime % 60)
-    def kb(b): return f'{b/1024:.1f}K' if b < 1024*1024 else f'{b/1024/1024:.2f}M'
-    print(f'clwnd savings  (daemon uptime {h}h {m}m {s}s)')
+    def kb(b):
+        if b == 0: return '0'
+        if b < 1024: return f'{b}B'
+        if b < 1024*1024: return f'{b/1024:.1f}K'
+        return f'{b/1024/1024:.2f}M'
+    print(f'clwnd savings  (since {h}h {m}m {s}s ago)')
     print()
-    print('Read dedup:')
-    print(f'  hits:              {c.get(\"readDedupHits\", 0)}')
-    print(f'  bytes not re-sent: {kb(c.get(\"readDedupBytes\", 0))}')
+    print('Daemon-side:')
+    print(f'  Read dedup:        {c.get(\"readDedupHits\", 0):>7}  hits   ({kb(c.get(\"readDedupBytes\", 0))} not re-sent)')
+    print(f'  Bash cap:          {c.get(\"bashTruncated\", 0):>7}  hits   ({kb(c.get(\"bashBytesTrimmed\", 0))} trimmed)')
+    print(f'  Rotations:         {c.get(\"rotations\", 0):>7}         (threshold {d.get(\"rotateThreshold\", 300000):,} tokens, {c.get(\"contextOverThreshold\", 0)} turns over)')
     print()
-    print('Bash output cap:')
-    print(f'  truncated calls:   {c.get(\"bashTruncated\", 0)}')
-    print(f'  bytes trimmed:     {kb(c.get(\"bashBytesTrimmed\", 0))}')
-    print()
-    print('Context rotation:')
-    print(f'  threshold:         {d.get(\"rotateThreshold\", 300000):,} tokens')
-    print(f'  turns over:        {c.get(\"contextOverThreshold\", 0)}')
-    print(f'  rotations fired:   {c.get(\"rotations\", 0)}')
+    print('Plugin-side:')
+    print(f'  Reminder stripped: {c.get(\"reminderStripped\", 0):>7}')
+    print(f'  Hum dedup:         {c.get(\"humDedup\", 0):>7}  prompts skipped ≥1 field')
+    print(f'  priorPetals elided:{c.get(\"priorPetalsElided\", 0):>7}')
+    print(f'  Aux model routed:  {c.get(\"auxModelRouted\", 0):>7}')
     top = d.get('topContextSessions', [])
     if top:
         print()
@@ -123,10 +131,7 @@ try:
         for t in top[:5]:
             print(f'  {t[\"sid\"][:30]:32s}  {t[\"maxContextTokens\"]:,} tokens')
     print()
-    print('(plugin-side dedup events — system-reminder strip, hum field hash,')
-    print(' priorPetals elision, aux model routing — live in the plugin process.')
-    print(' Grep journal for: reminder.stripped, hum.dedup, priorPetals.elided,')
-    print(' aux.model.routed.)')
+    print('counters persist across daemon restarts — \\'clwnd savings reset\\' to zero')
 except Exception as e:
     print(f'error: {e}')
 "
