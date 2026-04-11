@@ -577,7 +577,26 @@ interface Session {
   ocServerUrl?: string;
   thorns?: number; // consecutive error count — circuit breaker
   externalToolNames?: string[]; // sorted names of external MCP tools — respawn on change
+  // Per-session cached hum fields. Plugin dedups these — when a hum
+  // message omits them, we fall back to the cached value so a cold-spawn
+  // still gets the right system prompt / permissions / allowedTools.
+  lastSystemPrompt?: string;
+  lastPermissions?: unknown[];
+  lastAllowedTools?: string[];
+  // Largest per-turn input context (fresh + cache_create + cache_read) seen
+  // so far, captured from the result event's usage block. Drives the context
+  // rotation threshold — every per-turn cost scales linearly with this, and
+  // the JSONL dissection shows long sessions climbing from ~25K to 800K+.
+  maxContextTokens?: number;
 }
+
+// Rotation threshold — when max per-turn input context crosses this value,
+// clwnd tears down the current Claude CLI process + JSONL on the next prompt
+// and lets graft cold-start a fresh session from OC's priorPetals. OC-side
+// history is preserved; only Claude's internal chain state resets. Trade-off:
+// a short latency hit on the rotation turn, vs. paying the climbing cache-
+// read tax for the rest of the session.
+const CONTEXT_ROTATE_THRESHOLD = Number(process.env.CLWND_CONTEXT_ROTATE ?? "300000");
 
 const STATE_DIR = process.env.XDG_STATE_HOME
   ? `${process.env.XDG_STATE_HOME}/clwnd`
@@ -886,9 +905,22 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       }
       session.lastAccessed = Date.now();
 
-      const permissions = (msg.permissions ?? []) as unknown[];
-      const systemPrompt = (msg.systemPrompt as string) || undefined;
-      const allowedTools = (msg.allowedTools as string[]) || undefined;
+      // Plugin may omit these fields on steady-state turns (hash-dedup). Fall
+      // back to the session's last-known value so cold-spawns and respawns
+      // still get the correct system prompt / permissions / allowedTools.
+      const permissions = ("permissions" in msg
+        ? (msg.permissions as unknown[] ?? [])
+        : (session.lastPermissions ?? [])) as unknown[];
+      const systemPrompt = ("systemPrompt" in msg
+        ? ((msg.systemPrompt as string) || undefined)
+        : session.lastSystemPrompt);
+      const allowedTools = ("allowedTools" in msg
+        ? ((msg.allowedTools as string[]) || undefined)
+        : session.lastAllowedTools);
+      // Cache fresh values when the plugin sent them.
+      if ("permissions" in msg) session.lastPermissions = permissions;
+      if ("systemPrompt" in msg && systemPrompt !== undefined) session.lastSystemPrompt = systemPrompt;
+      if ("allowedTools" in msg && allowedTools !== undefined) session.lastAllowedTools = allowedTools;
       const cwd = msg.cwd as string | undefined;
       const ocServerUrl = (msg.ocServerUrl as string) || DEFAULT_OC_URL;
 
@@ -944,6 +976,28 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         trace("nest.thorns.breaker", { sid, thorns: session.thorns });
         hum(sid, { chi: "error", sid, message: `circuit breaker: ${session.thorns} consecutive errors` });
         return;
+      }
+
+      // Context rotation: if the last turn's input context crossed the
+      // threshold, tear down the Claude CLI process + JSONL and let graft
+      // cold-start a fresh session. Same teardown shape as "cancel/compaction"
+      // — the next real prompt will cold-start from priorPetals.
+      if (!msg.listenOnly && (session.maxContextTokens ?? 0) > CONTEXT_ROTATE_THRESHOLD) {
+        trace("rotation.triggered", {
+          sid,
+          maxCtx: session.maxContextTokens,
+          threshold: CONTEXT_ROTATE_THRESHOLD,
+        });
+        try { nest.fell(sid, sid); } catch {}
+        if (session.claudeSessionPath) {
+          try { unlinkSync(session.claudeSessionPath); } catch {}
+          trace("rotation.jsonl.deleted", { sid, path: session.claudeSessionPath });
+        }
+        session.claudeSessionId = null;
+        session.claudeSessionPath = null;
+        session.lastSyncedPetal = null;
+        session.maxContextTokens = 0;
+        saveSessions(sid);
       }
 
       // Graft: sync OC petals into Claude JSONL before spawning (skip for title gen / empty tools)
@@ -1144,7 +1198,18 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
             const tip = lastUuid(session.claudeSessionPath);
             if (tip) session.lastSyncedPetal = tip;
           }
-          trace("nest.wilt", { sid, finishReason: harvest.finishReason });
+          // Track peak per-turn input context. This drives context rotation.
+          if (harvest.usage) {
+            const u = harvest.usage;
+            const turnCtx = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
+            if (turnCtx > (session.maxContextTokens ?? 0)) {
+              session.maxContextTokens = turnCtx;
+              if (turnCtx > CONTEXT_ROTATE_THRESHOLD) {
+                trace("context.over.threshold", { sid, turnCtx, threshold: CONTEXT_ROTATE_THRESHOLD });
+              }
+            }
+          }
+          trace("nest.wilt", { sid, finishReason: harvest.finishReason, maxCtx: session.maxContextTokens });
           if (uncup) uncup(); // uncup any remaining petals before finish
           hum(sid, {
             chi: "finish", sid,

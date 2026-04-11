@@ -300,20 +300,25 @@ function extractContent(prompt: LanguageModelV3Prompt, sessionId?: string): Cont
           }
         }
         if (parts.length === 0) continue;
-        // Strip repeated system reminders
+        // Strip repeated system reminders. Normalize whitespace before
+        // comparison so near-duplicates (whitespace drift, trailing newlines
+        // from different OC code paths) also dedup — saves every repeated
+        // reminder that differs only in formatting.
         if (sessionId) {
+          const norm = (s: string) => s.replace(/\s+/g, " ").trim();
           for (let j = parts.length - 1; j >= 0; j--) {
             if (parts[j].type !== "text") continue;
             const reminder = (parts[j] as { text: string }).text.match(/<system-reminder>[\s\S]*?<\/system-reminder>/)?.[0];
             if (reminder) {
+              const key = norm(reminder);
               const prev = lastReminder.get(sessionId);
-              if (prev === reminder) {
+              if (prev === key) {
                 const stripped = (parts[j] as { type: "text"; text: string }).text.replace(reminder, "").trim();
                 if (stripped) { parts[j] = { type: "text", text: stripped }; }
                 else { parts.splice(j, 1); }
                 trace("reminder.stripped", { sid: sessionId });
               } else {
-                lastReminder.set(sessionId, reminder);
+                lastReminder.set(sessionId, key);
               }
             }
           }
@@ -452,6 +457,17 @@ function isAuxiliaryCall(opts: LanguageModelV3CallOptions): boolean {
   return opts.tools === undefined;
 }
 
+// Pick a cheaper model for auxiliary calls (compaction summaries, empty-tool
+// one-shots). Opus → Sonnet, Sonnet → Haiku, Haiku stays. Auxiliary calls
+// spawn a fresh Claude CLI subprocess per AUXILIARY_CALLS.md, so the model
+// swap costs zero extra respawn. A compaction summary does not need Opus
+// reasoning — Sonnet at ~60% and Haiku at ~20% of Opus pricing do it fine.
+function pickAuxModel(primary: string): string {
+  if (/^claude-opus/i.test(primary)) return "claude-sonnet-4-6";
+  if (/^claude-sonnet/i.test(primary)) return "claude-haiku-4-5";
+  return primary;
+}
+
 function isBrokeredToolReturn(prompt: LanguageModelV3Prompt): boolean {
   if (prompt.length < 2) return false;
   const last = prompt[prompt.length - 1];
@@ -542,6 +558,29 @@ const OC_TO_MCP: Record<string, string> = {
 };
 
 const lastAllowedTools = new Map<string, string>();
+
+// Per-session hash caches for hum payload dedup. On steady-state turns, the
+// systemPrompt and permissions rarely change; re-shipping them every turn is
+// pure IPC waste. Daemon-side falls back to its cached session values when
+// these fields are absent from the hum message (see daemon.ts "prompt" case).
+// Invalidated on compaction / cancel by clearSessionHashes(sid).
+const lastSystemPromptHash = new Map<string, string>();
+const lastPermissionsHash = new Map<string, string>();
+const lastAllowedToolsHash = new Map<string, string>();
+
+function cheapHash(s: string): string {
+  // Non-cryptographic, fast, sufficient for same-content detection.
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return h.toString(36) + ":" + s.length;
+}
+
+export function clearSessionHashes(sid: string): void {
+  lastSystemPromptHash.delete(sid);
+  lastPermissionsHash.delete(sid);
+  lastAllowedToolsHash.delete(sid);
+  lastAllowedTools.delete(sid);
+}
 
 const AGENT_DENY: Record<string, Set<string>> = {
   plan: new Set(["edit", "write"]),
@@ -685,6 +724,28 @@ export class ClwndModel implements LanguageModelV3 {
     const skipGraft = isEmptyTools;
     if (skipGraft) trace("graft.skip", { method: "doStream", sid, reason: "emptyTools", toolsLen: opts.tools?.length ?? "undefined" });
 
+    // Auxiliary calls (empty tools = compaction summaries per AUXILIARY_CALLS.md)
+    // get routed to a cheaper model. Spawn is already fresh for these calls so
+    // the swap costs nothing extra. Only affects this single turn's hum — the
+    // session's primary modelId in OC is untouched.
+    const effectiveModel = isEmptyTools ? pickAuxModel(self.modelId) : self.modelId;
+    if (effectiveModel !== self.modelId) trace("aux.model.routed", { sid, primary: self.modelId, aux: effectiveModel });
+
+    // Hash-dedup of per-turn hygiene fields. systemPrompt / permissions /
+    // allowedTools rarely change during a session — the daemon falls back to
+    // its cached session values when these fields are omitted, so dedup'd
+    // turns just skip the re-serialization and hum-socket transmission.
+    const systemPromptHash = cheapHash(systemPrompt);
+    const permissionsHash = cheapHash(JSON.stringify(permissions));
+    const allowedToolsHash = cheapHash(allowedTools.join(","));
+    const sendSystemPrompt = lastSystemPromptHash.get(sid) !== systemPromptHash;
+    const sendPermissions = lastPermissionsHash.get(sid) !== permissionsHash;
+    const sendAllowedTools = lastAllowedToolsHash.get(sid) !== allowedToolsHash;
+    if (sendSystemPrompt) lastSystemPromptHash.set(sid, systemPromptHash);
+    if (sendPermissions) lastPermissionsHash.set(sid, permissionsHash);
+    if (sendAllowedTools) lastAllowedToolsHash.set(sid, allowedToolsHash);
+    trace("hum.dedup", { sid, sp: sendSystemPrompt, perm: sendPermissions, tools: sendAllowedTools });
+
     // Brokered tool return — permission returns must listen for Claude's remaining output
     let permAskId: string | null = null;
     const isPermReturn = isBrokeredToolReturn(opts.prompt) && (() => {
@@ -740,12 +801,21 @@ export class ClwndModel implements LanguageModelV3 {
     });
 
     // Detect compaction: petal count dropped >50% — OC compacted, reset Claude JSONL
+    // Also decide whether to elide priorPetals from the hum payload: if the
+    // petal count hasn't changed since the last send, graft() would be a no-op
+    // anyway (graft is count-idempotent), and we can save re-serializing the
+    // whole history over the hum socket.
+    let prevPetalCount = 0;
+    let elidePriorPetals = false;
     if (!skipGraft) {
-      const prev = sessionPetalCounts.get(sid) ?? 0;
+      prevPetalCount = sessionPetalCounts.get(sid) ?? 0;
       sessionPetalCounts.set(sid, priorPetals.length);
-      if (prev > 0 && priorPetals.length < prev * 0.5) {
-        trace("compaction.detected", { sid, prev, now: priorPetals.length });
+      if (prevPetalCount > 0 && priorPetals.length < prevPetalCount * 0.5) {
+        trace("compaction.detected", { sid, prev: prevPetalCount, now: priorPetals.length });
         hum({ chi: "cancel", sid, reason: "compaction" });
+      } else if (prevPetalCount === priorPetals.length && prevPetalCount > 0) {
+        elidePriorPetals = true;
+        trace("priorPetals.elided", { sid, count: priorPetals.length });
       }
     }
 
@@ -772,7 +842,7 @@ export class ClwndModel implements LanguageModelV3 {
       // Order matters — Claude's post-permission events must have a listener
       hum({
         chi: "prompt", sid, cwd,
-        modelId: self.modelId,
+        modelId: effectiveModel,
         listenOnly: true,
         dusk: duskIn(30_000),
       });
@@ -784,12 +854,15 @@ export class ClwndModel implements LanguageModelV3 {
     } else if (!listenOnly && humAlive) {
       hum({
         chi: "prompt", sid, cwd,
-        modelId: self.modelId,
-        content, text, systemPrompt,
-        permissions, allowedTools, listenOnly,
+        modelId: effectiveModel,
+        content, text,
+        ...(sendSystemPrompt ? { systemPrompt } : {}),
+        ...(sendPermissions ? { permissions } : {}),
+        ...(sendAllowedTools ? { allowedTools } : {}),
+        listenOnly,
         skipGraft: skipGraft || undefined,
         ocServerUrl: self.config.pluginInput?.serverUrl?.toString(),
-        priorPetals,
+        ...(elidePriorPetals ? {} : { priorPetals }),
         externalTools: externalTools.length > 0 ? externalTools : undefined,
         mcpServerConfigs: await getMcpServerConfigs(this.config.client),
         visibleTools: allToolNames,

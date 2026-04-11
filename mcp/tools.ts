@@ -185,7 +185,37 @@ export interface ToolResult {
   metadata?: Record<string, unknown>;
 }
 
-function execRead(args: { file_path: string; offset?: number; limit?: number; symbol?: string; query?: string }): ToolResult {
+// Per-session "already read in this session" cache. Keyed by sid → path → mtime.
+// When Claude re-reads an unchanged file during a session, we return a short
+// placeholder instead of the full content. The full content is still in the
+// conversation from the earlier turn (cache-replayed for free), so re-serving
+// it just doubles the cached context weight forever. This single optimisation
+// targets the single biggest penny burn in the JSONL dissection: daemon.ts
+// was Read 558 times in one session, ~39MB of redundant content.
+//
+// execEdit/execWrite invalidate entries so the next read is fresh. Offset /
+// limit / symbol / query variants skip the cache — they return partial views
+// and shouldn't be substituted with "unchanged".
+const readCache = new Map<string, Map<string, number>>();
+
+function readCacheCheck(sessionId: string, absPath: string, mtime: number): boolean {
+  const sess = readCache.get(sessionId);
+  return !!sess && sess.get(absPath) === mtime;
+}
+function readCacheMark(sessionId: string, absPath: string, mtime: number): void {
+  let sess = readCache.get(sessionId);
+  if (!sess) { sess = new Map(); readCache.set(sessionId, sess); }
+  sess.set(absPath, mtime);
+}
+function readCacheInvalidate(sessionId: string | undefined, absPath: string): void {
+  if (!sessionId) { for (const sess of readCache.values()) sess.delete(absPath); return; }
+  readCache.get(sessionId)?.delete(absPath);
+}
+export function clearReadCache(sessionId: string): void {
+  readCache.delete(sessionId);
+}
+
+function execRead(args: { file_path: string; offset?: number; limit?: number; symbol?: string; query?: string }, sessionId?: string): ToolResult {
   const p = assertPath(args.file_path);
   checkPermission("read", p);
   if (!existsSync(p)) return { output: `Error: ${p} does not exist`, title: p };
@@ -195,6 +225,22 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
     if (stat.isDirectory()) {
       const out = execSync(`ls -la "${p}"`, { encoding: "utf-8", timeout: 5000 });
       return { output: out, title: relative(CWD, p) || p };
+    }
+
+    // Full-file reads (no offset/limit/symbol/query) are the dedup candidates.
+    // Partial views vary by args and must not be substituted with "unchanged".
+    const isFullRead = !args.offset && !args.limit && !args.symbol && !args.query;
+    if (sessionId && isFullRead && stat.isFile()) {
+      const mtime = stat.mtimeMs;
+      if (readCacheCheck(sessionId, p, mtime)) {
+        trace("read.cached", { sid: sessionId, path: p, size: stat.size });
+        return {
+          output: `[clwnd: ${p} (${stat.size} bytes) was already read earlier in this session and has not changed — content is still in conversation context, not re-reading. Use offset/limit/symbol/query to force a fresh partial read, or edit the file first to invalidate the cache.]`,
+          title: relative(CWD, p) || p,
+          metadata: { cached: true, loaded: [p] },
+        };
+      }
+      // Mark AFTER the real read succeeds (below)
     }
   } catch {}
 
@@ -256,6 +302,10 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
     const truncated = totalLines > offset + limit;
     const numbered = slice.map((line, i) => `${offset + i + 1}\t${line}`).join("\n");
     const suffix = truncated ? `\n[... truncated — showing ${slice.length} of ${totalLines} lines. Use offset/limit or symbol parameter to read specific sections.]` : "";
+    // Mark as "in context" only for full reads — partial views don't dedup.
+    if (sessionId && !args.offset && !args.limit && !args.symbol && !args.query && !truncated) {
+      try { readCacheMark(sessionId, p, statSync(p).mtimeMs); } catch {}
+    }
     return {
       output: outline + numbered + suffix,
       title: relPath,
@@ -266,7 +316,7 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
   }
 }
 
-function execEdit(args: { file_path: string; old_string: string; new_string: string; replace_all?: boolean }): ToolResult {
+function execEdit(args: { file_path: string; old_string: string; new_string: string; replace_all?: boolean }, sessionId?: string): ToolResult {
   const p = assertPath(args.file_path);
   checkPermission("edit", p);
   if (!existsSync(p)) return { output: `Error: ${p} does not exist` };
@@ -286,6 +336,8 @@ function execEdit(args: { file_path: string; old_string: string; new_string: str
   }
 
   writeFileSync(p, content);
+  // Invalidate read cache — a subsequent read should get the new content.
+  readCacheInvalidate(sessionId, p);
 
   // Generate unified diff
   let diff = "";
@@ -301,13 +353,14 @@ function execEdit(args: { file_path: string; old_string: string; new_string: str
   };
 }
 
-function execWrite(args: { file_path: string; content: string }): ToolResult {
+function execWrite(args: { file_path: string; content: string }, sessionId?: string): ToolResult {
   const p = assertPath(args.file_path);
   checkPermission("write", p);
   const dir = dirname(p);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const existed = existsSync(p);
   writeFileSync(p, args.content);
+  readCacheInvalidate(sessionId, p);
   return {
     output: `Wrote ${p}`,
     title: relative(CWD, p) || p,
@@ -315,7 +368,11 @@ function execWrite(args: { file_path: string; content: string }): ToolResult {
   };
 }
 
-const BASH_MAX_OUTPUT = 50 * 1024; // 50KB
+// Cap bash output at 16KB — per-turn Anthropic cost scales with everything
+// that lands in the conversation. A 50KB journal/strings dump that gets
+// cache-replayed for the rest of the session is a direct $ burn. Users can
+// `command > /tmp/out && head -c 16k /tmp/out` when they need more.
+const BASH_MAX_OUTPUT = 16 * 1024;
 
 function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
@@ -665,9 +722,9 @@ async function executeExternalTool(sessionId: string, toolName: string, args: Re
 export async function executeTool(name: string, args: Record<string, unknown>, _callId?: string, sessionId?: string): Promise<ToolResult> {
   if (name !== "permission_prompt") trace("mcp.tool.executed", { tool: name });
   switch (name) {
-    case "read": return execRead(args as any);
-    case "edit": return execEdit(args as any);
-    case "write": return execWrite(args as any);
+    case "read": return execRead(args as any, sessionId);
+    case "edit": return execEdit(args as any, sessionId);
+    case "write": return execWrite(args as any, sessionId);
     case "bash": return execBash(args as any);
     case "glob": return execGlob(args as any);
     case "grep": return execGrep(args as any);
