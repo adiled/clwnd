@@ -30,10 +30,100 @@ case "$CMD" in
     OS="$(uname -s)"
 
     if [ "$OS" = "Darwin" ]; then
-      launchctl print "gui/$(id -u)/com.clwnd.daemon" 2>/dev/null | head -5 || echo "daemon not running"
+      # Capture launchctl output first — piping directly to head swallows
+      # the failure exit code so the `|| echo "daemon not running"` branch
+      # would never fire. Do it in two steps so we can tell them apart.
+      OUT=$(launchctl print "gui/$(id -u)/com.clwnd.daemon" 2>&1)
+      if [ $? -eq 0 ]; then
+        echo "$OUT" | head -5
+      else
+        echo "daemon not running (launchctl: $OUT)"
+      fi
     else
-      $SC status clwnd 2>/dev/null | head -5 || echo "daemon not running"
+      if $SC is-active --quiet clwnd; then
+        $SC status clwnd 2>/dev/null | head -5
+      else
+        echo "daemon not running"
+      fi
     fi
+    ;;
+  doctor)
+    OS="$(uname -s)"
+    XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+    echo "clwnd doctor"
+    echo "  os:         $OS"
+    echo "  version:    $(cat "$CLWND_SRC/package.json" | grep '"version"' | head -1 | sed 's/.*"\([0-9.]*\)".*/\1/')"
+    echo "  src:        $CLWND_SRC ($(cd "$CLWND_SRC" && git describe --tags --exact-match 2>/dev/null || echo 'not a tag'))"
+    echo
+    echo "── process ──"
+    PIDS=$(pgrep -f "dist/daemon/index.js" 2>/dev/null || true)
+    if [ -n "$PIDS" ]; then
+      ps -o pid,user,etime,command -p $PIDS 2>/dev/null || true
+    else
+      echo "  no daemon process found"
+    fi
+    echo
+    echo "── port 29147 ──"
+    if command -v lsof >/dev/null 2>&1; then
+      lsof -iTCP:29147 -sTCP:LISTEN 2>/dev/null || echo "  nothing listening"
+    elif command -v ss >/dev/null 2>&1; then
+      ss -tlnp 2>/dev/null | grep 29147 || echo "  nothing listening"
+    else
+      echo "  (no lsof/ss available)"
+    fi
+    echo
+    echo "── service ──"
+    if [ "$OS" = "Darwin" ]; then
+      PLIST="$HOME/Library/LaunchAgents/com.clwnd.daemon.plist"
+      if [ -f "$PLIST" ]; then
+        echo "  plist:      $PLIST (exists)"
+      else
+        echo "  plist:      $PLIST (MISSING — run: clwnd update)"
+      fi
+      if launchctl print "gui/$(id -u)/com.clwnd.daemon" >/dev/null 2>&1; then
+        echo "  launchctl:  loaded"
+      else
+        echo "  launchctl:  NOT loaded (run: clwnd restart)"
+      fi
+      STDOUT_LOG="$XDG_STATE_HOME/clwnd/daemon.stdout.log"
+      STDERR_LOG="$XDG_STATE_HOME/clwnd/daemon.stderr.log"
+      for f in "$STDOUT_LOG" "$STDERR_LOG"; do
+        if [ -f "$f" ]; then
+          SIZE=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+          MTIME=$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$f" 2>/dev/null || stat -c '%y' "$f" 2>/dev/null)
+          echo "  $(basename "$f"): ${SIZE}B  (modified $MTIME)"
+        else
+          echo "  $(basename "$f"): missing"
+        fi
+      done
+    else
+      IS_ROOT=$([ "$(id -u)" = "0" ] && echo true || echo false)
+      SC="systemctl"
+      $IS_ROOT || SC="systemctl --user"
+      UNIT_FILE="$HOME/.config/systemd/user/clwnd.service"
+      $IS_ROOT && UNIT_FILE="/etc/systemd/system/clwnd.service"
+      if [ -f "$UNIT_FILE" ]; then
+        echo "  unit:       $UNIT_FILE (exists)"
+      else
+        echo "  unit:       $UNIT_FILE (MISSING)"
+      fi
+      if $SC is-active --quiet clwnd 2>/dev/null; then
+        echo "  systemd:    active"
+      else
+        echo "  systemd:    not active"
+      fi
+    fi
+    echo
+    echo "── socket ──"
+    SOCK="$XDG_RUNTIME_DIR/clwnd/clwnd.sock"
+    for ext in "" ".hum" ".http"; do
+      if [ -S "${SOCK}${ext}" ]; then
+        echo "  ${SOCK}${ext}: ok"
+      else
+        echo "  ${SOCK}${ext}: missing"
+      fi
+    done
     ;;
   logs)
     IS_ROOT=$([ "$(id -u)" = "0" ] && echo true || echo false)
@@ -41,7 +131,24 @@ case "$CMD" in
 
     if [ "$OS" = "Darwin" ]; then
       XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
-      tail -f "$XDG_STATE_HOME/clwnd/daemon.stdout.log" "$XDG_STATE_HOME/clwnd/daemon.stderr.log"
+      STDOUT_LOG="$XDG_STATE_HOME/clwnd/daemon.stdout.log"
+      STDERR_LOG="$XDG_STATE_HOME/clwnd/daemon.stderr.log"
+      # Tell the user up-front what we're going to tail and warn if the
+      # files are absent or empty — BSD `tail -f` on a missing file dies
+      # fast with a terse error, and on an empty file it just sits there
+      # forever showing nothing, neither of which tells you *why*.
+      for f in "$STDOUT_LOG" "$STDERR_LOG"; do
+        if [ ! -f "$f" ]; then
+          echo "  $f: missing (daemon has never written here — run 'clwnd doctor')"
+        elif [ ! -s "$f" ]; then
+          echo "  $f: empty"
+        else
+          echo "  $f: $(wc -l < "$f" | tr -d ' ') lines"
+        fi
+      done
+      echo "--- tailing ---"
+      # -F (capital) retries on missing files instead of exiting
+      tail -F "$STDOUT_LOG" "$STDERR_LOG"
     else
       if $IS_ROOT; then
         journalctl -u clwnd -f
@@ -145,6 +252,7 @@ except Exception as e:
     echo "  force      Fresh install from remote (bypasses cache)"
     echo "  restart    Restart the daemon"
     echo "  status     Show daemon status"
+    echo "  doctor     Full diagnostic probe (process, port, service, socket)"
     echo "  logs       Tail daemon logs"
     echo "  sessions   List tracked sessions"
     echo "  savings    Show penny-pincher counters (read dedup, bash cap, context warning, plugin-side dedup)"
