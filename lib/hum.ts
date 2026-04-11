@@ -463,8 +463,16 @@ export class Drone {
     const s = tone.sigil as string;
     if (s) {
       const state = this.getOrCreate(s);
-      if (chi === "pulse" && tone.kind === "roost-died") {
+      // Any process-death pulse resets per-process counters. Claude CLI's
+      // subprocess just ended — anything in flight is gone, the accumulated
+      // mid-turn response text is gone, the suspicion flag is about the
+      // turn that just died. Keep pendingEchoes, wane counters, and
+      // missedBeats — those are plugin↔daemon channel state, not process
+      // state, and they survive the kill.
+      if (chi === "pulse" && (tone.kind === "roost-died" || tone.kind === "roost-evicted" || tone.kind === "roost-idle")) {
         state.inflightTools = 0;
+        state.responseText = "";
+        state.suspicious = false;
       }
       this.resetSilence(s);
     }

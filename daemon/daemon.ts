@@ -80,6 +80,11 @@ class ClaudeNest {
     if (session?.needsRespawn) {
       if (roost) {
         trace("nest.respawn", { poolKey, reason: "seed" });
+        // Synchronously emit roost-died so the drone's pulse handler resets
+        // per-process counters. The proc.exited async handler skips its
+        // own emission on the stale branch (current !== roost after the map
+        // mutates below), so without this the drone's inflightTools leaks.
+        humPulse("roost-died", poolKey, { pid: roost.proc.pid, reason: "respawn" });
         try { roost.proc.kill(); } catch {}
         this.roosts.delete(poolKey);
         roost = undefined;
@@ -179,6 +184,12 @@ class ClaudeNest {
       if (roost.activeSid === sessionId) roost.activeSid = null;
       if (roost.listeners.size === 0) {
         trace("nest.felled", { poolKey, pid: roost.proc.pid });
+        // Emit roost-died BEFORE the kill + map delete. The async
+        // proc.exited handler checks `current === roost` and skips its own
+        // emission once the map no longer holds this entry (stale branch),
+        // so the drone would never hear this process die. Synchronous pulse
+        // here gives the drone's pulse handler a chance to reset counters.
+        humPulse("roost-died", poolKey, { pid: roost.proc.pid, reason: "felled" });
         try { roost.proc.kill(); } catch {}
         this.roosts.delete(poolKey);
         const timer = this.idleTimers.get(poolKey);
