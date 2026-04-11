@@ -42,3 +42,11 @@ Core workflow is operational (more coming). See [compatibility](https://github.c
 MCP servers configured in `opencode.json` are available to Claude. clwnd's daemon spawns and proxies local MCP servers (e.g. context7). Auth-bound (OAuth) MCPs are not yet supported.
 
 clwnd denies file writes in directories parent to `cwd`. Until ask is supported for that, you can use [`opencode-dir`](https://github.com/adiled/opencode-dir) plugin's `/cd` and `/mv` commands to relocate your session to the desired directory.
+
+**Tips**
+
+clwnd currently relies on opencode as _the harness_ because of thorough customizability. Utilize its configuration to the fullest.
+
+- clwnd sanitizes prompts to ensure undisrupted usage, ensure any custom prompts do not depend on xml tags and second-person attributions
+- clwnd greatly strips away commonly expected file system tools by any harness, with more superior code and non-code tooling, but does not dictate prompt engineering or reminders around them yet, so take control of that as needed
+- clwnd code analysis and authoring tools are pure AST-based and are limited to few languages, more can be added on-demand
