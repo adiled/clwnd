@@ -7,7 +7,16 @@
 import { readFileSync, statSync } from "fs";
 import { extname } from "path";
 
-// Lazy-loaded parser and languages
+// Lazy-loaded parser and languages.
+//
+// IMPORTANT: do NOT add `import "tree-sitter-X"` at the top of this file
+// for any grammar. Grammars are loaded ON DEMAND inside getLanguage() via
+// require(grammar) — a daemon process that only ever sees TypeScript
+// will never pull tree-sitter-python / -java / -cpp / etc. into memory.
+// Each grammar package is a few MB of compiled state machines + queries;
+// loading all 12 eagerly would add 30-50MB to the daemon RSS for no
+// benefit. The tsup config (tsup.config.ts) lists every grammar in its
+// `external` array so the bundler won't ever inline them either.
 let Parser: any = null;
 const languages = new Map<string, any>();
 
