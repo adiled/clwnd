@@ -595,20 +595,19 @@ interface Session {
   lastSystemPrompt?: string;
   lastPermissions?: unknown[];
   lastAllowedTools?: string[];
-  // Largest per-turn input context (fresh + cache_create + cache_read) seen
-  // so far, captured from the result event's usage block. Drives the context
-  // rotation threshold — every per-turn cost scales linearly with this, and
-  // the JSONL dissection shows long sessions climbing from ~25K to 800K+.
+  // Largest per-turn input context (input + cache_create + cache_read) seen
+  // so far, captured from each result event's usage block. Pure observation:
+  // surfaced via `clwnd savings` and used to emit a warning trace when a
+  // session climbs past CONTEXT_WARN_THRESHOLD. Context reduction is OC's
+  // job — clwnd does not mutate session state on this signal.
   maxContextTokens?: number;
 }
 
-// Rotation threshold — when max per-turn input context crosses this value,
-// clwnd tears down the current Claude CLI process + JSONL on the next prompt
-// and lets graft cold-start a fresh session from OC's priorPetals. OC-side
-// history is preserved; only Claude's internal chain state resets. Trade-off:
-// a short latency hit on the rotation turn, vs. paying the climbing cache-
-// read tax for the rest of the session.
-const CONTEXT_ROTATE_THRESHOLD = Number(process.env.CLWND_CONTEXT_ROTATE ?? "300000");
+// Advisory threshold. When a session's peak per-turn input context crosses
+// this value, clwnd emits a `context.over.threshold.warning` trace on the
+// next prompt and bumps `penny.contextOverThreshold`. Operator-facing signal
+// only — no state mutation.
+const CONTEXT_WARN_THRESHOLD = Number(process.env.CLWND_CONTEXT_WARN ?? "300000");
 
 const STATE_DIR = process.env.XDG_STATE_HOME
   ? `${process.env.XDG_STATE_HOME}/clwnd`
@@ -1002,27 +1001,17 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         return;
       }
 
-      // Context rotation: if the last turn's input context crossed the
-      // threshold, tear down the Claude CLI process + JSONL and let graft
-      // cold-start a fresh session. Same teardown shape as "cancel/compaction"
-      // — the next real prompt will cold-start from priorPetals.
-      if (!msg.listenOnly && (session.maxContextTokens ?? 0) > CONTEXT_ROTATE_THRESHOLD) {
-        penny.rotations++;
-        trace("rotation.triggered", {
+      // Advisory: if the prior turn's peak input context crossed the warning
+      // threshold, emit a trace and bump the penny counter so an operator
+      // sees a session climbing toward the cache-replay tax. No state
+      // mutation; OC owns context reduction.
+      if (!msg.listenOnly && (session.maxContextTokens ?? 0) > CONTEXT_WARN_THRESHOLD) {
+        penny.contextOverThreshold++;
+        trace("context.over.threshold.warning", {
           sid,
           maxCtx: session.maxContextTokens,
-          threshold: CONTEXT_ROTATE_THRESHOLD,
+          threshold: CONTEXT_WARN_THRESHOLD,
         });
-        try { nest.fell(sid, sid); } catch {}
-        if (session.claudeSessionPath) {
-          try { unlinkSync(session.claudeSessionPath); } catch {}
-          trace("rotation.jsonl.deleted", { sid, path: session.claudeSessionPath });
-        }
-        session.claudeSessionId = null;
-        session.claudeSessionPath = null;
-        session.lastSyncedPetal = null;
-        session.maxContextTokens = 0;
-        saveSessions(sid);
       }
 
       // Graft: sync OC petals into Claude JSONL before spawning (skip for title gen / empty tools)
@@ -1223,16 +1212,14 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
             const tip = lastUuid(session.claudeSessionPath);
             if (tip) session.lastSyncedPetal = tip;
           }
-          // Track peak per-turn input context. This drives context rotation.
+          // Track peak per-turn input context for observability — surfaced
+          // by `clwnd savings` and used by the next-prompt warning trace.
+          // No destructive action attached: clwnd does not rotate sessions.
           if (harvest.usage) {
             const u = harvest.usage;
             const turnCtx = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
             if (turnCtx > (session.maxContextTokens ?? 0)) {
               session.maxContextTokens = turnCtx;
-              if (turnCtx > CONTEXT_ROTATE_THRESHOLD) {
-                penny.contextOverThreshold++;
-                trace("context.over.threshold", { sid, turnCtx, threshold: CONTEXT_ROTATE_THRESHOLD });
-              }
             }
           }
           trace("nest.wilt", { sid, finishReason: harvest.finishReason, maxCtx: session.maxContextTokens });
@@ -1279,15 +1266,24 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       if (session) {
         trace("nest.cancelled", { sid, reason: msg.reason });
         if (msg.reason === "compaction") {
-          // Compaction: kill process, delete JSONL, reset — next prompt cold-starts from compacted prompt
+          // Compaction: kill the running Claude CLI process and TRUNCATE the
+          // existing JSONL in place. The claudeSessionId / claudeSessionPath
+          // STAY THE SAME — clwnd's invariant is one-OC-session-to-one-Claude-
+          // session, stable for the lifetime of the OC session. Next prompt
+          // takes the warm-path graft, which sees an effectively-empty JSONL
+          // (just the summary header) and writes the compacted history into
+          // it. Claude resumes from the same uuid with fresh content.
           nest.fell(sid, sid);
-          if (session.claudeSessionPath) {
-            try { unlinkSync(session.claudeSessionPath); } catch {}
-            trace("compaction.jsonl.deleted", { sid, path: session.claudeSessionPath });
+          if (session.claudeSessionPath && session.claudeSessionId) {
+            try {
+              createClaudeSession(session.cwd, session.claudeSessionId);
+              trace("compaction.jsonl.truncated", { sid, path: session.claudeSessionPath });
+            } catch (e) {
+              trace("compaction.truncate.failed", { sid, err: String(e) });
+            }
           }
           session.lastSyncedPetal = null;
-          session.claudeSessionId = null;
-          session.claudeSessionPath = null;
+          session.needsRespawn = true;
           saveSessions(sid);
         } else if (msg.reason === "swallow") {
           // Drone swallow: kill process — plugin re-sends prompt, daemon re-seeds via graft
@@ -1476,7 +1472,7 @@ Bun.serve({
       return Response.json({
         uptimeMs: Date.now() - penny.started,
         counters: penny,
-        rotateThreshold: Number(process.env.CLWND_CONTEXT_ROTATE ?? "300000"),
+        contextWarnThreshold: CONTEXT_WARN_THRESHOLD,
         topContextSessions: sessionCtx.slice(0, 10),
       });
     }

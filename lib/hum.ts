@@ -67,7 +67,11 @@ export interface BreathSession {
   sid: string;
   claudeSessionId: string | null;
   claudeSessionPath: string | null;
-  lastSyncedPetal: [string, string] | null;
+  // uuid of the last JSONL entry clwnd considers "in sync" with OC's petals.
+  // graft() returns a plain uuid string; the wire type used to be a tuple of
+  // [uuid, role] but the role half was never populated. Kept as string to
+  // match reality — change both ends if role information is ever needed.
+  lastSyncedPetal: string | null;
   wane: number;
   modelId: string;
   cwd: string;

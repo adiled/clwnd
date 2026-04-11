@@ -907,7 +907,15 @@ async function getMcpClient(config: McpServerConfig): Promise<McpClient> {
 function mcpRpc(client: McpClient, method: string, params?: unknown, notification = false): Promise<unknown> {
   const id = notification ? undefined : client.nextId++;
   const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
-  client.proc.stdin.write(msg);
+  // We always spawn with stdin: "pipe" so the sink is a FileSink. Bun's
+  // generic type widens to `number | FileSink | undefined` when the generics
+  // aren't inferred at the call site; narrow defensively so any future spawn
+  // config change that drops the pipe fails loudly instead of silently.
+  const sink = client.proc.stdin;
+  if (!sink || typeof sink === "number") {
+    throw new Error(`mcp client stdin is not a writable sink (server=${client.config.name})`);
+  }
+  sink.write(msg);
   if (notification) return Promise.resolve(null);
   return new Promise((resolve) => {
     const timer = setTimeout(() => {

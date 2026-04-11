@@ -160,7 +160,13 @@ type HumListener = (msg: Record<string, unknown>) => void;
 
 let humSocket: NetSocket | null = null;
 let humEcho = "";
-let humHearer: HumListener | null = null;
+// Per-session listeners. Keyed by sid so concurrent doStream calls (build +
+// compaction + title + summarize, often from different sessions) don't clobber
+// each other's finish handlers. Earlier versions had a single global humHearer
+// which was overwritten by every new doStream, causing finishes to be
+// delivered to the wrong stream — manifesting as hung turns and scrambled
+// session state. See the compaction hang incident.
+const humHearers = new Map<string, HumListener>();
 let humAlive = false;
 let humReady: { resolve: () => void } | null = null;
 let humAwaken: Promise<void> = awakenHum();
@@ -213,7 +219,15 @@ async function awakenHum(): Promise<void> {
             continue;
           }
           if (msg.chi === "pulse") { trace("hum.pulse", { kind: msg.kind, sid: msg.sid }); continue; }
-          if (humHearer) humHearer(msg);
+          // Dispatch stream events to the per-session listener. Every clwnd
+          // hum event that belongs to a stream carries sid — pulses, breaths
+          // and echoes (handled above) do not, and they reach all sessions by
+          // design. Missing sid means the message is not stream-bound; drop.
+          const msgSid = typeof msg.sid === "string" ? msg.sid : undefined;
+          if (msgSid) {
+            const h = humHearers.get(msgSid);
+            if (h) h(msg);
+          }
         } catch {}
       }
     });
@@ -255,15 +269,15 @@ export function hum(msg: Record<string, unknown>): void {
   }
 }
 
-function humHear(onMessage: HumListener): Promise<void> {
+function humHear(sid: string, onMessage: HumListener): Promise<void> {
   return new Promise<void>((resolve) => {
-    humHearer = (incoming) => {
+    humHearers.set(sid, (incoming) => {
       onMessage(incoming);
       if (incoming.chi === "finish" || incoming.chi === "error") {
-        humHearer = null;
+        humHearers.delete(sid);
         resolve();
       }
-    };
+    });
   });
 }
 
@@ -781,8 +795,13 @@ export class ClwndModel implements LanguageModelV3 {
       if (!lt || !Array.isArray(lt.content)) return false;
       for (const p of lt.content) {
         if (p.type === "tool-result" && p.toolCallId?.startsWith("perm-")) {
-          // V3 tool-result: output is {type:"text",value:"..."} envelope from OC
-          const rawOutput = (p as Record<string, unknown>).output ?? (p as Record<string, unknown>).result;
+          // V3 tool-result on the PROMPT side uses `output: {type,value}` —
+          // see LanguageModelV3ToolResultPart. We still probe `.result` as a
+          // compat shim for older plugin/AI-SDK revisions where the field
+          // name differed. Double-cast through `unknown` because V3 tightly
+          // types the output shape and we're reading a pre-envelope blob.
+          const loose = p as unknown as { output?: unknown; result?: unknown };
+          const rawOutput = loose.output ?? loose.result;
           try {
             const outer = typeof rawOutput === "string" ? JSON.parse(rawOutput) : rawOutput;
             const inner = outer?.value ?? outer;
@@ -926,6 +945,11 @@ export class ClwndModel implements LanguageModelV3 {
         function wilt(): void {
           if (done) return;
           done = true;
+          // Evict this session's listener even when wilting was triggered by
+          // abort/error (not by chi=finish). Leaving a stale entry in the map
+          // would leak memory and, worse, trap any same-sid follow-up events
+          // intended for the next doStream.
+          humHearers.delete(sid);
           try { controller.close(); } catch {}
         }
 
@@ -948,7 +972,7 @@ export class ClwndModel implements LanguageModelV3 {
 
         petal({ type: "stream-start", warnings: [] });
 
-        const humFade = humHear(onHummin);
+        const humFade = humHear(sid, onHummin);
         if (!promptSent) {
           hum({
             chi: "prompt", sid, cwd,

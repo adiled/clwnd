@@ -20,8 +20,7 @@ export interface Penny {
   bashTruncated: number;      // bash calls that hit the 16KB cap
   bashBytesTrimmed: number;   // total bytes trimmed off bash output
   // Daemon session-level
-  rotations: number;          // context-threshold rotations fired
-  contextOverThreshold: number; // turns where per-turn context exceeded the threshold
+  contextOverThreshold: number; // prompts where last turn's per-turn context exceeded the warning threshold
   // Plugin-side (sent via pennyDelta on each prompt hum)
   humDedup: number;           // prompt hums with ≥1 dedup'd field (sp/perm/tools)
   reminderStripped: number;   // system-reminder blocks stripped as duplicates
@@ -37,7 +36,6 @@ export const penny: Penny = {
   readDedupBytes: 0,
   bashTruncated: 0,
   bashBytesTrimmed: 0,
-  rotations: 0,
   contextOverThreshold: 0,
   humDedup: 0,
   reminderStripped: 0,
@@ -51,7 +49,6 @@ export function pennyReset(): void {
   penny.readDedupBytes = 0;
   penny.bashTruncated = 0;
   penny.bashBytesTrimmed = 0;
-  penny.rotations = 0;
   penny.contextOverThreshold = 0;
   penny.humDedup = 0;
   penny.reminderStripped = 0;
@@ -66,7 +63,6 @@ export function pennyAdd(delta: PennyDelta): void {
   if (typeof delta.readDedupBytes === "number") penny.readDedupBytes += delta.readDedupBytes;
   if (typeof delta.bashTruncated === "number") penny.bashTruncated += delta.bashTruncated;
   if (typeof delta.bashBytesTrimmed === "number") penny.bashBytesTrimmed += delta.bashBytesTrimmed;
-  if (typeof delta.rotations === "number") penny.rotations += delta.rotations;
   if (typeof delta.contextOverThreshold === "number") penny.contextOverThreshold += delta.contextOverThreshold;
   if (typeof delta.humDedup === "number") penny.humDedup += delta.humDedup;
   if (typeof delta.reminderStripped === "number") penny.reminderStripped += delta.reminderStripped;
@@ -84,7 +80,6 @@ export function pennyLoad(path: string): void {
     penny.readDedupBytes = data.readDedupBytes ?? 0;
     penny.bashTruncated = data.bashTruncated ?? 0;
     penny.bashBytesTrimmed = data.bashBytesTrimmed ?? 0;
-    penny.rotations = data.rotations ?? 0;
     penny.contextOverThreshold = data.contextOverThreshold ?? 0;
     penny.humDedup = data.humDedup ?? 0;
     penny.reminderStripped = data.reminderStripped ?? 0;

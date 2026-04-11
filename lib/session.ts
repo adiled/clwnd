@@ -503,7 +503,11 @@ export function graft(
   // Count user-text messages (not tool_results) — same filter both sides
   const jUsers = countJsonlTurns(existing);
   const pUsers = countTurns(history);
-  const anchored = lastSyncedPetal && existing.some(e => (e as Record<string, unknown>).uuid === lastSyncedPetal);
+  // existing is ClaudeEntry[] — a tagged union where some members (e.g.
+  // ClaudeLastPrompt) don't declare `uuid`. All the real-on-disk entries do
+  // carry one; we probe it opaquely via the double cast rather than adding
+  // `uuid` to every member of the union for one lookup.
+  const anchored = lastSyncedPetal && existing.some(e => (e as unknown as { uuid?: string }).uuid === lastSyncedPetal);
 
   // Synced: anchor valid AND JSONL covers all prompt turns
   if (anchored && jUsers >= pUsers) {
@@ -678,8 +682,10 @@ export function sanitizeJsonl(path: string): SanitizeResult {
             i++; // skip the user entry too
             continue;
           }
-        } else if (!nextUser || nextUser.type !== "user") {
-          // No user entry following tool_use — dangling
+        } else {
+          // No user entry following tool_use — dangling. (Any ClaudeUserEntry
+          // with type "user" is guaranteed to have "message" by construction,
+          // so the previous branch fully covers the "user-with-results" case.)
           rules.push("dangling-tool-use");
           continue;
         }

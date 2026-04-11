@@ -117,7 +117,7 @@ try:
     print('Daemon-side:')
     print(f'  Read dedup:        {c.get(\"readDedupHits\", 0):>7}  hits   ({kb(c.get(\"readDedupBytes\", 0))} not re-sent)')
     print(f'  Bash cap:          {c.get(\"bashTruncated\", 0):>7}  hits   ({kb(c.get(\"bashBytesTrimmed\", 0))} trimmed)')
-    print(f'  Rotations:         {c.get(\"rotations\", 0):>7}         (threshold {d.get(\"rotateThreshold\", 300000):,} tokens, {c.get(\"contextOverThreshold\", 0)} turns over)')
+    print(f'  Context warning:   {c.get(\"contextOverThreshold\", 0):>7}  prompts where last turn crossed {d.get(\"contextWarnThreshold\", 300000):,} tokens')
     print()
     print('Plugin-side:')
     print(f'  Reminder stripped: {c.get(\"reminderStripped\", 0):>7}')
@@ -148,7 +148,7 @@ except Exception as e:
     echo "  status     Show daemon status"
     echo "  logs       Tail daemon logs"
     echo "  sessions   List tracked sessions"
-    echo "  savings    Show penny-pincher counters (read dedup, bash cap, rotations)"
+    echo "  savings    Show penny-pincher counters (read dedup, bash cap, context warning, plugin-side dedup)"
     echo "  version    Show installed version"
     echo "  uninstall  Remove clwnd"
     ;;
