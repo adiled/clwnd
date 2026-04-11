@@ -126,26 +126,68 @@ function extractSymbols(node: any, depth = 0): Symbol[] {
  */
 const MAX_FILE_SIZE = 500 * 1024; // 500KB — skip huge files
 
-export function fileSymbols(filePath: string): Symbol[] | null {
+// ─── Parsed-file cache ─────────────────────────────────────────────────────
+// Every symbol query, source slice, and AST grep used to re-run readFileSync
+// + tree-sitter parse + symbol extraction on every call. That's 2-5ms per
+// file for a 1500-line TS source, paid on every repeat call. Cache the
+// parsed result by absolute path and auto-invalidate on mtime change.
+//
+// Insertion order = LRU order (Map preserves it). Over AST_CACHE_MAX, drop
+// the oldest. A cache hit refreshes the entry's position so hot files stick.
+// Memory budget at 100 entries × ~50KB source + small symbol tree ≈ 5-6 MB.
+
+interface AstCacheEntry {
+  mtime: number;
+  symbols: Symbol[];
+  source: string;
+}
+
+const AST_CACHE_MAX = 100;
+const astCache = new Map<string, AstCacheEntry>();
+
+function cachedParse(filePath: string): AstCacheEntry | null {
+  let stat;
+  try { stat = statSync(filePath); } catch { return null; }
+  if (stat.size > MAX_FILE_SIZE) return null;
+
+  const mtime = stat.mtimeMs;
+  const existing = astCache.get(filePath);
+  if (existing && existing.mtime === mtime) {
+    // LRU refresh: re-insert so this entry is "most recent"
+    astCache.delete(filePath);
+    astCache.set(filePath, existing);
+    return existing;
+  }
+
   const ext = extname(filePath).toLowerCase();
   const lang = getLanguage(ext);
   if (!lang) return null;
 
-  try {
-    const stat = statSync(filePath);
-    if (stat.size > MAX_FILE_SIZE) return null;
-  } catch { return null; }
+  let source: string;
+  try { source = readFileSync(filePath, "utf-8"); } catch { return null; }
 
   try {
     const P = getParser();
     const parser = new P();
     parser.setLanguage(lang);
-    const source = readFileSync(filePath, "utf-8");
     const tree = parser.parse(source);
-    return extractSymbols(tree.rootNode);
+    const symbols = extractSymbols(tree.rootNode);
+    const entry: AstCacheEntry = { mtime, symbols, source };
+
+    // Evict oldest if at cap
+    if (astCache.size >= AST_CACHE_MAX) {
+      const oldest = astCache.keys().next().value;
+      if (oldest) astCache.delete(oldest);
+    }
+    astCache.set(filePath, entry);
+    return entry;
   } catch {
     return null;
   }
+}
+
+export function fileSymbols(filePath: string): Symbol[] | null {
+  return cachedParse(filePath)?.symbols ?? null;
 }
 
 /**
@@ -153,11 +195,11 @@ export function fileSymbols(filePath: string): Symbol[] | null {
  * Returns the source lines for that symbol, or null if not found.
  */
 export function readSymbol(filePath: string, symbolPath: string): { source: string; startLine: number; endLine: number } | null {
-  const symbols = fileSymbols(filePath);
-  if (!symbols) return null;
+  const entry = cachedParse(filePath);
+  if (!entry) return null;
 
   const parts = symbolPath.split(".");
-  let current: Symbol[] = symbols;
+  let current: Symbol[] = entry.symbols;
   let found: Symbol | null = null;
 
   for (const part of parts) {
@@ -168,7 +210,7 @@ export function readSymbol(filePath: string, symbolPath: string): { source: stri
 
   if (!found) return null;
 
-  const lines = readFileSync(filePath, "utf-8").split("\n");
+  const lines = entry.source.split("\n");
   const source = lines.slice(found.startLine - 1, found.endLine).map((l, i) => `${found!.startLine + i}\t${l}`).join("\n");
   return { source, startLine: found.startLine, endLine: found.endLine };
 }
@@ -201,8 +243,8 @@ export function isSupported(filePath: string): boolean {
  * Matches substrings case-insensitively. Returns matching symbols with context.
  */
 export function searchSymbols(filePath: string, query: string): Symbol[] {
-  const symbols = fileSymbols(filePath);
-  if (!symbols) return [];
+  const entry = cachedParse(filePath);
+  if (!entry) return [];
   const q = query.toLowerCase();
   const results: Symbol[] = [];
 
@@ -215,7 +257,7 @@ export function searchSymbols(filePath: string, query: string): Symbol[] {
       if (s.children) search(s.children, fullName);
     }
   }
-  search(symbols);
+  search(entry.symbols);
   return results;
 }
 
@@ -234,27 +276,13 @@ export interface GrepMatch {
  * Returns matches with their enclosing symbol — not just line numbers.
  */
 export function astGrep(filePath: string, pattern: string): GrepMatch[] {
-  const ext = extname(filePath).toLowerCase();
-  const lang = getLanguage(ext);
-  if (!lang) return [];
+  const entry = cachedParse(filePath);
+  if (!entry) return [];
 
-  const P = getParser();
-  const parser = new P();
-  parser.setLanguage(lang);
-
-  let source: string;
-  try {
-    source = readFileSync(filePath, "utf-8");
-  } catch {
-    return [];
-  }
-
-  const tree = parser.parse(source);
-  const lines = source.split("\n");
+  const lines = entry.source.split("\n");
   const regex = new RegExp(pattern, "i");
 
   // Build symbol map: line → enclosing symbol
-  const symbols = extractSymbols(tree.rootNode);
   const lineSymbol = new Map<number, { name: string; kind: string }>();
 
   function mapLines(syms: Symbol[], parentName = "") {
@@ -266,7 +294,7 @@ export function astGrep(filePath: string, pattern: string): GrepMatch[] {
       if (s.children) mapLines(s.children, fullName);
     }
   }
-  mapLines(symbols);
+  mapLines(entry.symbols);
 
   const matches: GrepMatch[] = [];
   for (let i = 0; i < lines.length; i++) {

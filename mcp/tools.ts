@@ -205,6 +205,25 @@ export interface ToolResult {
 const readCache = new Map<string, Map<string, number>>();
 const readCachePathIndex = new Map<string, Map<string, Set<string>>>(); // sid → path → Set<cacheKey>
 
+// Separate "Claude has touched this file in this session" ground-truth map.
+// Used ONLY by the Edit staleness guard. Unlike readCache (which drops
+// entries on Edit so the next Read sees fresh content), sessionTouched keeps
+// tracking across edits — an edit _establishes_ a known mtime, and the next
+// edit should see that mtime as the baseline. Without this separation, back-
+// to-back edits after an external mutation would go unnoticed.
+const sessionTouched = new Map<string, Map<string, number>>();
+
+function touchSession(sessionId: string | undefined, absPath: string, mtime: number): void {
+  if (!sessionId) return;
+  let m = sessionTouched.get(sessionId);
+  if (!m) { m = new Map(); sessionTouched.set(sessionId, m); }
+  m.set(absPath, mtime);
+}
+function touchedMtime(sessionId: string | undefined, absPath: string): number | undefined {
+  if (!sessionId) return undefined;
+  return sessionTouched.get(sessionId)?.get(absPath);
+}
+
 function readCacheKey(absPath: string, args?: { offset?: number; limit?: number; symbol?: string; query?: string }): string {
   if (!args || (!args.offset && !args.limit && !args.symbol && !args.query)) return absPath + "#";
   return absPath + "#o=" + (args.offset ?? "") + "&l=" + (args.limit ?? "") + "&s=" + (args.symbol ?? "") + "&q=" + (args.query ?? "");
@@ -245,7 +264,15 @@ function readCacheInvalidate(sessionId: string | undefined, absPath: string): vo
 export function clearReadCache(sessionId: string): void {
   readCache.delete(sessionId);
   readCachePathIndex.delete(sessionId);
+  sessionTouched.delete(sessionId);
 }
+
+// Extensions handled via a special path inside execRead instead of the
+// generic line-numbered flow. Images return a helpful error; .ipynb parses
+// JSON cells; PDFs shell out to pdftotext if available.
+const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico", ".svg"]);
+const PDF_EXT = ".pdf";
+const IPYNB_EXT = ".ipynb";
 
 function execRead(args: { file_path: string; offset?: number; limit?: number; symbol?: string; query?: string }, sessionId?: string): ToolResult {
   const p = assertPath(args.file_path);
@@ -257,6 +284,63 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
     if (stat.isDirectory()) {
       const out = execSync(`ls -la "${p}"`, { encoding: "utf-8", timeout: 5000 });
       return { output: out, title: relative(CWD, p) || p };
+    }
+
+    // Rich-media fallbacks — parity with Claude Code's native Read which
+    // handles notebooks, PDFs, and images. clwnd doesn't do image transform
+    // (resize ladders etc.) because we're not in the image-processing
+    // business; we route around the types we can't usefully stream as text.
+    const ext = extname(p).toLowerCase();
+    if (IMAGE_EXTS.has(ext)) {
+      return {
+        output: `[clwnd: ${p} is an image file (${(stat.size / 1024).toFixed(1)} KB, ${ext.slice(1).toUpperCase()}). Image content is not served as text by clwnd's Read tool — Claude's native image handling path is disabled while using clwnd's MCP tool surface. Use 'bash' to inspect metadata ('file "${p}"', 'identify "${p}"') or let the user attach the image directly to the conversation.]`,
+        title: relative(CWD, p) || p,
+        metadata: { filepath: p, fileType: "image", size: stat.size },
+      };
+    }
+    if (ext === PDF_EXT) {
+      try {
+        const text = execSync(`pdftotext -layout -q "${p}" - 2>/dev/null`, { encoding: "utf-8", timeout: 30000 });
+        const lines = text.split("\n");
+        const totalLines = lines.length;
+        const offset = (args.offset ?? 1) - 1;
+        const limit = Math.min(args.limit ?? 2000, 2000);
+        const slice = lines.slice(offset, offset + limit);
+        const truncated = totalLines > offset + limit;
+        const numbered = slice.map((line, i) => `${offset + i + 1}\t${line}`).join("\n");
+        const suffix = truncated ? `\n[... truncated — showing ${slice.length} of ${totalLines} lines. Use offset/limit to read further.]` : "";
+        return {
+          output: `[clwnd: ${p} (${(stat.size / 1024).toFixed(1)} KB PDF, extracted via pdftotext)]\n${numbered}${suffix}`,
+          title: relative(CWD, p) || p,
+          metadata: { filepath: p, fileType: "pdf", size: stat.size, totalLines, truncated },
+        };
+      } catch {
+        return {
+          output: `[clwnd: ${p} is a PDF but pdftotext is not available (install poppler-utils). clwnd does not embed a PDF parser. You can ask the user to convert it to text, or install the tool via 'apt install poppler-utils' / 'brew install poppler'.]`,
+          title: relative(CWD, p) || p,
+          metadata: { filepath: p, fileType: "pdf", size: stat.size },
+        };
+      }
+    }
+    if (ext === IPYNB_EXT) {
+      try {
+        const raw = JSON.parse(readFileSync(p, "utf-8")) as { cells?: Array<{ cell_type?: string; source?: string[] | string }> };
+        const cells = raw.cells ?? [];
+        const sections: string[] = [];
+        sections.push(`[clwnd: ${p} — ${cells.length} cells, outputs omitted]`);
+        cells.forEach((c, i) => {
+          const src = Array.isArray(c.source) ? c.source.join("") : (c.source ?? "");
+          const kind = (c.cell_type ?? "unknown").toUpperCase();
+          sections.push(`--- cell ${i + 1} (${kind}) ---\n${src}`);
+        });
+        return {
+          output: sections.join("\n\n"),
+          title: relative(CWD, p) || p,
+          metadata: { filepath: p, fileType: "notebook", cells: cells.length },
+        };
+      } catch (e) {
+        return { output: `Error parsing notebook ${p}: ${(e as Error).message}`, title: relative(CWD, p) || p };
+      }
     }
 
     // Dedup-check: same file, same args, same mtime → placeholder. Covers full
@@ -286,7 +370,11 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
   if (args.symbol) {
     const result = readSymbol(p, args.symbol);
     if (!result) return { output: `Symbol "${args.symbol}" not found in ${relPath}`, title: relPath };
-    if (sessionId) try { readCacheMark(sessionId, p, readCacheKey(p, args), statSync(p).mtimeMs); } catch {}
+    if (sessionId) try {
+      const mt = statSync(p).mtimeMs;
+      readCacheMark(sessionId, p, readCacheKey(p, args), mt);
+      touchSession(sessionId, p, mt);
+    } catch {}
     return {
       output: result.source,
       title: `${relPath}:${args.symbol}`,
@@ -310,7 +398,11 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
       sections.push(`--- ${s.kind} ${s.name} ${range} ---\n${lines}`);
     }
     const suffix = results.length > 10 ? `\n[+${results.length - 10} more matches]` : "";
-    if (sessionId) try { readCacheMark(sessionId, p, readCacheKey(p, args), statSync(p).mtimeMs); } catch {}
+    if (sessionId) try {
+      const mt = statSync(p).mtimeMs;
+      readCacheMark(sessionId, p, readCacheKey(p, args), mt);
+      touchSession(sessionId, p, mt);
+    } catch {}
     return {
       output: sections.join("\n\n") + suffix,
       title: `${relPath} ? ${args.query}`,
@@ -345,9 +437,14 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
     const suffix = truncated ? `\n[... truncated — showing ${slice.length} of ${totalLines} lines. Use offset/limit or symbol parameter to read specific sections.]` : "";
     // Mark as "in context". Full reads mark under path+"#"; partial views
     // (offset/limit) mark under a key that includes their args so an identical
-    // repeat dedups but a different range still runs.
+    // repeat dedups but a different range still runs. Also updates the
+    // session-touched witness so the Edit staleness guard has ground truth.
     if (sessionId && !truncated) {
-      try { readCacheMark(sessionId, p, readCacheKey(p, args), statSync(p).mtimeMs); } catch {}
+      try {
+        const mt = statSync(p).mtimeMs;
+        readCacheMark(sessionId, p, readCacheKey(p, args), mt);
+        touchSession(sessionId, p, mt);
+      } catch {}
     }
     return {
       output: outline + numbered + suffix,
@@ -365,24 +462,18 @@ function execEdit(args: { file_path: string; old_string: string; new_string: str
   if (!existsSync(p)) return { output: `Error: ${p} does not exist` };
 
   // Staleness guard — matches native Claude Code's behavior. If this session
-  // has a cached read for this file, compare its recorded mtime against the
-  // current mtime. Any mismatch means something (a linter, another process,
-  // a human in another window) touched the file between read and edit, and
-  // Claude's old_string is looking at stale content. Refuse and make it
-  // re-read. Only skips the guard when nothing was read in this session —
-  // blind edits on a freshly-listed file still work for scripted flows.
+  // has EVER touched this file (read or edit), the sessionTouched map holds
+  // the mtime at that moment. Any mismatch vs the current mtime means some-
+  // thing else touched it since (linter, other process, human editor), so
+  // Claude's old_string is looking at stale content. Refuse and force a
+  // re-read. If this session has never touched the file, allow (scripted /
+  // blind edits still work).
   if (sessionId) {
-    const pathMap = readCachePathIndex.get(sessionId);
-    const keySet = pathMap?.get(p);
-    if (keySet && keySet.size > 0) {
+    const known = touchedMtime(sessionId, p);
+    if (known !== undefined) {
       try {
         const currentMtime = statSync(p).mtimeMs;
-        const sess = readCache.get(sessionId);
-        let hasFresh = false;
-        for (const k of keySet) {
-          if (sess?.get(k) === currentMtime) { hasFresh = true; break; }
-        }
-        if (!hasFresh) {
+        if (currentMtime !== known) {
           return { output: `Error: ${p} has been modified since your last read in this session — re-read the file before editing. (Staleness guard; matches native Claude Code behavior.)`, title: relative(CWD, p) || p };
         }
       } catch {}
@@ -404,8 +495,11 @@ function execEdit(args: { file_path: string; old_string: string; new_string: str
   }
 
   writeFileSync(p, content);
-  // Invalidate read cache — a subsequent read should get the new content.
+  // Invalidate read cache — a subsequent read should get the new content —
+  // but update the session-touched witness with the new mtime so a chain of
+  // edits in the same session can still check against the last-known state.
   readCacheInvalidate(sessionId, p);
+  try { touchSession(sessionId, p, statSync(p).mtimeMs); } catch {}
 
   // Generate unified diff
   let diff = "";
@@ -429,6 +523,7 @@ function execWrite(args: { file_path: string; content: string }, sessionId?: str
   const existed = existsSync(p);
   writeFileSync(p, args.content);
   readCacheInvalidate(sessionId, p);
+  try { touchSession(sessionId, p, statSync(p).mtimeMs); } catch {}
   return {
     output: `Wrote ${p}`,
     title: relative(CWD, p) || p,
@@ -452,55 +547,103 @@ function capBashStream(s: string): { kept: string; trimmed: number } {
   return { kept: s.slice(0, BASH_MAX_OUTPUT) + `\n[... truncated at ${Math.round(BASH_MAX_OUTPUT / 1024)}KB]`, trimmed: s.length - BASH_MAX_OUTPUT };
 }
 
-function execBash(args: { command: string; description?: string; timeout?: number }): ToolResult {
+// Ring buffer for streamed bash output. Keeps the most recent RING_CAP bytes
+// per stream — for a long-running build or test suite that emits 50MB, we
+// keep the last 1MB window and cap() pulls the user-visible slice from it.
+// Matches native Claude Code's 8MB ring-buffered output shape (just smaller).
+const BASH_RING_CAP = 1024 * 1024; // 1MB per stream
+
+function appendRing(prev: string, chunk: string): string {
+  const next = prev + chunk;
+  if (next.length <= BASH_RING_CAP) return next;
+  return "[... earlier output evicted ...]\n" + next.slice(next.length - BASH_RING_CAP);
+}
+
+async function execBash(args: { command: string; description?: string; timeout?: number }): Promise<ToolResult> {
   checkPermission("bash", args.command);
   const timeout = args.timeout ?? 120_000;
   let stdout = "";
   let stderr = "";
+  let interrupted = false;
   let exitCode: number | null = 0;
+
   try {
-    // spawnSync keeps stdout and stderr separate so we can present them as
-    // distinct sections in the result. Native Claude Code's tool contract
-    // returns { stdout, stderr, interrupted } with the streams separated;
-    // matching that shape makes Claude's parsing cleaner and avoids the
-    // "which part was the error?" ambiguity of naive concatenation.
-    const { spawnSync } = require("child_process") as typeof import("child_process");
-    const r = spawnSync(args.command, {
-      encoding: "utf-8", timeout, cwd: CWD, shell: true,
+    // Bun spawn for streamed stdout/stderr. Two ReadableStream drains pump
+    // into per-stream ring buffers concurrently, so a command that emits
+    // 100MB over 5 minutes keeps only the last 1MB per stream in memory —
+    // no 10MB maxBuffer cliff, no middle-of-output loss, no OOM.
+    const proc = spawnProc({
+      cmd: ["/bin/bash", "-lc", args.command],
+      cwd: CWD,
       env: { ...process.env, TERM: "dumb" },
-      maxBuffer: 10 * 1024 * 1024,
+      stdout: "pipe",
+      stderr: "pipe",
     });
-    stdout = stripAnsi(String(r.stdout ?? ""));
-    stderr = stripAnsi(String(r.stderr ?? ""));
-    exitCode = r.status ?? (r.error ? 1 : 0);
+
+    const drain = async (stream: ReadableStream<Uint8Array> | undefined, onChunk: (s: string) => void) => {
+      if (!stream) return;
+      const reader = stream.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) onChunk(decoder.decode(value, { stream: true }));
+      }
+    };
+
+    const timer = setTimeout(() => {
+      interrupted = true;
+      try { proc.kill("SIGTERM"); } catch {}
+      // Backstop hard-kill if SIGTERM isn't honored within 2s
+      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 2000);
+    }, timeout);
+
+    try {
+      await Promise.all([
+        drain(proc.stdout as ReadableStream<Uint8Array>, c => { stdout = appendRing(stdout, c); }),
+        drain(proc.stderr as ReadableStream<Uint8Array>, c => { stderr = appendRing(stderr, c); }),
+        proc.exited,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    exitCode = proc.exitCode ?? (interrupted ? 124 : 1);
   } catch (e: any) {
-    stdout = stripAnsi(String(e.stdout ?? ""));
-    stderr = stripAnsi(String(e.stderr ?? e.message ?? ""));
-    exitCode = e.status ?? 1;
+    stderr = (stderr || "") + stripAnsi(String(e.message ?? ""));
+    exitCode = 1;
   }
+
+  stdout = stripAnsi(stdout);
+  stderr = stripAnsi(stderr);
+
   const outCap = capBashStream(stdout);
   const errCap = capBashStream(stderr);
   if (outCap.trimmed > 0 || errCap.trimmed > 0) {
     penny.bashTruncated++;
     penny.bashBytesTrimmed += outCap.trimmed + errCap.trimmed;
   }
-  // Assemble the visible body. Keep the no-stderr case identical to the old
-  // shape so existing prompts and expectations don't drift. When stderr is
-  // present, emit a labelled section so Claude can tell stdout from stderr
-  // without guessing.
+
+  // Assemble visible body. When stderr is present, emit a labelled section so
+  // Claude can tell streams apart without guessing. When interrupted by
+  // timeout, prepend a marker so Claude knows the command didn't finish.
   let body: string;
   if (errCap.kept) {
     body = (outCap.kept ? outCap.kept + "\n" : "") + "<stderr>\n" + errCap.kept + "\n</stderr>";
   } else {
     body = outCap.kept;
   }
+  if (interrupted) {
+    body = `[clwnd: command interrupted after ${timeout}ms timeout — partial output follows]\n` + body;
+  }
+
   return {
     output: body || `(exit ${exitCode ?? 0})`,
     title: args.description ?? args.command.slice(0, 80),
     metadata: {
       exit: exitCode,
       description: args.description ?? args.command.slice(0, 80),
-      // Mirror native's structured shape for consumers that introspect metadata.
+      interrupted,
       stdout: outCap.kept,
       stderr: errCap.kept,
       stdoutTrimmed: outCap.trimmed,
