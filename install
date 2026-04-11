@@ -82,8 +82,13 @@ ensure_source() {
     CURRENT=$(current_tag)
 
     if [ "$CMD" = "update" ] && [ "$CURRENT" = "$LATEST" ] && [ "$LATEST" != "" ]; then
-      echo "[source] already at $LATEST — nothing to update"
-      exit 0
+      echo "[source] already at $LATEST — nothing to pull"
+      # Don't exit — the source is current, but the OC plugin cache may
+      # still be stuck on a pre-v0.16 version because Npm.add() short-
+      # circuits on loadVirtual(). Flow through so wipe_oc_plugin_cache
+      # runs and the user gets the reload hint.
+      SOURCE_UNCHANGED=1
+      return 0
     fi
 
     echo "[source] updating $CLWND_SRC to $LATEST..."
@@ -345,6 +350,25 @@ install_cli() {
   echo "  linked $BIN_DIR/clwnd"
 }
 
+# OC caches installed plugins under its XDG cache. Once `@clwnd/opencode@latest`
+# resolves once, Npm.add() (packages/opencode/src/npm/index.ts) short-circuits
+# on loadVirtual() and never re-resolves `latest`, so the cached version is
+# pinned forever — a v0.15.x plugin keeps running even after the daemon is
+# rebuilt at v0.16.x. The symptom is tools/list advertising only read + bash
+# because the stale plugin hums an old allowedTools set that has no entries
+# for do_code / do_noncode, and the daemon's TOOLS.filter(allowedToolSet)
+# drops anything not in that set.
+#
+# Blow it away on every update (and install) so OC's next plugin resolve
+# actually hits npm for the latest tag.
+wipe_oc_plugin_cache() {
+  local OC_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/opencode/packages/@clwnd"
+  if [ -d "$OC_CACHE" ]; then
+    rm -rf "$OC_CACHE"
+    echo "  wiped OC plugin cache: $OC_CACHE"
+  fi
+}
+
 # ─── commands ────────────────────────────────────────────────────────────────
 
 cmd_install() {
@@ -362,9 +386,22 @@ cmd_install() {
   echo "[cli] installing clwnd command..."
   install_cli
 
+  echo "[cache] clearing stale OC plugin cache..."
+  wipe_oc_plugin_cache
+
   echo "[daemon] starting..."
   start_daemon
   print_greeting
+  print_oc_reload_hint
+}
+
+print_oc_reload_hint() {
+  echo ""
+  echo "  ⚠ if OpenCode is running, quit and reopen it."
+  echo "    OC caches the plugin in memory and won't pick up the new"
+  echo "    build until next process start. The plugin cache on disk"
+  echo "    was wiped, so the reopen will fetch the latest from npm."
+  echo ""
 }
 
 print_greeting() {
@@ -394,22 +431,35 @@ cmd_update() {
   echo "=== clwnd update ==="
   check_prereqs
   ensure_dirs
+  SOURCE_UNCHANGED=0
   ensure_source
 
   echo "[daemon] stopping..."
   stop_daemon
 
-  do_build
-  configure_opencode
+  if [ "$SOURCE_UNCHANGED" = "1" ]; then
+    echo "[build] skipped — source unchanged"
+  else
+    do_build
+    configure_opencode
+    echo "[service] re-registering..."
+    register_service
+    install_cli
+  fi
 
-  echo "[service] re-registering..."
-  register_service
-
-  install_cli
+  # Always wipe the OC plugin cache + restart the daemon, even when the
+  # source didn't move. This is the whole point of updating: an earlier
+  # update may have left OC's plugin cache pinned to a pre-v0.16 version
+  # (because Npm.add short-circuits on loadVirtual). Wiping here guarantees
+  # the next OC reload pulls a fresh plugin, and a fresh daemon kills any
+  # live Claude roost so the next spawn does a fresh tools/list handshake.
+  echo "[cache] clearing stale OC plugin cache..."
+  wipe_oc_plugin_cache
 
   echo "[daemon] restarting..."
   start_daemon
   print_greeting
+  print_oc_reload_hint
 }
 
 cmd_uninstall() {
