@@ -12,13 +12,39 @@ let Parser: any = null;
 const languages = new Map<string, any>();
 
 const EXT_TO_GRAMMAR: Record<string, string> = {
+  // TypeScript / JavaScript
   ".ts": "tree-sitter-typescript/typescript",
   ".tsx": "tree-sitter-typescript/tsx",
   ".js": "tree-sitter-javascript",
   ".jsx": "tree-sitter-javascript",
+  ".mjs": "tree-sitter-javascript",
+  ".cjs": "tree-sitter-javascript",
+  // Python
   ".py": "tree-sitter-python",
+  ".pyi": "tree-sitter-python",
+  // Go / Rust
   ".go": "tree-sitter-go",
   ".rs": "tree-sitter-rust",
+  // Java
+  ".java": "tree-sitter-java",
+  // C
+  ".c": "tree-sitter-c",
+  ".h": "tree-sitter-c",
+  // C++
+  ".cc": "tree-sitter-cpp",
+  ".cpp": "tree-sitter-cpp",
+  ".cxx": "tree-sitter-cpp",
+  ".hpp": "tree-sitter-cpp",
+  ".hxx": "tree-sitter-cpp",
+  // Ruby / PHP / C# — note php uses sub-export
+  ".rb": "tree-sitter-ruby",
+  ".php": "tree-sitter-php/php",
+  ".cs": "tree-sitter-c-sharp",
+  // Shell — bash grammar handles .sh and .bash. .zsh and .fish are too
+  // divergent (zsh-only constructs throw parse errors in tree-sitter-bash)
+  // so they fall through to do_code's text-only validation path.
+  ".sh": "tree-sitter-bash",
+  ".bash": "tree-sitter-bash",
 };
 
 function getParser(): any {
@@ -58,12 +84,11 @@ export interface Symbol {
 
 /** Node types that represent named symbols */
 const SYMBOL_TYPES: Record<string, string> = {
+  // ── TypeScript / JavaScript ────────────────────────────────────────────
   function_declaration: "function",
-  function_definition: "function", // Python
   arrow_function: "function",
   generator_function_declaration: "function",
   class_declaration: "class",
-  class_definition: "class", // Python
   interface_declaration: "interface",
   type_alias_declaration: "type",
   enum_declaration: "enum",
@@ -72,38 +97,129 @@ const SYMBOL_TYPES: Record<string, string> = {
   public_field_definition: "property",
   property_declaration: "property",
   property_signature: "property",
-  function_item: "function", // Rust
-  struct_item: "struct", // Rust
-  impl_item: "impl", // Rust
-  enum_item: "enum", // Rust
-  trait_item: "trait", // Rust
-  function_type: "function", // Go
-  method_declaration_go: "method", // Go (type_declaration contains methods)
+  // ── Python ─────────────────────────────────────────────────────────────
+  function_definition: "function", // also C, C++, PHP, Bash
+  class_definition: "class",
+  // ── Rust ───────────────────────────────────────────────────────────────
+  function_item: "function",
+  struct_item: "struct",
+  impl_item: "impl",
+  enum_item: "enum",
+  trait_item: "trait",
+  // ── Go ─────────────────────────────────────────────────────────────────
+  function_type: "function",
+  // ── Java / C# (also use class_declaration / method_declaration above) ──
+  constructor_declaration: "constructor",
+  // ── C / C++ ────────────────────────────────────────────────────────────
+  // function_definition reused. struct/enum/union_specifier are C/C++.
+  struct_specifier: "struct",
+  enum_specifier: "enum",
+  union_specifier: "union",
+  type_definition: "type",
+  class_specifier: "class", // C++
+  namespace_definition: "namespace", // C++
+  // ── C# ─────────────────────────────────────────────────────────────────
+  namespace_declaration: "namespace",
+  struct_declaration: "struct",
+  // ── Ruby ───────────────────────────────────────────────────────────────
+  // Ruby uses bare `class`, `module`, `method` as the AST node type names.
+  method: "method",
+  singleton_method: "method",
+  class: "class",
+  module: "module",
+  // ── PHP ────────────────────────────────────────────────────────────────
+  // function_definition / class_declaration / method_declaration reused.
+  trait_declaration: "trait",
 };
 
 /** Container types whose children we recurse into */
 const CONTAINERS = new Set([
+  // TS/JS
   "class_declaration", "class_definition", "class_body",
   "interface_declaration", "interface_body",
   "enum_declaration", "enum_body",
   "export_statement",
-  "impl_item", // Rust
-  "struct_item", // Rust
-  "trait_item", // Rust
-  "decorated_definition", // Python decorators
-  "block", // Python class body
+  // Rust
+  "impl_item", "struct_item", "trait_item",
+  // Python
+  "decorated_definition", "block",
+  // Java / C# / PHP — declaration_list wraps members inside class/namespace
+  "declaration_list",
+  // C / C++ — field_declaration_list wraps struct/class members; namespace
+  // and class specifiers themselves are also containers so their members
+  // surface as nested children of the parent symbol.
+  "field_declaration_list",
+  "namespace_definition",
+  "class_specifier",
+  "struct_specifier",
+  // C#
+  "namespace_declaration",
+  "struct_declaration",
+  // Ruby — body_statement holds methods inside class/module; the bare
+  // `class` and `module` node types are themselves containers because
+  // their children include the methods.
+  "body_statement", "class", "module",
+  // PHP
+  "trait_declaration",
 ]);
+
+// Resolve a symbol's display name from a tree-sitter node. Most languages
+// expose the name via a `name` field (childForFieldName("name")), so the
+// fast path is a single lookup. C and C++ are the exception: their
+// function_definition wraps the name inside a function_declarator (and
+// possibly a pointer_declarator on top), so we walk the declarator chain
+// down to the leaf identifier.
+function getSymbolName(node: any): string | null {
+  const direct = node.childForFieldName?.("name")?.text;
+  if (direct) return direct;
+  if (node.type === "function_definition") {
+    // C / C++: function_definition.declarator → (pointer_declarator)? →
+    // function_declarator → declarator → identifier
+    let cur = node.childForFieldName?.("declarator");
+    while (cur) {
+      if (cur.type === "function_declarator") {
+        cur = cur.childForFieldName?.("declarator") ?? null;
+        continue;
+      }
+      if (cur.type === "pointer_declarator" || cur.type === "parenthesized_declarator") {
+        cur = cur.childForFieldName?.("declarator") ?? null;
+        continue;
+      }
+      if (cur.type === "identifier" || cur.type === "field_identifier") {
+        return cur.text;
+      }
+      break;
+    }
+  }
+  return null;
+}
 
 function extractSymbols(node: any, depth = 0): Symbol[] {
   const symbols: Symbol[] = [];
-  for (let i = 0; i < node.childCount; i++) {
-    const child = node.child(i);
+  // Iterate NAMED children only — `child(i)` / `childCount` includes
+  // anonymous keyword tokens like `class`, `def`, `function`, `end`,
+  // and Ruby's tree-sitter grammar happens to give the literal keyword
+  // token the same type name as the wrapping node ("class"). With raw
+  // childCount iteration, the keyword gets matched against SYMBOL_TYPES
+  // and emits a phantom `class:anonymous` symbol inside every Ruby class.
+  // namedChild() skips those tokens.
+  const count = node.namedChildCount as number;
+  for (let i = 0; i < count; i++) {
+    const child = node.namedChild(i);
     const type = child.type as string;
     const kind = SYMBOL_TYPES[type];
 
     if (kind) {
-      const nameNode = child.childForFieldName("name");
-      const name = nameNode?.text ?? "anonymous";
+      const name = getSymbolName(child);
+      // Skip unnamed matches that aren't containers — they're usually
+      // tree-sitter artifacts (anonymous structs, lambda bodies, etc.)
+      // we don't want cluttering the outline.
+      if (!name) {
+        if (CONTAINERS.has(type)) {
+          symbols.push(...extractSymbols(child, depth + 1));
+        }
+        continue;
+      }
       const sym: Symbol = {
         name,
         kind,

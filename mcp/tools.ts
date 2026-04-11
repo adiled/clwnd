@@ -140,7 +140,27 @@ RULES:
     name: "do_code",
     description: `Write or modify a code file. This is the ONLY way to author code in clwnd — there is no string-replace edit, no fuzzy match, no "old_string / new_string" vocabulary. Edits are grounded in the tree-sitter AST: you target a symbol by name, you provide the new source for it, and clwnd re-parses the result before writing. Any edit that would leave the file syntactically invalid is rejected without touching disk.
 
-ACCEPTS: code files only. Extensions: ts, tsx, js, jsx, mjs, cjs, py, pyi, go, rs, java, c, cc, cpp, cxx, h, hpp, hxx, rb, php, cs, kt, kts, swift, scala, lua, sh, bash, zsh, fish, vue, svelte, sql. Anything else → use do_noncode.
+LANGUAGE COVERAGE — two tiers:
+
+  Full AST grounding (re-parsed on write, symbol-scoped operations work):
+    .ts .tsx .js .jsx .mjs .cjs   (TypeScript / JavaScript)
+    .py .pyi                       (Python)
+    .go                            (Go)
+    .rs                            (Rust)
+    .java                          (Java)
+    .c .h                          (C)
+    .cc .cpp .cxx .hpp .hxx        (C++)
+    .rb                            (Ruby)
+    .php                           (PHP)
+    .cs                            (C#)
+    .sh .bash                      (Bash / POSIX shell)
+
+  Accepted but TEXT-ONLY (create + whole-file replace work; symbol-scoped
+  operations will fail with "symbol not found" because we don't have a
+  tree-sitter grammar registered for these yet):
+    .kt .kts .swift .scala .lua .zsh .fish .vue .svelte .sql
+
+Anything else → use do_noncode.
 
 FIVE OPERATIONS — pick one via the 'operation' field:
 
