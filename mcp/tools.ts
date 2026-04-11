@@ -71,15 +71,15 @@ function assertPath(p: string): string {
 export const TOOLS = [
   {
     name: "read",
-    description: "Read a file, directory, or code symbols. For code files (ts/js/py/go/rs), automatically returns a symbol outline showing all functions/classes/methods with line ranges, followed by the source. Use `symbol` to read ONLY a specific function/class (e.g. 'Server.start') — much cheaper than reading the whole file. Use `query` to fuzzy-search symbols and get their source (e.g. query='handle' finds handleRequest, handleAuth etc). Always print tool results to the user — they cannot see tool output directly.",
+    description: "Read a file, directory, or code symbols. For code files (ts/tsx/js/jsx/py/go/rs), this tool is AST-aware via tree-sitter and exposes symbol-scoped reads that no other tool can match. STRONG PREFERENCE ORDER for code files: (1) If you know what function/class/method you want, use `symbol` (e.g. symbol='handleRequest' or symbol='Server.start') — returns ONLY that symbol's source, typically 10–50× smaller than the whole file. (2) If you're looking for something by fuzzy name, use `query` (e.g. query='auth' returns every matching function/class). (3) Only fall back to a full-file read when you truly need the whole file (configs, small files, or you haven't explored the symbol table yet). A full-file read on a code file will prepend a symbol outline — use that outline to plan a symbol-scoped follow-up instead of re-reading the file. Always print tool results to the user — they cannot see tool output directly.",
     inputSchema: {
       type: "object" as const,
       properties: {
         file_path: { type: "string", description: "Absolute path to the file or directory to read" },
         offset: { type: "number", description: "Line number to start reading from (1-indexed)" },
-        limit: { type: "number", description: "Maximum number of lines to read (default 500)" },
-        symbol: { type: "string", description: "Read a specific symbol by name (e.g. 'graft', 'Server.start'). Dot-separated for nested." },
-        query: { type: "string", description: "Fuzzy search symbols by name (e.g. 'handle', 'Config'). Returns matching symbols with source." },
+        limit: { type: "number", description: "Maximum number of lines to read (default 2000, matches native Claude Code)" },
+        symbol: { type: "string", description: "PREFERRED for code files: read a specific symbol by name (e.g. 'graft', 'Server.start'). Dot-separated for nested symbols." },
+        query: { type: "string", description: "PREFERRED for fuzzy code exploration: return sources of all symbols whose name matches (e.g. 'handle' finds handleRequest, handleAuth, etc.)." },
       },
       required: ["file_path"],
     },
@@ -186,34 +186,65 @@ export interface ToolResult {
   metadata?: Record<string, unknown>;
 }
 
-// Per-session "already read in this session" cache. Keyed by sid → path → mtime.
-// When Claude re-reads an unchanged file during a session, we return a short
-// placeholder instead of the full content. The full content is still in the
-// conversation from the earlier turn (cache-replayed for free), so re-serving
-// it just doubles the cached context weight forever. This single optimisation
-// targets the single biggest penny burn in the JSONL dissection: daemon.ts
-// was Read 558 times in one session, ~39MB of redundant content.
+// Per-session "already served" cache for read results. Keyed by sid → cacheKey
+// → mtime, where cacheKey is path+"#"+argsSignature. Full-file reads share a
+// signature (the empty string); partial reads (offset/limit/symbol/query) each
+// get their own signature, so repeating the EXACT same partial read returns
+// the placeholder while a different partial view on the same file still runs.
 //
-// execEdit/execWrite invalidate entries so the next read is fresh. Offset /
-// limit / symbol / query variants skip the cache — they return partial views
-// and shouldn't be substituted with "unchanged".
+// The `pathIndex` side-map tracks which cacheKeys belong to each absPath so
+// execEdit/execWrite can invalidate all views of a file at once when the file
+// mutates. Without it, a Write would leave stale partial-view entries cached
+// past their validity.
+//
+// Targets the single biggest penny burn from the JSONL dissection: daemon.ts
+// was Read 558 times in one session, ~39MB of redundant content. Claude Code
+// natively has `readFileState` dedup for full reads — clwnd's MCP routing
+// disabled that, so this re-implements parity plus partial-read coverage that
+// native doesn't have.
 const readCache = new Map<string, Map<string, number>>();
+const readCachePathIndex = new Map<string, Map<string, Set<string>>>(); // sid → path → Set<cacheKey>
 
-function readCacheCheck(sessionId: string, absPath: string, mtime: number): boolean {
-  const sess = readCache.get(sessionId);
-  return !!sess && sess.get(absPath) === mtime;
+function readCacheKey(absPath: string, args?: { offset?: number; limit?: number; symbol?: string; query?: string }): string {
+  if (!args || (!args.offset && !args.limit && !args.symbol && !args.query)) return absPath + "#";
+  return absPath + "#o=" + (args.offset ?? "") + "&l=" + (args.limit ?? "") + "&s=" + (args.symbol ?? "") + "&q=" + (args.query ?? "");
 }
-function readCacheMark(sessionId: string, absPath: string, mtime: number): void {
+function readCacheCheck(sessionId: string, key: string, mtime: number): boolean {
+  const sess = readCache.get(sessionId);
+  return !!sess && sess.get(key) === mtime;
+}
+function readCacheMark(sessionId: string, absPath: string, key: string, mtime: number): void {
   let sess = readCache.get(sessionId);
   if (!sess) { sess = new Map(); readCache.set(sessionId, sess); }
-  sess.set(absPath, mtime);
+  sess.set(key, mtime);
+  let pathMap = readCachePathIndex.get(sessionId);
+  if (!pathMap) { pathMap = new Map(); readCachePathIndex.set(sessionId, pathMap); }
+  let keySet = pathMap.get(absPath);
+  if (!keySet) { keySet = new Set(); pathMap.set(absPath, keySet); }
+  keySet.add(key);
 }
 function readCacheInvalidate(sessionId: string | undefined, absPath: string): void {
-  if (!sessionId) { for (const sess of readCache.values()) sess.delete(absPath); return; }
-  readCache.get(sessionId)?.delete(absPath);
+  if (!sessionId) {
+    // Cross-session: wipe every view of this path
+    for (const [sid, sess] of readCache) {
+      const keySet = readCachePathIndex.get(sid)?.get(absPath);
+      if (keySet) {
+        for (const k of keySet) sess.delete(k);
+        readCachePathIndex.get(sid)?.delete(absPath);
+      }
+    }
+    return;
+  }
+  const sess = readCache.get(sessionId);
+  const keySet = readCachePathIndex.get(sessionId)?.get(absPath);
+  if (sess && keySet) {
+    for (const k of keySet) sess.delete(k);
+    readCachePathIndex.get(sessionId)?.delete(absPath);
+  }
 }
 export function clearReadCache(sessionId: string): void {
   readCache.delete(sessionId);
+  readCachePathIndex.delete(sessionId);
 }
 
 function execRead(args: { file_path: string; offset?: number; limit?: number; symbol?: string; query?: string }, sessionId?: string): ToolResult {
@@ -228,17 +259,19 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
       return { output: out, title: relative(CWD, p) || p };
     }
 
-    // Full-file reads (no offset/limit/symbol/query) are the dedup candidates.
-    // Partial views vary by args and must not be substituted with "unchanged".
-    const isFullRead = !args.offset && !args.limit && !args.symbol && !args.query;
-    if (sessionId && isFullRead && stat.isFile()) {
-      const mtime = stat.mtimeMs;
-      if (readCacheCheck(sessionId, p, mtime)) {
+    // Dedup-check: same file, same args, same mtime → placeholder. Covers full
+    // reads AND identical partial views. Partial views of the same file with
+    // different args (different symbol, different offset) each get their own
+    // cache entry and run independently.
+    if (sessionId && stat.isFile()) {
+      const key = readCacheKey(p, args);
+      if (readCacheCheck(sessionId, key, stat.mtimeMs)) {
         penny.readDedupHits++;
         penny.readDedupBytes += stat.size;
-        trace("read.cached", { sid: sessionId, path: p, size: stat.size });
+        trace("read.cached", { sid: sessionId, path: p, size: stat.size, key: key.slice(p.length) });
+        const variant = key === p + "#" ? "full file" : "partial view (" + key.slice(p.length + 1) + ")";
         return {
-          output: `[clwnd: ${p} (${stat.size} bytes) was already read earlier in this session and has not changed — content is still in conversation context, not re-reading. Use offset/limit/symbol/query to force a fresh partial read, or edit the file first to invalidate the cache.]`,
+          output: `[clwnd: ${p} ${variant} was already served earlier in this session and has not changed — content is still in conversation context, not re-reading. Edit the file or pass different offset/limit/symbol/query to force a fresh read.]`,
           title: relative(CWD, p) || p,
           metadata: { cached: true, loaded: [p] },
         };
@@ -253,6 +286,7 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
   if (args.symbol) {
     const result = readSymbol(p, args.symbol);
     if (!result) return { output: `Symbol "${args.symbol}" not found in ${relPath}`, title: relPath };
+    if (sessionId) try { readCacheMark(sessionId, p, readCacheKey(p, args), statSync(p).mtimeMs); } catch {}
     return {
       output: result.source,
       title: `${relPath}:${args.symbol}`,
@@ -276,6 +310,7 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
       sections.push(`--- ${s.kind} ${s.name} ${range} ---\n${lines}`);
     }
     const suffix = results.length > 10 ? `\n[+${results.length - 10} more matches]` : "";
+    if (sessionId) try { readCacheMark(sessionId, p, readCacheKey(p, args), statSync(p).mtimeMs); } catch {}
     return {
       output: sections.join("\n\n") + suffix,
       title: `${relPath} ? ${args.query}`,
@@ -300,14 +335,19 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
     }
 
     const offset = (args.offset ?? 1) - 1;
-    const limit = Math.min(args.limit ?? 500, 1000);
+    // Match Claude Code's native default (LrH=2000). Anything smaller forces
+    // Claude to issue a second Read call for files it would have received
+    // in one go on the native path — doubles tool-use overhead for nothing.
+    const limit = Math.min(args.limit ?? 2000, 2000);
     const slice = lines.slice(offset, offset + limit);
     const truncated = totalLines > offset + limit;
     const numbered = slice.map((line, i) => `${offset + i + 1}\t${line}`).join("\n");
     const suffix = truncated ? `\n[... truncated — showing ${slice.length} of ${totalLines} lines. Use offset/limit or symbol parameter to read specific sections.]` : "";
-    // Mark as "in context" only for full reads — partial views don't dedup.
-    if (sessionId && !args.offset && !args.limit && !args.symbol && !args.query && !truncated) {
-      try { readCacheMark(sessionId, p, statSync(p).mtimeMs); } catch {}
+    // Mark as "in context". Full reads mark under path+"#"; partial views
+    // (offset/limit) mark under a key that includes their args so an identical
+    // repeat dedups but a different range still runs.
+    if (sessionId && !truncated) {
+      try { readCacheMark(sessionId, p, readCacheKey(p, args), statSync(p).mtimeMs); } catch {}
     }
     return {
       output: outline + numbered + suffix,
@@ -323,6 +363,31 @@ function execEdit(args: { file_path: string; old_string: string; new_string: str
   const p = assertPath(args.file_path);
   checkPermission("edit", p);
   if (!existsSync(p)) return { output: `Error: ${p} does not exist` };
+
+  // Staleness guard — matches native Claude Code's behavior. If this session
+  // has a cached read for this file, compare its recorded mtime against the
+  // current mtime. Any mismatch means something (a linter, another process,
+  // a human in another window) touched the file between read and edit, and
+  // Claude's old_string is looking at stale content. Refuse and make it
+  // re-read. Only skips the guard when nothing was read in this session —
+  // blind edits on a freshly-listed file still work for scripted flows.
+  if (sessionId) {
+    const pathMap = readCachePathIndex.get(sessionId);
+    const keySet = pathMap?.get(p);
+    if (keySet && keySet.size > 0) {
+      try {
+        const currentMtime = statSync(p).mtimeMs;
+        const sess = readCache.get(sessionId);
+        let hasFresh = false;
+        for (const k of keySet) {
+          if (sess?.get(k) === currentMtime) { hasFresh = true; break; }
+        }
+        if (!hasFresh) {
+          return { output: `Error: ${p} has been modified since your last read in this session — re-read the file before editing. (Staleness guard; matches native Claude Code behavior.)`, title: relative(CWD, p) || p };
+        }
+      } catch {}
+    }
+  }
 
   const original = readFileSync(p, "utf-8");
   let content = original;
@@ -371,44 +436,75 @@ function execWrite(args: { file_path: string; content: string }, sessionId?: str
   };
 }
 
-// Cap bash output at 16KB — per-turn Anthropic cost scales with everything
-// that lands in the conversation. A 50KB journal/strings dump that gets
-// cache-replayed for the rest of the session is a direct $ burn. Users can
-// `command > /tmp/out && head -c 16k /tmp/out` when they need more.
-const BASH_MAX_OUTPUT = 16 * 1024;
+// Cap bash output at 30KB — native Claude Code's BASH_MAX_OUTPUT_LENGTH has a
+// 30_000-char floor (default 150_000). Sitting at the floor matches what
+// Claude trained on (30K is the conservative-bound the model expects to get
+// when a command is noisy) while still saving 5× vs the native default — a
+// decent middle-ground between penny-pinching and information preservation.
+const BASH_MAX_OUTPUT = 30 * 1024;
 
 function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
 }
 
+function capBashStream(s: string): { kept: string; trimmed: number } {
+  if (s.length <= BASH_MAX_OUTPUT) return { kept: s, trimmed: 0 };
+  return { kept: s.slice(0, BASH_MAX_OUTPUT) + `\n[... truncated at ${Math.round(BASH_MAX_OUTPUT / 1024)}KB]`, trimmed: s.length - BASH_MAX_OUTPUT };
+}
+
 function execBash(args: { command: string; description?: string; timeout?: number }): ToolResult {
   checkPermission("bash", args.command);
   const timeout = args.timeout ?? 120_000;
-  let output = "";
+  let stdout = "";
+  let stderr = "";
   let exitCode: number | null = 0;
   try {
-    output = execSync(args.command, {
-      encoding: "utf-8", timeout, cwd: CWD,
+    // spawnSync keeps stdout and stderr separate so we can present them as
+    // distinct sections in the result. Native Claude Code's tool contract
+    // returns { stdout, stderr, interrupted } with the streams separated;
+    // matching that shape makes Claude's parsing cleaner and avoids the
+    // "which part was the error?" ambiguity of naive concatenation.
+    const { spawnSync } = require("child_process") as typeof import("child_process");
+    const r = spawnSync(args.command, {
+      encoding: "utf-8", timeout, cwd: CWD, shell: true,
       env: { ...process.env, TERM: "dumb" },
       maxBuffer: 10 * 1024 * 1024,
     });
+    stdout = stripAnsi(String(r.stdout ?? ""));
+    stderr = stripAnsi(String(r.stderr ?? ""));
+    exitCode = r.status ?? (r.error ? 1 : 0);
   } catch (e: any) {
-    output = (e.stdout ?? "") + (e.stderr ? "\n" + e.stderr : "");
+    stdout = stripAnsi(String(e.stdout ?? ""));
+    stderr = stripAnsi(String(e.stderr ?? e.message ?? ""));
     exitCode = e.status ?? 1;
   }
-  output = stripAnsi(output);
-  if (output.length > BASH_MAX_OUTPUT) {
-    const trimmed = output.length - BASH_MAX_OUTPUT;
+  const outCap = capBashStream(stdout);
+  const errCap = capBashStream(stderr);
+  if (outCap.trimmed > 0 || errCap.trimmed > 0) {
     penny.bashTruncated++;
-    penny.bashBytesTrimmed += trimmed;
-    output = output.slice(0, BASH_MAX_OUTPUT) + `\n[... output truncated at ${Math.round(BASH_MAX_OUTPUT / 1024)}KB — pipe to file for full output]`;
+    penny.bashBytesTrimmed += outCap.trimmed + errCap.trimmed;
+  }
+  // Assemble the visible body. Keep the no-stderr case identical to the old
+  // shape so existing prompts and expectations don't drift. When stderr is
+  // present, emit a labelled section so Claude can tell stdout from stderr
+  // without guessing.
+  let body: string;
+  if (errCap.kept) {
+    body = (outCap.kept ? outCap.kept + "\n" : "") + "<stderr>\n" + errCap.kept + "\n</stderr>";
+  } else {
+    body = outCap.kept;
   }
   return {
-    output: output || `(exit ${exitCode ?? 0})`,
+    output: body || `(exit ${exitCode ?? 0})`,
     title: args.description ?? args.command.slice(0, 80),
     metadata: {
       exit: exitCode,
       description: args.description ?? args.command.slice(0, 80),
+      // Mirror native's structured shape for consumers that introspect metadata.
+      stdout: outCap.kept,
+      stderr: errCap.kept,
+      stdoutTrimmed: outCap.trimmed,
+      stderrTrimmed: errCap.trimmed,
     },
   };
 }
@@ -416,9 +512,14 @@ function execBash(args: { command: string; description?: string; timeout?: numbe
 function execGlob(args: { pattern: string; path?: string }): ToolResult {
   const dir = assertPath(args.path ?? CWD);
   checkPermission("glob", dir);
+  // Sort matches newest-first by mtime to match native Claude Code's behavior
+  // ("sorted by modification time"). Recently-touched files are almost always
+  // what Claude wants next, and matching the native convention means Claude
+  // doesn't have to re-prioritize the list before choosing a follow-up read.
   try {
     const out = execSync(
-      `shopt -s globstar nullglob; cd "${dir}" && printf '%s\\n' ${args.pattern} 2>/dev/null | head -100`,
+      `shopt -s globstar nullglob; cd "${dir}" && printf '%s\\0' ${args.pattern} 2>/dev/null | ` +
+      `xargs -0 -r stat -c '%Y %n' 2>/dev/null | sort -rn | head -100 | cut -d' ' -f2-`,
       { encoding: "utf-8", timeout: 10000, shell: "/bin/bash" },
     );
     const files = out.trim().split("\n").filter(Boolean);
