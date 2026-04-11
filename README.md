@@ -49,4 +49,4 @@ clwnd currently relies on opencode as _the harness_ because of thorough customiz
 
 - clwnd sanitizes prompts to ensure undisrupted usage, ensure any custom prompts do not depend on xml tags and second-person attributions
 - clwnd greatly strips away commonly expected file system tools by any harness, with more superior code and non-code tooling, but does not dictate prompt engineering or reminders around them yet, so take control of that as needed
-- clwnd code analysis and authoring tools are pure AST-based and are limited to few languages, more can be added on-demand
+- clwnd code analysis and authoring tools are pure AST-based and are limited to few languages, a non-code writing tool can be relied on for yet unsupported languages
