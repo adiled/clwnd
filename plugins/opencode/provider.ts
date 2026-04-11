@@ -1006,12 +1006,21 @@ export class ClwndModel implements LanguageModelV3 {
               reasoningStarted = false;
             }
 
-            // Tool events — close open text/reasoning blocks first, then buffer
+            // Tool events — close open text/reasoning blocks first, then buffer.
+            // providerExecuted MUST be set on tool-input-start (not tool-call) per
+            // the v3 AI SDK contract — OC's processor reads the flag there and
+            // ignores it on tool-call. Without this, OC treats every non-brokered
+            // clwnd tool as a pending external call, hasToolCalls stays true,
+            // the prompt loop never exits on a text-only end_turn, and OC auto-
+            // re-enters doStream with the same user message. Claude sees the same
+            // user prompt 2-4 times per turn and complains.
             if (ct === "tool_input_start" && raw.toolCallId && raw.toolName) {
               if (textStarted) { petal({ type: "text-end", id: textId }); textStarted = false; }
               if (reasoningStarted) { petal({ type: "reasoning-end", id: reasoningId }); reasoningStarted = false; }
               sap.set(raw.toolCallId as string, "");
-              buds.push({ type: "tool-input-start", id: raw.toolCallId as string, toolName: mapToolName(raw.toolName as string) });
+              const ocToolName = mapToolName(raw.toolName as string);
+              const isBrokered = streamBrokered.has(ocToolName);
+              buds.push({ type: "tool-input-start", id: raw.toolCallId as string, toolName: ocToolName, providerExecuted: !isBrokered });
             }
             if (ct === "tool_input_delta" && raw.toolCallId && raw.partialJson) {
               const prev = sap.get(raw.toolCallId as string) ?? "";
@@ -1021,7 +1030,8 @@ export class ClwndModel implements LanguageModelV3 {
             if (ct === "tool_call" && raw.toolCallId && raw.toolName) {
               const ocToolName = mapToolName(raw.toolName as string);
               if (!sap.has(raw.toolCallId as string)) {
-                buds.push({ type: "tool-input-start", id: raw.toolCallId as string, toolName: ocToolName });
+                const isBrokeredLate = streamBrokered.has(ocToolName);
+                buds.push({ type: "tool-input-start", id: raw.toolCallId as string, toolName: ocToolName, providerExecuted: !isBrokeredLate });
               }
               const accumulated = sap.get(raw.toolCallId as string);
               let rawInput: string;
