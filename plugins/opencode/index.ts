@@ -189,8 +189,10 @@ For existing files, read(file_path) first so clwnd's staleness guard knows your 
 // Dispatch a tool call to clwnd's daemon MCP endpoint. Same transport and
 // JSON-RPC shape Claude CLI uses when it calls mcp__clwnd__<tool>. The port
 // is pinned (29147) so there's no discovery ceremony — if you change the
-// port in daemon.ts, change it here too.
-const CLWND_MCP_PORT = parseInt(process.env.CLWND_MCP_PORT ?? "29147") || 29147;
+// port in daemon.ts, change it here too. No `|| 29147` fallback — if you
+// explicitly set CLWND_MCP_PORT, we respect it or fail loudly, not silently
+// revert to the default.
+const CLWND_MCP_PORT = parseInt(process.env.CLWND_MCP_PORT ?? "29147");
 const CLWND_MCP_HOST = process.env.CLWND_MCP_HOST ?? "127.0.0.1";
 
 async function callClwndTool(name: string, args: Record<string, unknown>, sessionID: string): Promise<string> {

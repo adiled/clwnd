@@ -1519,8 +1519,10 @@ import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms, s
 // Fixed port so the plugin (and anything else local) can reach the MCP
 // HTTP endpoint without discovery. Override with CLWND_MCP_PORT if the
 // default clashes with something on your machine. 29147 is in the IANA
-// user range, not commonly assigned.
-const MCP_PORT = parseInt(process.env.CLWND_MCP_PORT ?? "29147") || 29147;
+// user range, not commonly assigned. No `|| 29147` fallback — if you
+// explicitly set the env var, we respect it or fail loudly, not silently
+// revert to the default.
+const MCP_PORT = parseInt(process.env.CLWND_MCP_PORT ?? "29147");
 
 const MCP_HOST = process.env.CLWND_HOST ?? "127.0.0.1";
 
