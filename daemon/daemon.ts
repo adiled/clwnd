@@ -9,6 +9,7 @@ import { loadConfig } from "../lib/config.ts";
 import { sigil, rid as makeRid, echo, pulse, isDusk, classifySuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type DroneState, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
 import { droneThink, setDroneWorkspace, releaseDroneSession } from "../lib/drone-llm.ts";
 import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, lastUuid, sanitizeJsonl, type GraftResult } from "../lib/session.ts";
+import { penny } from "../lib/penny.ts";
 
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
@@ -983,6 +984,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       // cold-start a fresh session. Same teardown shape as "cancel/compaction"
       // — the next real prompt will cold-start from priorPetals.
       if (!msg.listenOnly && (session.maxContextTokens ?? 0) > CONTEXT_ROTATE_THRESHOLD) {
+        penny.rotations++;
         trace("rotation.triggered", {
           sid,
           maxCtx: session.maxContextTokens,
@@ -1205,6 +1207,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
             if (turnCtx > (session.maxContextTokens ?? 0)) {
               session.maxContextTokens = turnCtx;
               if (turnCtx > CONTEXT_ROTATE_THRESHOLD) {
+                penny.contextOverThreshold++;
                 trace("context.over.threshold", { sid, turnCtx, threshold: CONTEXT_ROTATE_THRESHOLD });
               }
             }
@@ -1432,6 +1435,23 @@ Bun.serve({
         procs: nest.survey(),
         sessions: sessions.size,
         drone: droneStates,
+      });
+    }
+
+    // /savings — penny-pincher counters since daemon start
+    if (req.method === "GET" && url.pathname === "/savings") {
+      const sessionCtx: Array<{ sid: string; maxContextTokens: number }> = [];
+      for (const [sid, sess] of sessions) {
+        if (sess.maxContextTokens && sess.maxContextTokens > 0) {
+          sessionCtx.push({ sid, maxContextTokens: sess.maxContextTokens });
+        }
+      }
+      sessionCtx.sort((a, b) => b.maxContextTokens - a.maxContextTokens);
+      return Response.json({
+        uptimeMs: Date.now() - penny.started,
+        counters: penny,
+        rotateThreshold: Number(process.env.CLWND_CONTEXT_ROTATE ?? "300000"),
+        topContextSessions: sessionCtx.slice(0, 10),
       });
     }
 

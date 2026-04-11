@@ -8,6 +8,7 @@ import { execSync } from "child_process";
 import { resolve, dirname, relative, extname } from "path";
 
 import { trace } from "../log.ts";
+import { penny } from "../lib/penny.ts";
 import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, astGrep, formatGrepMatches, searchSymbols, type Symbol } from "../lib/ast.ts";
 
 let CWD = process.env.CLWND_CWD ?? process.cwd();
@@ -233,6 +234,8 @@ function execRead(args: { file_path: string; offset?: number; limit?: number; sy
     if (sessionId && isFullRead && stat.isFile()) {
       const mtime = stat.mtimeMs;
       if (readCacheCheck(sessionId, p, mtime)) {
+        penny.readDedupHits++;
+        penny.readDedupBytes += stat.size;
         trace("read.cached", { sid: sessionId, path: p, size: stat.size });
         return {
           output: `[clwnd: ${p} (${stat.size} bytes) was already read earlier in this session and has not changed — content is still in conversation context, not re-reading. Use offset/limit/symbol/query to force a fresh partial read, or edit the file first to invalidate the cache.]`,
@@ -395,6 +398,9 @@ function execBash(args: { command: string; description?: string; timeout?: numbe
   }
   output = stripAnsi(output);
   if (output.length > BASH_MAX_OUTPUT) {
+    const trimmed = output.length - BASH_MAX_OUTPUT;
+    penny.bashTruncated++;
+    penny.bashBytesTrimmed += trimmed;
     output = output.slice(0, BASH_MAX_OUTPUT) + `\n[... output truncated at ${Math.round(BASH_MAX_OUTPUT / 1024)}KB — pipe to file for full output]`;
   }
   return {
