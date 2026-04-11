@@ -622,10 +622,40 @@ export function sanitizeJsonl(path: string): SanitizeResult {
     break;
   }
 
-  // Pass 3: validate tool_use/tool_result pairing
-  const validated: ClaudeEntry[] = [];
+  // Pass 2.5: coalesce runs of consecutive pure-tool_result user entries into
+  // one. Claude CLI and OC both inject their own user entries mid-stream
+  // (system-reminders, ghosts, etc.), so the same assistant turn's tool_results
+  // sometimes land as multiple adjacent user entries in the JSONL. Pass 3 only
+  // inspects clean[i+1] when validating tool_use/tool_result pairing — a split
+  // would make it see a subset of the expected ids and delete the whole turn.
+  // Fixing at the source isn't possible (we don't control Claude/OC's writers);
+  // the sanitizer is the right layer.
+  const merged: ClaudeEntry[] = [];
   for (let i = 0; i < clean.length; i++) {
     const e = clean[i];
+    const isPureToolResult = (entry: ClaudeEntry): boolean =>
+      entry.type === "user" && "message" in entry &&
+      (entry as ClaudeUserEntry).message.content.every(c => c.type === "tool_result");
+
+    if (isPureToolResult(e)) {
+      const anchor = e as ClaudeUserEntry;
+      // Greedily absorb every adjacent pure-tool_result user entry.
+      while (i + 1 < clean.length && isPureToolResult(clean[i + 1])) {
+        const next = clean[i + 1] as ClaudeUserEntry;
+        anchor.message.content = [...anchor.message.content, ...next.message.content];
+        rules.push("merge-tool-results");
+        i++;
+      }
+      merged.push(anchor);
+      continue;
+    }
+    merged.push(e);
+  }
+
+  // Pass 3: validate tool_use/tool_result pairing
+  const validated: ClaudeEntry[] = [];
+  for (let i = 0; i < merged.length; i++) {
+    const e = merged[i];
 
     if (e.type === "assistant" && "message" in e) {
       const toolUseIds = (e as ClaudeAssistantEntry).message.content
@@ -634,7 +664,7 @@ export function sanitizeJsonl(path: string): SanitizeResult {
 
       if (toolUseIds.length > 0) {
         // Find the next user entry with tool_results
-        const nextUser = clean[i + 1];
+        const nextUser = merged[i + 1];
         if (nextUser?.type === "user" && "message" in nextUser) {
           const resultIds = new Set(
             (nextUser as ClaudeUserEntry).message.content
@@ -660,6 +690,29 @@ export function sanitizeJsonl(path: string): SanitizeResult {
   }
 
   if (rules.length === 0) return { removed: 0, fixed: 0, rules: [] };
+
+  // Pass 4: relink the uuid chain. Every removal/merge in Passes 1-3 leaves
+  // downstream entries with parentUuid pointing at an entry that no longer
+  // exists, and the summary's leafUuid pointing at a removed tip. Claude CLI
+  // walks leafUuid → parentUuid back to the root on --resume; a dangling
+  // pointer makes it refuse to continue the session. Re-sequence the chain
+  // linearly across surviving entries and fix leafUuid at the tail.
+  let summary: Record<string, unknown> | null = null;
+  const contents: Array<Record<string, unknown>> = [];
+  for (const e of validated) {
+    const rec = e as unknown as Record<string, unknown>;
+    if (rec.type === "summary") summary = rec;
+    else contents.push(rec);
+  }
+  let prevUuid: string | null = null;
+  for (const rec of contents) {
+    if (typeof rec.uuid === "string") {
+      if ("parentUuid" in rec) rec.parentUuid = prevUuid;
+      prevUuid = rec.uuid as string;
+    }
+  }
+  if (summary) summary.leafUuid = prevUuid;
+  if (prevUuid !== null || contents.length === 0) rules.push("relink");
 
   // Write back
   writeFileSync(path, validated.map(e => JSON.stringify(e)).join("\n") + "\n");

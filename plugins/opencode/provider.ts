@@ -337,6 +337,115 @@ function extractSystemPrompt(prompt: LanguageModelV3Prompt): string {
   return parts.join("\n\n");
 }
 
+// Sanitize a system prompt before forwarding to Claude:
+//   1. Strip XML-like enclosures only — `<tag>` and `</tag>` wrappers are
+//      removed, but the content between them is preserved. The tags add noise
+//      (and may trigger the CLI's <system-reminder>-aware handling) while the
+//      prose inside is usually meaningful.
+//   2. Drop every unit mentioning `word` (case-insensitive) from what remains.
+// A "unit" is either an atomic block (header, list item with its indented
+// continuations) or a prose sentence (within a prose block, split on sentence-
+// terminator + whitespace). This hybrid keeps bullets with their URL continua-
+// tions as one unit (so stripping leaves no dangling "at"), while still split-
+// ting multi-sentence paragraphs finely enough that one bad sentence doesn't
+// drag the whole paragraph down.
+function sanitizePrompt(text: string, word: string): string {
+  if (!text) return text;
+
+  // Pass 1: strip enclosure markers. Matches opening, closing, and self-closing
+  // tags; content in between is left intact. Requires a word-char start so it
+  // doesn't eat "2 < 3" style inequalities.
+  text = text.replace(/<\/?\w[\w-]*\b[^>]*>/g, "");
+
+  if (!word) {
+    return text.replace(/^\n+/, "");
+  }
+
+  const needle = new RegExp(word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+
+  // Split into lines, preserving each line's trailing \n.
+  const lines: string[] = [];
+  {
+    let cursor = 0;
+    while (cursor < text.length) {
+      const nl = text.indexOf("\n", cursor);
+      if (nl === -1) { lines.push(text.slice(cursor)); break; }
+      lines.push(text.slice(cursor, nl + 1));
+      cursor = nl + 1;
+    }
+  }
+
+  type Kind = "blank" | "header" | "list" | "prose";
+  const kindOf = (line: string): Kind => {
+    const body = line.replace(/\n$/, "");
+    if (!body.trim()) return "blank";
+    if (/^\s*#/.test(body)) return "header";
+    if (/^\s*(?:[-*]|\d+\.)\s/.test(body)) return "list";
+    return "prose";
+  };
+  // Indented non-list line → belongs to the preceding atomic block
+  const isContinuation = (line: string): boolean => {
+    const body = line.replace(/\n$/, "");
+    if (!body.trim()) return false;
+    return /^\s/.test(body) && !/^\s*(?:[-*]|\d+\.)\s/.test(body);
+  };
+
+  const units: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const k = kindOf(lines[i]);
+
+    if (k === "blank" || k === "header") {
+      units.push(lines[i]);
+      i++;
+      continue;
+    }
+
+    if (k === "list") {
+      let unit = lines[i];
+      i++;
+      while (i < lines.length && isContinuation(lines[i])) {
+        unit += lines[i];
+        i++;
+      }
+      units.push(unit);
+      continue;
+    }
+
+    // Prose: collect consecutive prose lines into one block, then split into
+    // sentences. Sentence terminator = .!? followed by space/tab/newline; the
+    // delimiter is kept with the preceding sentence so the whole sentence —
+    // trailing newline included — disappears when stripped, no orphan blanks.
+    let block = lines[i];
+    i++;
+    while (i < lines.length && kindOf(lines[i]) === "prose") {
+      block += lines[i];
+      i++;
+    }
+
+    // Boundary: .!? + whitespace, OR bare \n. The bare-\n fallback rescues
+    // terminator-less lines (file paths, <env> blocks) — each becomes its own
+    // unit instead of bundling into one giant tail that trips on a single
+    // opencode mention anywhere in the block.
+    const sentRe = /[.!?][ \t\n]+|\n/g;
+    let start = 0;
+    let m: RegExpExecArray | null;
+    while ((m = sentRe.exec(block)) !== null) {
+      const end = m.index + m[0].length;
+      units.push(block.slice(start, end));
+      start = end;
+    }
+    if (start < block.length) units.push(block.slice(start));
+  }
+
+  // Strip leading blank units — if the first few kept units are just newlines
+  // (often the \n\n separator left behind when the first system message was
+  // fully removed), drop them so the prompt doesn't start with a blank line.
+  const kept = units.filter(u => !needle.test(u));
+  while (kept.length > 0 && !kept[0].trim()) kept.shift();
+  return kept.join("");
+}
+
 // ─── Detection Helpers ───────────────────────────────────────────────────
 
 function isAuxiliaryCall(opts: LanguageModelV3CallOptions): boolean {
@@ -545,7 +654,7 @@ export class ClwndModel implements LanguageModelV3 {
     trace("doStream.enter", { sid, promptLen: opts.prompt.length, lastRole });
     const content = extractContent(opts.prompt, sid);
     const text = content.filter((p): p is { type: "text"; text: string } => p.type === "text").map(p => p.text).join("\n\n");
-    const systemPrompt = extractSystemPrompt(opts.prompt);
+    const systemPrompt = sanitizePrompt(extractSystemPrompt(opts.prompt), "opencode");
     detectAgent(sid, opts.headers);
     const cwd = (this.config.client ? await getSessionDirectory(this.config.client, sid) : null) ?? this.config.cwd ?? process.cwd();
     const self = this;
@@ -615,7 +724,20 @@ export class ClwndModel implements LanguageModelV3 {
 
     // Include prior petals — daemon compares with JSONL state and grafts only what's new
     const priorPetals = opts.prompt.filter(m => m.role === "user" || m.role === "assistant" || m.role === "tool");
-    trace("priorPetals", { sid, count: priorPetals.length, roles: priorPetals.map(m => m.role).join(",") });
+    trace("priorPetals", { 
+      sid, 
+      count: priorPetals.length, 
+      roles: priorPetals.map(m => m.role).join(","),
+      hasToolUse: priorPetals.some(p => 
+        p.role === "assistant" && 
+        Array.isArray(p.content) && 
+        p.content.some((c: any) => c.type === "tool-call")
+      ),
+      toolCallCount: priorPetals.filter(p => 
+        p.role === "assistant" && 
+        Array.isArray(p.content)
+      ).reduce((acc, p) => acc + (p.content as any[]).filter((c: any) => c.type === "tool-call").length, 0)
+    });
 
     // Detect compaction: petal count dropped >50% — OC compacted, reset Claude JSONL
     if (!skipGraft) {
