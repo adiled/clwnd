@@ -82,23 +82,34 @@ function mapToolName(name: string): string {
 
 const BROKERED_TOOLS = new Set(["webfetch", "websearch", "todowrite"]);
 
-// Tools handled natively by clwnd — anything NOT in this set from opts.tools is external
+// Tools handled natively by clwnd — anything NOT in this set from opts.tools
+// is treated as an external MCP tool and forwarded to Claude CLI for dispatch.
+// do_code/do_noncode replace edit+write; read absorbs glob+grep via modifiers.
+//
+// REPLACED legacy tools are INCLUDED in this set so they're silently dropped
+// from opts.tools by the external-tool filter — Claude CLI never even learns
+// they exist. Without this, OC's built-in edit/write/glob/grep tool defs get
+// forwarded as "external" MCP tools, Claude sees them, calls them, and
+// clwnd's dispatcher bounces them as unknown. The agent wastes round-trips
+// discovering what's gone.
 const KNOWN_TOOLS = new Set([
-  "read", "edit", "write", "bash", "glob", "grep",
+  "read", "do_code", "do_noncode", "bash",
   "webfetch", "websearch", "todowrite",
   "task", "skill", "todoread", "taskoutput", "taskstop",
   "question", "clwnd_permission", "permission_prompt",
   "cronCreate", "cronDelete", "cronList",
   "notebookedit", "codesearch", "applypatch", "ls",
+  // Replaced-and-banned. Do not forward. Do not re-enable.
+  "edit", "write", "glob", "grep",
 ]);
 
+// Map OC's snake_case schema fields to the camelCase Claude CLI expects.
+// New surface only: read (absorbs glob+grep via modifiers), do_code, do_noncode.
 const INPUT_FIELD_MAP: Record<string, Record<string, string>> = {
-  read:  { file_path: "filePath" },
-  edit:  { file_path: "filePath", old_string: "oldString", new_string: "newString", replace_all: "replaceAll" },
-  write: { file_path: "filePath" },
-  bash:  {},
-  glob:  {},
-  grep:  {},
+  read:       { file_path: "filePath" },
+  do_code:    { file_path: "filePath", new_source: "newSource" },
+  do_noncode: { file_path: "filePath" },
+  bash:       {},
 };
 
 function mapToolInput(toolName: string, input: string): string {
@@ -467,21 +478,16 @@ function sanitizePrompt(text: string, word: string): string {
 }
 
 // ─── Detection Helpers ───────────────────────────────────────────────────
-
-function isAuxiliaryCall(opts: LanguageModelV3CallOptions): boolean {
-  return opts.tools === undefined;
-}
-
-// Pick a cheaper model for auxiliary calls (compaction summaries, empty-tool
-// one-shots). Opus → Sonnet, Sonnet → Haiku, Haiku stays. Auxiliary calls
-// spawn a fresh Claude CLI subprocess per AUXILIARY_CALLS.md, so the model
-// swap costs zero extra respawn. A compaction summary does not need Opus
-// reasoning — Sonnet at ~60% and Haiku at ~20% of Opus pricing do it fine.
-function pickAuxModel(primary: string): string {
-  if (/^claude-opus/i.test(primary)) return "claude-sonnet-4-6";
-  if (/^claude-sonnet/i.test(primary)) return "claude-haiku-4-5";
-  return primary;
-}
+//
+// There is no longer a unified "auxiliary call" concept. OC has two
+// distinct agent types we handle specially: `title` (skipped entirely —
+// clwnd doesn't title-gen) and `compaction` (passes through to Claude CLI
+// but tells the daemon to truncate the JSONL in place so the next turn
+// starts from the summary). Everything else is a normal build/chat turn.
+// An earlier revision swapped the model on empty-tools calls ("aux model
+// routing") as a cost optimization. That swap pollutes the nest pool
+// with the wrong model and silently downgrades the next real turn, so it
+// was ripped. The user's selected model now passes through every turn.
 
 function isBrokeredToolReturn(prompt: LanguageModelV3Prompt): boolean {
   if (prompt.length < 2) return false;
@@ -504,6 +510,10 @@ function isBrokeredToolReturn(prompt: LanguageModelV3Prompt): boolean {
 
 const sessionLastAgent = new Map<string, string>();
 const sessionPetalCounts = new Map<string, number>();
+// Set true in the compaction doStream, consumed + cleared in the next build
+// doStream on the same session. Primary signal that OC just compacted;
+// the petal-count drop is a fallback for anything that bypasses the marker.
+const sessionJustCompacted = new Map<string, boolean>();
 
 function detectAgent(sid: string, headers?: Record<string, string | undefined>): string | null {
   const raw = headers?.["x-clwnd-agent"] ?? null;
@@ -568,8 +578,11 @@ async function getMcpServerConfigs(client: unknown): Promise<Array<{ name: strin
 }
 
 const OC_TO_MCP: Record<string, string> = {
-  read: "read", edit: "edit", write: "write", bash: "bash",
-  glob: "glob", grep: "grep", apply_patch: "edit", webfetch: "webfetch",
+  read: "read",
+  do_code: "do_code",
+  do_noncode: "do_noncode",
+  bash: "bash",
+  webfetch: "webfetch",
 };
 
 const lastAllowedTools = new Map<string, string>();
@@ -591,18 +604,16 @@ const pendingPenny = {
   humDedup: 0,
   reminderStripped: 0,
   priorPetalsElided: 0,
-  auxModelRouted: 0,
 };
 function flushPenny(): Record<string, number> | undefined {
   if (pendingPenny.humDedup === 0 && pendingPenny.reminderStripped === 0
-      && pendingPenny.priorPetalsElided === 0 && pendingPenny.auxModelRouted === 0) {
+      && pendingPenny.priorPetalsElided === 0) {
     return undefined;
   }
   const snap = { ...pendingPenny };
   pendingPenny.humDedup = 0;
   pendingPenny.reminderStripped = 0;
   pendingPenny.priorPetalsElided = 0;
-  pendingPenny.auxModelRouted = 0;
   return snap;
 }
 
@@ -621,7 +632,7 @@ export function clearSessionHashes(sid: string): void {
 }
 
 const AGENT_DENY: Record<string, Set<string>> = {
-  plan: new Set(["edit", "write"]),
+  plan: new Set(["do_code", "do_noncode"]),
 };
 
 function deriveAllowedTools(sid: string, opts: LanguageModelV3CallOptions): string[] {
@@ -629,7 +640,7 @@ function deriveAllowedTools(sid: string, opts: LanguageModelV3CallOptions): stri
   let agentName = agent;
   try { const p = JSON.parse(agent); if (p?.name) agentName = p.name; } catch {}
   const denied = AGENT_DENY[agentName] ?? new Set();
-  const all = ["read", "edit", "write", "bash", "glob", "grep", "webfetch"];
+  const all = ["read", "do_code", "do_noncode", "bash", "webfetch"];
   const result = all.filter(t => !denied.has(t));
   const key = result.join(",");
   const prev = lastAllowedTools.get(sid);
@@ -681,20 +692,14 @@ export class ClwndModel implements LanguageModelV3 {
   }
 
   async doGenerate(opts: LanguageModelV3CallOptions): Promise<LanguageModelV3GenerateResult> {
-    // Check for title generation - return empty
+    // Title agent is the only OC call we short-circuit — clwnd doesn't waste
+    // tokens generating session titles. Every other call (including OC's
+    // compaction agent) delegates to doStream and runs with the user's
+    // selected model.
     const rawAgent = opts.headers?.["x-clwnd-agent"] ?? "";
     let agentName = rawAgent;
     try { const p = JSON.parse(rawAgent); if (p?.name) agentName = p.name; } catch {}
     if (agentName === "title") {
-      return {
-        content: [{ type: "text", text: "" }],
-        usage: zeroUsage(),
-        finishReason: { unified: "stop", raw: "stop" },
-        warnings: [],
-      };
-    }
-    
-    if (isAuxiliaryCall(opts)) {
       return {
         content: [{ type: "text", text: "" }],
         usage: zeroUsage(),
@@ -739,13 +744,27 @@ export class ClwndModel implements LanguageModelV3 {
     const permissions = await getSessionPermissions(this.config.client, sid);
     const allowedTools = deriveAllowedTools(sid, opts);
 
-    // Detect title generation (agent=title) vs regular calls
+    // Detect each OC built-in agent independently. NEVER unify these under
+    // a generic "auxiliary" bucket — past revisions did that (via an
+    // isEmptyTools heuristic) and it caused a silent model downgrade because
+    // the nest pool cached the wrong model. OC defines agents explicitly;
+    // treat each one explicitly.
+    //
+    //   title       — skipped entirely. clwnd does not generate titles.
+    //   compaction  — passes through to Claude CLI with the user's selected
+    //                 model (NO model swap). We just skip graft because OC
+    //                 already owns the compacted history state and there is
+    //                 nothing for the daemon to reconcile.
+    //   build/chat  — normal flow, full graft.
+    //
+    // If OC adds more built-in agents in the future, add a new branch.
+    // Do not introduce a generic fallback that treats them alike.
     const rawAgent = opts.headers?.["x-clwnd-agent"] ?? "";
     let agentName = rawAgent;
     try { const p = JSON.parse(rawAgent); if (p?.name) agentName = p.name; } catch {}
     const isTitleGen = agentName === "title";
-    const isEmptyTools = !opts.tools || opts.tools.length === 0;
-    
+    const isCompaction = agentName === "compaction";
+
     // Skip title generation entirely - return empty, don't pass to Claude
     if (isTitleGen) {
       trace("title.skip", { method: "doStream", sid });
@@ -758,19 +777,13 @@ export class ClwndModel implements LanguageModelV3 {
         }),
       };
     }
-    
-    const skipGraft = isEmptyTools;
-    if (skipGraft) trace("graft.skip", { method: "doStream", sid, reason: "emptyTools", toolsLen: opts.tools?.length ?? "undefined" });
 
-    // Auxiliary calls (empty tools = compaction summaries per AUXILIARY_CALLS.md)
-    // get routed to a cheaper model. Spawn is already fresh for these calls so
-    // the swap costs nothing extra. Only affects this single turn's hum — the
-    // session's primary modelId in OC is untouched.
-    const effectiveModel = isEmptyTools ? pickAuxModel(self.modelId) : self.modelId;
-    if (effectiveModel !== self.modelId) {
-      pendingPenny.auxModelRouted++;
-      trace("aux.model.routed", { sid, primary: self.modelId, aux: effectiveModel });
-    }
+    // Compaction is an OC-owned flow — OC has already decided the history
+    // should be replaced with a summary, so we don't need to graft the old
+    // turns into the JSONL. We still forward the request to Claude CLI so
+    // the summary is generated on the user's actual model.
+    const skipGraft = isCompaction;
+    if (skipGraft) trace("graft.skip", { method: "doStream", sid, reason: "compaction" });
 
     // Hash-dedup of per-turn hygiene fields. systemPrompt / permissions /
     // allowedTools rarely change during a session — the daemon falls back to
@@ -847,27 +860,51 @@ export class ClwndModel implements LanguageModelV3 {
       ).reduce((acc, p) => acc + (p.content as any[]).filter((c: any) => c.type === "tool-call").length, 0)
     });
 
-    // Detect compaction: petal count dropped >50% — OC compacted, reset Claude JSONL
+    // Tell the daemon to reset its session view whenever we know OC just
+    // compacted. Two signals, checked on the FIRST build turn after the
+    // compaction agent call:
+    //
+    //   (1) The most recent prior turn was compaction (sessionLastAgent
+    //       remembers it). This is the authoritative signal — OC explicitly
+    //       named the agent.
+    //   (2) Fallback heuristic: the petal count dropped by >= 2 since the
+    //       previous build turn. OC's normal prompt loop is append-only so
+    //       any shrink is abnormal. The absolute-drop threshold catches the
+    //       real case (where post-compaction petals stay around 60% of the
+    //       pre-compaction count, so a ratio threshold missed it).
+    //
     // Also decide whether to elide priorPetals from the hum payload: if the
-    // petal count hasn't changed since the last send, graft() would be a no-op
-    // anyway (graft is count-idempotent), and we can save re-serializing the
-    // whole history over the hum socket.
+    // petal count hasn't changed since the last send, graft() would be a
+    // no-op anyway (graft is count-idempotent), and we can save
+    // re-serializing the whole history over the hum socket.
     let prevPetalCount = 0;
     let elidePriorPetals = false;
     if (!skipGraft) {
       prevPetalCount = sessionPetalCounts.get(sid) ?? 0;
       sessionPetalCounts.set(sid, priorPetals.length);
-      if (prevPetalCount > 0 && priorPetals.length < prevPetalCount * 0.5) {
-        trace("compaction.detected", { sid, prev: prevPetalCount, now: priorPetals.length });
+      const dropped = prevPetalCount - priorPetals.length;
+      const justCompacted = sessionJustCompacted.get(sid) === true;
+      if (justCompacted || (prevPetalCount > 0 && dropped >= 2)) {
+        trace("compaction.detected", { sid, prev: prevPetalCount, now: priorPetals.length, dropped, reason: justCompacted ? "agent" : "petal-drop" });
         hum({ chi: "cancel", sid, reason: "compaction" });
+        sessionJustCompacted.delete(sid);
       } else if (prevPetalCount === priorPetals.length && prevPetalCount > 0) {
         elidePriorPetals = true;
         pendingPenny.priorPetalsElided++;
         trace("priorPetals.elided", { sid, count: priorPetals.length });
       }
     }
+    if (isCompaction) {
+      // Mark so the NEXT build turn (the post-compaction one) recognizes
+      // the transition and triggers the cancel + truncate flow.
+      sessionJustCompacted.set(sid, true);
+    }
 
-    // Extract external tools from opts.tools — anything OC has that clwnd doesn't handle natively
+    // Extract external MCP tools from opts.tools — anything OC has that
+    // clwnd doesn't handle natively (e.g. context7). KNOWN_TOOLS includes
+    // both our native surface (read/do_code/do_noncode/bash/…) AND the
+    // legacy-replaced tools (edit/write/glob/grep) so neither gets
+    // forwarded to Claude CLI as a pseudo-MCP tool.
     const externalTools: Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }> = [];
     const externalToolNames = new Set<string>();
     if (opts.tools) {
@@ -879,9 +916,14 @@ export class ClwndModel implements LanguageModelV3 {
         externalToolNames.add(name);
       }
     }
-    const allToolNames = opts.tools ? opts.tools.filter(t => t.type === "function").map(t => t.name) : [];
-    trace("tools.available", { sid, count: allToolNames.length, names: allToolNames.join(",") });
+    const ocToolNames = opts.tools ? opts.tools.filter(t => t.type === "function").map(t => t.name) : [];
+    trace("tools.available", { sid, count: ocToolNames.length, names: ocToolNames.join(",") });
     if (externalTools.length > 0) trace("external.tools.detected", { sid, names: [...externalToolNames].join(",") });
+    // visibleTools in the hum is ONLY external names — clwnd's native tools
+    // are always advertised by the MCP server regardless. Sending OC's whole
+    // tool list used to pollute this channel with legacy names that got
+    // looked up in a mapping table and either missed or created ghost tools.
+    const visibleExternalNames = [...externalToolNames];
 
     // Send prompt before creating stream — survives OC plugin reload
     let promptSent = false;
@@ -891,7 +933,7 @@ export class ClwndModel implements LanguageModelV3 {
       const pd = flushPenny();
       hum({
         chi: "prompt", sid, cwd,
-        modelId: effectiveModel,
+        modelId: self.modelId,
         listenOnly: true,
         ...(pd ? { pennyDelta: pd } : {}),
         dusk: duskIn(30_000),
@@ -905,7 +947,7 @@ export class ClwndModel implements LanguageModelV3 {
       const pd = flushPenny();
       hum({
         chi: "prompt", sid, cwd,
-        modelId: effectiveModel,
+        modelId: self.modelId,
         content, text,
         ...(sendSystemPrompt ? { systemPrompt } : {}),
         ...(sendPermissions ? { permissions } : {}),
@@ -916,7 +958,7 @@ export class ClwndModel implements LanguageModelV3 {
         ...(elidePriorPetals ? {} : { priorPetals }),
         externalTools: externalTools.length > 0 ? externalTools : undefined,
         mcpServerConfigs: await getMcpServerConfigs(this.config.client),
-        visibleTools: allToolNames,
+        visibleTools: visibleExternalNames,
         ...(pd ? { pennyDelta: pd } : {}),
         dusk: duskIn(30_000),
       });

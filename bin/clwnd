@@ -123,7 +123,6 @@ try:
     print(f'  Reminder stripped: {c.get(\"reminderStripped\", 0):>7}')
     print(f'  Hum dedup:         {c.get(\"humDedup\", 0):>7}  prompts skipped ≥1 field')
     print(f'  priorPetals elided:{c.get(\"priorPetalsElided\", 0):>7}')
-    print(f'  Aux model routed:  {c.get(\"auxModelRouted\", 0):>7}')
     top = d.get('topContextSessions', [])
     if top:
         print()

@@ -4,10 +4,17 @@
 // daemon restart — accumulating a lifetime view by default.
 //
 // Plugin-side optimizations (system-reminder dedup, hum hash dedup,
-// priorPetals elision, aux model routing) live in OpenCode's plugin
-// process, not the daemon. The plugin piggybacks a `pennyDelta` field
-// on every prompt hum; the daemon adds it into this shared struct on
-// receipt. See provider.ts flushPennyDelta() and daemon.ts case "prompt".
+// priorPetals elision) live in OpenCode's plugin process, not the daemon.
+// The plugin piggybacks a `pennyDelta` field on every prompt hum; the
+// daemon adds it into this shared struct on receipt. See provider.ts
+// flushPennyDelta() and daemon.ts case "prompt".
+//
+// NOTE: an earlier revision had an `auxModelRouted` counter tracking turns
+// where clwnd silently swapped opus → sonnet-4-6 on empty-tool calls. That
+// swap was ripped because it polluted the nest pool with the wrong model
+// and silently downgraded the next build turn. Do not reintroduce it: OC
+// built-in agents (title, compaction) should each be detected and handled
+// independently, never unified under a generic "auxiliary" bucket.
 
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname } from "path";
@@ -25,7 +32,6 @@ export interface Penny {
   humDedup: number;           // prompt hums with ≥1 dedup'd field (sp/perm/tools)
   reminderStripped: number;   // system-reminder blocks stripped as duplicates
   priorPetalsElided: number;  // prompt hums where priorPetals was elided
-  auxModelRouted: number;     // turns routed to a cheaper auxiliary model
 }
 
 export type PennyDelta = Partial<Omit<Penny, "started">>;
@@ -40,7 +46,6 @@ export const penny: Penny = {
   humDedup: 0,
   reminderStripped: 0,
   priorPetalsElided: 0,
-  auxModelRouted: 0,
 };
 
 export function pennyReset(): void {
@@ -53,7 +58,6 @@ export function pennyReset(): void {
   penny.humDedup = 0;
   penny.reminderStripped = 0;
   penny.priorPetalsElided = 0;
-  penny.auxModelRouted = 0;
 }
 
 // Merge a delta (from the plugin) into the live counters.
@@ -67,7 +71,6 @@ export function pennyAdd(delta: PennyDelta): void {
   if (typeof delta.humDedup === "number") penny.humDedup += delta.humDedup;
   if (typeof delta.reminderStripped === "number") penny.reminderStripped += delta.reminderStripped;
   if (typeof delta.priorPetalsElided === "number") penny.priorPetalsElided += delta.priorPetalsElided;
-  if (typeof delta.auxModelRouted === "number") penny.auxModelRouted += delta.auxModelRouted;
 }
 
 // Load persisted counters. Called once on daemon startup. Missing or corrupt
@@ -84,7 +87,6 @@ export function pennyLoad(path: string): void {
     penny.humDedup = data.humDedup ?? 0;
     penny.reminderStripped = data.reminderStripped ?? 0;
     penny.priorPetalsElided = data.priorPetalsElided ?? 0;
-    penny.auxModelRouted = data.auxModelRouted ?? 0;
   } catch {
     // First run, corrupt file, missing file — all fine, stay at zero.
   }

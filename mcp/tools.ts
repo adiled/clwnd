@@ -3,13 +3,13 @@
  * Shared between the stdio server and the daemon's HTTP MCP endpoint.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, readdirSync, type Stats } from "fs";
 import { execSync } from "child_process";
-import { resolve, dirname, relative, extname } from "path";
+import { resolve, dirname, relative, extname, join as pathJoin } from "path";
 
 import { trace } from "../log.ts";
 import { penny } from "../lib/penny.ts";
-import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, astGrep, formatGrepMatches, searchSymbols, type Symbol } from "../lib/ast.ts";
+import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, astGrep, searchSymbols, validateSyntax, symbolLineRange, type Symbol } from "../lib/ast.ts";
 
 let CWD = process.env.CLWND_CWD ?? process.cwd();
 
@@ -71,81 +71,151 @@ function assertPath(p: string): string {
 export const TOOLS = [
   {
     name: "read",
-    description: "Read a file, directory, or code symbols. For code files (ts/tsx/js/jsx/py/go/rs), this tool is AST-aware via tree-sitter and exposes symbol-scoped reads that no other tool can match. STRONG PREFERENCE ORDER for code files: (1) If you know what function/class/method you want, use `symbol` (e.g. symbol='handleRequest' or symbol='Server.start') — returns ONLY that symbol's source, typically 10–50× smaller than the whole file. (2) If you're looking for something by fuzzy name, use `query` (e.g. query='auth' returns every matching function/class). (3) Only fall back to a full-file read when you truly need the whole file (configs, small files, or you haven't explored the symbol table yet). A full-file read on a code file will prepend a symbol outline — use that outline to plan a symbol-scoped follow-up instead of re-reading the file. Always print tool results to the user — they cannot see tool output directly.",
+    description: `The ONE filesystem analysis tool. It discovers, studies, and searches — replacing any line-based read, any glob, any grep. No offset, no limit, no pagination. Code is analysed via tree-sitter so you reason about symbols, not text pages.
+
+═══════════════════════════════════════════════════════════════════
+QUICKSTART — five concrete tasks and the exact call:
+═══════════════════════════════════════════════════════════════════
+1. "What's in this file?"
+     → read('/abs/path/daemon.ts')
+     returns: file stats + first 20 lines + full symbol outline + hints
+
+2. "Show me the foo() function"
+     → read('/abs/path/daemon.ts', symbol: 'foo')
+     returns: just foo's source, line-numbered
+
+3. "Find every trace() call in daemon.ts"
+     → read('/abs/path/daemon.ts', pattern: 'trace\\\\(')
+     returns: every matching line with its enclosing symbol,
+              e.g. "daemon.ts:82 [function ClaudeNest.awaken] trace(…"
+
+4. "Find all handlers across src/"
+     → read('/abs/path/src', query: 'handle')
+     recursively fuzzy-matches symbol names across the whole tree
+
+5. "What .py tests exist?"
+     → read('/abs/path/**/test_*.py')
+     glob expands, returns one-line inventory per file
+
+═══════════════════════════════════════════════════════════════════
+path semantics (auto-detected):
+  /abs/path/file           → single file
+  /abs/path/dir            → walks the tree (skips node_modules, .git, …)
+  /abs/path/**/glob.pattern → glob expands (detected by * or ?)
+
+modifiers (pick at most one, mutually exclusive):
+  symbol: 'X'     exact symbol by name. Dot-nested: 'Class.method'.
+  query:  'sub'   fuzzy substring match on symbol NAMES.
+  pattern: 'regex' regex on file CONTENT. For code, each match carries
+                   its enclosing function/class symbol.
+
+═══════════════════════════════════════════════════════════════════
+RULES:
+- No offset, no limit, no line numbers in the request — that is not
+  how an agent should interact with code. If you catch yourself
+  wanting "lines 400-800 of X", you want read(X, symbol: 'SomeFunc')
+  or read(X, pattern: 'thing-I-was-looking-for').
+- Start with the modifier-free call read(path) ONLY when you don't
+  know the file yet. If you already know what you want, go straight
+  to symbol/pattern/query — the modifier-free call is slower.
+- AST-backed code: ts/tsx/js/jsx/py/go/rs. Other files get plain
+  line-based regex for pattern and full content for the default read.
+- Always print the tool result to the user — they cannot see it
+  directly.
+- This tool is self-sufficient. Do NOT reach for bash ls/find/grep/
+  cat/head/tail — they are hard-banned and will be rejected with a
+  redirect back to this tool.`,
     inputSchema: {
       type: "object" as const,
       properties: {
-        file_path: { type: "string", description: "Absolute path to the file or directory to read" },
-        offset: { type: "number", description: "Line number to start reading from (1-indexed)" },
-        limit: { type: "number", description: "Maximum number of lines to read (default 2000, matches native Claude Code)" },
-        symbol: { type: "string", description: "PREFERRED for code files: read a specific symbol by name (e.g. 'graft', 'Server.start'). Dot-separated for nested symbols." },
-        query: { type: "string", description: "PREFERRED for fuzzy code exploration: return sources of all symbols whose name matches (e.g. 'handle' finds handleRequest, handleAuth, etc.)." },
+        file_path: { type: "string", description: "Absolute file path, absolute directory path, or glob pattern (detected by presence of * or ?). Examples: '/home/user/src/auth.ts', '/home/user/src', '/home/user/src/**/*.ts', '/home/user/**/test_*.py'." },
+        symbol: { type: "string", description: "Extract a specific symbol by exact name. Dot-separated for nested members (e.g. 'Server.start', 'ClaudeNest.awaken'). Works across whatever the path resolves to — pass a directory or glob to search the symbol in every file." },
+        query: { type: "string", description: "Fuzzy case-insensitive substring match on symbol NAMES (not content). Returns each matching symbol's source. Use this for 'find anything whose name looks like X'." },
+        pattern: { type: "string", description: "Regex over file CONTENT. For code files, each match is returned with its enclosing function/class symbol so you know which structural unit to read next. For non-code files, plain regex over lines." },
       },
       required: ["file_path"],
     },
   },
   {
-    name: "edit",
-    description: "Make exact string replacements in a file. old_string must be unique in the file. Use read with symbol parameter first to get the exact text to replace.",
+    name: "do_code",
+    description: `Write or modify a code file. This is the ONLY way to author code in clwnd — there is no string-replace edit, no fuzzy match, no "old_string / new_string" vocabulary. Edits are grounded in the tree-sitter AST: you target a symbol by name, you provide the new source for it, and clwnd re-parses the result before writing. Any edit that would leave the file syntactically invalid is rejected without touching disk.
+
+ACCEPTS: code files only. Extensions: ts, tsx, js, jsx, mjs, cjs, py, pyi, go, rs, java, c, cc, cpp, cxx, h, hpp, hxx, rb, php, cs, kt, kts, swift, scala, lua, sh, bash, zsh, fish, vue, svelte, sql. Anything else → use do_noncode.
+
+FIVE OPERATIONS — pick one via the 'operation' field:
+
+  operation: 'create'
+    Create a brand-new code file. The file must not already exist. Required: new_source. Content is re-parsed for syntax and the file is only written if parsing succeeds.
+    Example: do_code('/src/auth/handler.ts', operation: 'create', new_source: 'export function handle() { … }')
+
+  operation: 'replace' WITH symbol
+    Replace the full source of an existing symbol. Required: symbol, new_source. The symbol's AST-derived line range is found, those lines are spliced out, new_source is inserted, and the whole file is re-parsed. The new_source should be the complete new source of the symbol (including its header and body).
+    Example: do_code('/src/auth/handler.ts', operation: 'replace', symbol: 'Server.start', new_source: 'async start(port: number) { … }')
+
+  operation: 'replace' WITHOUT symbol
+    Full-file rewrite. Required: new_source is the entire new file content. Re-parsed before writing. Use this only when every line is changing; prefer symbol-scoped replace when possible.
+
+  operation: 'insert_after'  /  'insert_before'
+    Add a new symbol immediately after / before an existing one. Required: symbol (the anchor), new_source (the new code block). A blank-line separator is added automatically. Re-parsed.
+    Example: do_code('/src/auth/handler.ts', operation: 'insert_after', symbol: 'Server.start', new_source: 'async stop() { … }')
+
+  operation: 'delete'
+    Remove a symbol from the file. Required: symbol. No new_source. Re-parsed.
+    Example: do_code('/src/auth/handler.ts', operation: 'delete', symbol: 'deprecatedHelper')
+
+WORKFLOW: before calling do_code on an existing file, read it first — both to see the symbol outline AND to clear clwnd's staleness guard, which rejects edits whose baseline is older than the current mtime. Typical loop: read(file) → do_code(file, operation, symbol, new_source) → read(file, symbol: ...) to verify.`,
     inputSchema: {
       type: "object" as const,
       properties: {
-        file_path: { type: "string", description: "Absolute path to the file to modify" },
-        old_string: { type: "string", description: "The exact text to find and replace" },
-        new_string: { type: "string", description: "The replacement text" },
-        replace_all: { type: "boolean", description: "Replace all occurrences (default false)" },
+        file_path: { type: "string", description: "Absolute path to the code file. Must have a code extension (ts, py, go, rs, java, cpp, etc.) — do_code refuses non-code." },
+        operation: { type: "string", description: "One of: create, replace, insert_before, insert_after, delete. Default: replace." },
+        symbol: { type: "string", description: "Target symbol name. Required for replace (unless rewriting the whole file), insert_before, insert_after, delete. Dot-separated for nested (e.g. 'Class.method')." },
+        new_source: { type: "string", description: "The new source code. Required for create, replace, insert_before, insert_after. For symbol-scoped replace, pass the full new source of that symbol. For whole-file replace, pass the entire new file content." },
       },
-      required: ["file_path", "old_string", "new_string"],
+      required: ["file_path"],
     },
   },
   {
-    name: "write",
-    description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does.",
+    name: "do_noncode",
+    description: `Write or modify a non-code file. This is the ONLY way to author non-code in clwnd — no in-place string editing, no pattern matching, no symbol vocabulary (there is no AST for non-code). You hand over content; clwnd writes it. Three modes: write (create or overwrite), append (add to the end), prepend (add to the beginning).
+
+ACCEPTS: anything that is NOT a code file. Configs (json, yaml, toml, ini, env), docs (md, txt, rst), markup (html, xml, svg), stylesheets (css, scss, less), data (csv, tsv, jsonl), logs, plain text.
+
+REFUSES: any file whose extension puts it in do_code's territory. If you need to change a code file, use do_code with a symbol or a full-file replace — there is no escape hatch.
+
+MODES:
+
+  mode: 'write' (default)
+    Create the file if it doesn't exist, or overwrite it entirely if it does. A fresh write does not require prior context. An overwrite of an existing file does require a prior read in the same session (staleness guard) UNLESS you genuinely don't care what was there.
+
+  mode: 'append'
+    Append content to the end of an existing file. Requires the file to exist and to have been read in this session (staleness guard). Content is added verbatim — include your own leading newline if needed.
+
+  mode: 'prepend'
+    Prepend content to the beginning of an existing file. Same staleness requirement as append.
+
+Typical uses: writing a README, updating a config, appending a changelog entry, dumping JSON output to disk, creating a new markdown note.`,
     inputSchema: {
       type: "object" as const,
       properties: {
-        file_path: { type: "string", description: "Absolute path to the file to write" },
-        content: { type: "string", description: "The content to write" },
+        file_path: { type: "string", description: "Absolute path to a non-code file. Code extensions (ts, py, go, rs, java, etc.) are rejected — use do_code for those." },
+        content: { type: "string", description: "The content to write/append/prepend. Written exactly as provided." },
+        mode: { type: "string", description: "One of: write, append, prepend. Default: write." },
       },
       required: ["file_path", "content"],
     },
   },
   {
     name: "bash",
-    description: "Execute a shell command. Use ONLY for running programs, scripts, git, tests, package managers, and system commands. Do NOT use for searching code or reading files — use the read and grep tools instead, they have AST-powered symbol search.",
+    description: "Execute a shell command. This is the escape hatch for actions that aren't filesystem analysis or modification: running tests, git operations, build scripts, package managers, starting/stopping services, invoking language runtimes, calling CLI utilities.\n\nHARD BANNED COMMANDS — if the first token (or the first token after a pipe/&&/||/;) is one of these, the call is rejected with a redirect to the right `read` invocation, NO shell execution happens: `ls`, `find`, `grep`, `rg`, `ripgrep`, `cat`, `head`, `tail`, `sed`, `awk`, `cut`, `sort -u`, `uniq`, `wc`, `more`, `less`, `tree`, `du`, `file`, `od`, `xxd`, `strings`. Do not try to wrap these in `bash -c`, `sh -c`, `env`, or shell functions — the filter checks after unwrapping.\n\nThe correct tool for EVERY file-inspection task is `read`: `read(path)` for a directory listing or file study view; `read(path, pattern: 'regex')` for content search (AST-aware for code); `read(path, symbol: 'X')` for a specific symbol; `read(path, query: 'sub')` for fuzzy symbol name search; `read('/glob/**/*.ts')` for glob file discovery. There is NO case where bash beats read for file inspection — if you think there is, you're misreading the task.\n\nUse bash for: `git <anything>`, `npm/yarn/pnpm/bun <anything>`, `pip/uv/cargo/go <anything>`, `tsc`, `make`, `pytest`, `jest`, `docker`, `systemctl`, `journalctl`, `curl`, `wget`, `kill`, `ps`, `date`, `whoami`, `echo`, `printf`, and anything else that isn't file-content inspection. Output over 30 KB is truncated.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        command: { type: "string", description: "The shell command to execute" },
+        command: { type: "string", description: "The shell command to execute. File-inspection commands (ls, find, grep, cat, head, tail, sed, awk, etc.) are rejected — use `read` instead." },
         description: { type: "string", description: "Short description of what the command does" },
         timeout: { type: "number", description: "Timeout in milliseconds (default 120000)" },
       },
       required: ["command"],
-    },
-  },
-  {
-    name: "glob",
-    description: "Find files matching a glob pattern. Returns matching file paths. Use this to discover files, then use read with symbol/query to explore their contents — do NOT use bash for file discovery.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        pattern: { type: "string", description: "Glob pattern to match (e.g. '**/*.ts')" },
-        path: { type: "string", description: "Directory to search in (default: cwd)" },
-      },
-      required: ["pattern"],
-    },
-  },
-  {
-    name: "grep",
-    description: "Search file contents using regex. For code files, returns matches with enclosing function/class context. For directories, searches recursively. Do NOT use bash grep — this tool is AST-aware and shows which symbol each match belongs to.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        pattern: { type: "string", description: "Regex pattern to search for" },
-        path: { type: "string", description: "Directory or file to search in (default: cwd)" },
-        include: { type: "string", description: "Glob pattern to filter files (e.g. '*.ts')" },
-      },
-      required: ["pattern"],
     },
   },
   {
@@ -224,9 +294,9 @@ function touchedMtime(sessionId: string | undefined, absPath: string): number | 
   return sessionTouched.get(sessionId)?.get(absPath);
 }
 
-function readCacheKey(absPath: string, args?: { offset?: number; limit?: number; symbol?: string; query?: string }): string {
-  if (!args || (!args.offset && !args.limit && !args.symbol && !args.query)) return absPath + "#";
-  return absPath + "#o=" + (args.offset ?? "") + "&l=" + (args.limit ?? "") + "&s=" + (args.symbol ?? "") + "&q=" + (args.query ?? "");
+function readCacheKey(absPath: string, args?: { symbol?: string; query?: string; pattern?: string }): string {
+  if (!args || (!args.symbol && !args.query && !args.pattern)) return absPath + "#";
+  return absPath + "#s=" + (args.symbol ?? "") + "&q=" + (args.query ?? "") + "&p=" + (args.pattern ?? "");
 }
 function readCacheCheck(sessionId: string, key: string, mtime: number): boolean {
   const sess = readCache.get(sessionId);
@@ -274,260 +344,871 @@ const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".
 const PDF_EXT = ".pdf";
 const IPYNB_EXT = ".ipynb";
 
-function execRead(args: { file_path: string; offset?: number; limit?: number; symbol?: string; query?: string }, sessionId?: string): ToolResult {
-  const p = assertPath(args.file_path);
-  checkPermission("read", p);
-  if (!existsSync(p)) return { output: `Error: ${p} does not exist`, title: p };
+// Output budget — safely under Claude CLI's 2000-tokens-per-tool-result cap
+// (eEH=2000 in the Claude binary, with UtH=4 chars/token → ~8000 char ceiling).
+// 7500 leaves ~500-char headroom for framing while still giving pattern
+// searches on busy regexes (86+ matches) enough space to deliver every hit
+// in a single call. Earlier 6000-char value forced pattern searches into
+// compact/minimal truncation, which Claude then interpreted as "narrow the
+// search more" and issued dozens of prefix-scoped follow-ups.
+const MAX_READ_OUTPUT = 7500;
+// Hard cap on number of files a single read call will resolve when given a
+// dir or glob — prevents a read of `/` from exploding into thousands of files.
+const MAX_RESOLVED_TARGETS = 200;
+// Directories we never recurse into when walking a tree. Keeping this list
+// small and conservative — real source directories that happen to share
+// these names (e.g. a directory called `test`) should still be walked.
+const SKIP_DIR_NAMES = new Set([
+  "node_modules", ".git", ".svn", ".hg", "dist", "build", ".next", ".nuxt",
+  ".turbo", "target", "__pycache__", ".venv", "venv", ".mypy_cache",
+  ".pytest_cache", ".cache", "coverage", ".idea", ".vscode",
+]);
 
-  try {
-    const stat = statSync(p);
-    if (stat.isDirectory()) {
-      const out = execSync(`ls -la "${p}"`, { encoding: "utf-8", timeout: 5000 });
-      return { output: out, title: relative(CWD, p) || p };
-    }
+function isGlobPattern(path: string): boolean {
+  return /[*?[\]]/.test(path);
+}
 
-    // Rich-media fallbacks — parity with Claude Code's native Read which
-    // handles notebooks, PDFs, and images. clwnd doesn't do image transform
-    // (resize ladders etc.) because we're not in the image-processing
-    // business; we route around the types we can't usefully stream as text.
-    const ext = extname(p).toLowerCase();
-    if (IMAGE_EXTS.has(ext)) {
-      return {
-        output: `[clwnd: ${p} is an image file (${(stat.size / 1024).toFixed(1)} KB, ${ext.slice(1).toUpperCase()}). Image content is not served as text by clwnd's Read tool — Claude's native image handling path is disabled while using clwnd's MCP tool surface. Use 'bash' to inspect metadata ('file "${p}"', 'identify "${p}"') or let the user attach the image directly to the conversation.]`,
-        title: relative(CWD, p) || p,
-        metadata: { filepath: p, fileType: "image", size: stat.size },
-      };
+// Expand a glob pattern to a list of absolute file paths. Uses the shell's
+// globstar + nullglob so `**` walks the tree and no-match becomes empty
+// instead of the literal pattern. Sorted newest-first by mtime.
+function expandGlobPattern(pattern: string): string[] {
+  // Decide the base dir: absolute patterns expand from the first component
+  // that has no wildcard; relative patterns expand from CWD.
+  let baseDir: string;
+  let pat: string;
+  if (pattern.startsWith("/")) {
+    const parts = pattern.split("/");
+    const firstWild = parts.findIndex(seg => isGlobPattern(seg));
+    if (firstWild === -1) {
+      // No wildcard despite the classifier — fall through as a literal.
+      return existsSync(pattern) ? [pattern] : [];
     }
-    if (ext === PDF_EXT) {
-      try {
-        const text = execSync(`pdftotext -layout -q "${p}" - 2>/dev/null`, { encoding: "utf-8", timeout: 30000 });
-        const lines = text.split("\n");
-        const totalLines = lines.length;
-        const offset = (args.offset ?? 1) - 1;
-        const limit = Math.min(args.limit ?? 2000, 2000);
-        const slice = lines.slice(offset, offset + limit);
-        const truncated = totalLines > offset + limit;
-        const numbered = slice.map((line, i) => `${offset + i + 1}\t${line}`).join("\n");
-        const suffix = truncated ? `\n[... truncated — showing ${slice.length} of ${totalLines} lines. Use offset/limit to read further.]` : "";
-        return {
-          output: `[clwnd: ${p} (${(stat.size / 1024).toFixed(1)} KB PDF, extracted via pdftotext)]\n${numbered}${suffix}`,
-          title: relative(CWD, p) || p,
-          metadata: { filepath: p, fileType: "pdf", size: stat.size, totalLines, truncated },
-        };
-      } catch {
-        return {
-          output: `[clwnd: ${p} is a PDF but pdftotext is not available (install poppler-utils). clwnd does not embed a PDF parser. You can ask the user to convert it to text, or install the tool via 'apt install poppler-utils' / 'brew install poppler'.]`,
-          title: relative(CWD, p) || p,
-          metadata: { filepath: p, fileType: "pdf", size: stat.size },
-        };
-      }
-    }
-    if (ext === IPYNB_EXT) {
-      try {
-        const raw = JSON.parse(readFileSync(p, "utf-8")) as { cells?: Array<{ cell_type?: string; source?: string[] | string }> };
-        const cells = raw.cells ?? [];
-        const sections: string[] = [];
-        sections.push(`[clwnd: ${p} — ${cells.length} cells, outputs omitted]`);
-        cells.forEach((c, i) => {
-          const src = Array.isArray(c.source) ? c.source.join("") : (c.source ?? "");
-          const kind = (c.cell_type ?? "unknown").toUpperCase();
-          sections.push(`--- cell ${i + 1} (${kind}) ---\n${src}`);
-        });
-        return {
-          output: sections.join("\n\n"),
-          title: relative(CWD, p) || p,
-          metadata: { filepath: p, fileType: "notebook", cells: cells.length },
-        };
-      } catch (e) {
-        return { output: `Error parsing notebook ${p}: ${(e as Error).message}`, title: relative(CWD, p) || p };
-      }
-    }
-
-    // Dedup-check: same file, same args, same mtime → placeholder. Covers full
-    // reads AND identical partial views. Partial views of the same file with
-    // different args (different symbol, different offset) each get their own
-    // cache entry and run independently.
-    if (sessionId && stat.isFile()) {
-      const key = readCacheKey(p, args);
-      if (readCacheCheck(sessionId, key, stat.mtimeMs)) {
-        penny.readDedupHits++;
-        penny.readDedupBytes += stat.size;
-        trace("read.cached", { sid: sessionId, path: p, size: stat.size, key: key.slice(p.length) });
-        const variant = key === p + "#" ? "full file" : "partial view (" + key.slice(p.length + 1) + ")";
-        return {
-          output: `[clwnd: ${p} ${variant} was already served earlier in this session and has not changed — content is still in conversation context, not re-reading. Edit the file or pass different offset/limit/symbol/query to force a fresh read.]`,
-          title: relative(CWD, p) || p,
-          metadata: { cached: true, loaded: [p] },
-        };
-      }
-      // Mark AFTER the real read succeeds (below)
-    }
-  } catch {}
-
-  const relPath = relative(CWD, p) || p;
-
-  // Symbol-based read: extract just the requested symbol
-  if (args.symbol) {
-    const result = readSymbol(p, args.symbol);
-    if (!result) return { output: `Symbol "${args.symbol}" not found in ${relPath}`, title: relPath };
-    if (sessionId) try {
-      const mt = statSync(p).mtimeMs;
-      readCacheMark(sessionId, p, readCacheKey(p, args), mt);
-      touchSession(sessionId, p, mt);
-    } catch {}
-    return {
-      output: result.source,
-      title: `${relPath}:${args.symbol}`,
-      metadata: { loaded: [p] },
-    };
+    baseDir = parts.slice(0, firstWild).join("/") || "/";
+    pat = parts.slice(firstWild).join("/");
+  } else {
+    baseDir = CWD;
+    pat = pattern;
   }
-
-  // Fuzzy symbol search: find matching symbols and return their source
-  if (args.query && astSupported(p)) {
-    const allResults = searchSymbols(p, args.query);
-    // Prefer functions/classes/methods over individual properties
-    const results = allResults.filter(s => s.kind !== "property") .length > 0
-      ? allResults.filter(s => s.kind !== "property")
-      : allResults;
-    if (results.length === 0) return { output: `No symbols matching "${args.query}" in ${relPath}`, title: relPath };
-    const source = readFileSync(p, "utf-8").split("\n");
-    const sections: string[] = [];
-    for (const s of results.slice(0, 10)) {
-      const range = s.startLine === s.endLine ? `L${s.startLine}` : `L${s.startLine}-${s.endLine}`;
-      const lines = source.slice(s.startLine - 1, s.endLine).map((l, i) => `${s.startLine + i}\t${l}`).join("\n");
-      sections.push(`--- ${s.kind} ${s.name} ${range} ---\n${lines}`);
-    }
-    const suffix = results.length > 10 ? `\n[+${results.length - 10} more matches]` : "";
-    if (sessionId) try {
-      const mt = statSync(p).mtimeMs;
-      readCacheMark(sessionId, p, readCacheKey(p, args), mt);
-      touchSession(sessionId, p, mt);
-    } catch {}
-    return {
-      output: sections.join("\n\n") + suffix,
-      title: `${relPath} ? ${args.query}`,
-      metadata: { count: results.length, loaded: [p] },
-    };
-  }
-
   try {
-    const content = readFileSync(p, "utf-8");
-    const lines = content.split("\n");
-    const totalLines = lines.length;
-
-    // For supported code files without offset, prepend symbol outline (NOT counted against limit)
-    let outline = "";
-    if (!args.offset && astSupported(p)) {
-      try {
-        const symbols = fileSymbols(p);
-        if (symbols && symbols.length > 0) {
-          outline = `--- symbols (${symbols.length}) ---\n${formatSymbols(symbols)}\n---\n`;
-        }
-      } catch {}
-    }
-
-    const offset = (args.offset ?? 1) - 1;
-    // Match Claude Code's native default (LrH=2000). Anything smaller forces
-    // Claude to issue a second Read call for files it would have received
-    // in one go on the native path — doubles tool-use overhead for nothing.
-    const limit = Math.min(args.limit ?? 2000, 2000);
-    const slice = lines.slice(offset, offset + limit);
-    const truncated = totalLines > offset + limit;
-    const numbered = slice.map((line, i) => `${offset + i + 1}\t${line}`).join("\n");
-    const suffix = truncated ? `\n[... truncated — showing ${slice.length} of ${totalLines} lines. Use offset/limit or symbol parameter to read specific sections.]` : "";
-    // Mark as "in context". Full reads mark under path+"#"; partial views
-    // (offset/limit) mark under a key that includes their args so an identical
-    // repeat dedups but a different range still runs. Also updates the
-    // session-touched witness so the Edit staleness guard has ground truth.
-    if (sessionId && !truncated) {
-      try {
-        const mt = statSync(p).mtimeMs;
-        readCacheMark(sessionId, p, readCacheKey(p, args), mt);
-        touchSession(sessionId, p, mt);
-      } catch {}
-    }
-    return {
-      output: outline + numbered + suffix,
-      title: relPath,
-      metadata: { truncated, loaded: [p] },
-    };
-  } catch (e: any) {
-    return { output: `Error reading ${p}: ${e.message}`, title: p };
+    const out = execSync(
+      `shopt -s globstar nullglob; cd "${baseDir}" && printf '%s\\0' ${pat} 2>/dev/null | ` +
+      `xargs -0 -r stat -c '%Y %n' 2>/dev/null | sort -rn | head -${MAX_RESOLVED_TARGETS} | cut -d' ' -f2-`,
+      { encoding: "utf-8", timeout: 10000, shell: "/bin/bash" },
+    );
+    return out.trim().split("\n").filter(Boolean).map(f => resolve(baseDir, f));
+  } catch {
+    return [];
   }
 }
 
-function execEdit(args: { file_path: string; old_string: string; new_string: string; replace_all?: boolean }, sessionId?: string): ToolResult {
-  const p = assertPath(args.file_path);
-  checkPermission("edit", p);
-  if (!existsSync(p)) return { output: `Error: ${p} does not exist` };
-
-  // Staleness guard — matches native Claude Code's behavior. If this session
-  // has EVER touched this file (read or edit), the sessionTouched map holds
-  // the mtime at that moment. Any mismatch vs the current mtime means some-
-  // thing else touched it since (linter, other process, human editor), so
-  // Claude's old_string is looking at stale content. Refuse and force a
-  // re-read. If this session has never touched the file, allow (scripted /
-  // blind edits still work).
-  if (sessionId) {
-    const known = touchedMtime(sessionId, p);
-    if (known !== undefined) {
-      try {
-        const currentMtime = statSync(p).mtimeMs;
-        if (currentMtime !== known) {
-          return { output: `Error: ${p} has been modified since your last read in this session — re-read the file before editing. (Staleness guard; matches native Claude Code behavior.)`, title: relative(CWD, p) || p };
-        }
-      } catch {}
+// Walk a directory tree for regular files, up to `max`. Skips common junk
+// directories (SKIP_DIR_NAMES) and anything starting with a dot. Used only
+// internally — the agent-visible API is `read(path)` where path is the dir.
+function walkDirectory(dir: string, max = MAX_RESOLVED_TARGETS): string[] {
+  const results: string[] = [];
+  const stack: string[] = [dir];
+  while (stack.length > 0 && results.length < max) {
+    const d = stack.pop()!;
+    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    try {
+      // Force the utf-8 string variant of Dirent — without an explicit
+      // encoding, Bun/Node's types widen to NonSharedBuffer.
+      entries = readdirSync(d, { withFileTypes: true, encoding: "utf-8" }) as unknown as Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    } catch { continue; }
+    for (const e of entries) {
+      if (results.length >= max) break;
+      const full = pathJoin(d, e.name);
+      if (e.isDirectory()) {
+        if (SKIP_DIR_NAMES.has(e.name) || e.name.startsWith(".")) continue;
+        stack.push(full);
+      } else if (e.isFile()) {
+        results.push(full);
+      }
     }
   }
+  return results;
+}
 
-  const original = readFileSync(p, "utf-8");
-  let content = original;
+// Resolve a user-supplied path into a concrete list of file paths. The path
+// may be an absolute file, an absolute directory (recursively walked), or a
+// glob pattern (detected by the presence of * or ?). Returns an empty list
+// when the path cannot be resolved or when nothing matches.
+function resolveReadTargets(rawPath: string): string[] {
+  if (isGlobPattern(rawPath)) return expandGlobPattern(rawPath);
+  let p: string;
+  try { p = assertPath(rawPath); } catch { return []; }
+  if (!existsSync(p)) return [];
+  let stat: Stats;
+  try { stat = statSync(p); } catch { return []; }
+  if (stat.isFile()) return [p];
+  if (stat.isDirectory()) return walkDirectory(p);
+  return [];
+}
 
-  if (args.replace_all) {
-    if (!content.includes(args.old_string)) return { output: `Error: old_string not found in ${p}` };
-    content = content.replaceAll(args.old_string, args.new_string);
-  } else {
-    const idx = content.indexOf(args.old_string);
-    if (idx === -1) return { output: `Error: old_string not found in ${p}` };
-    const secondIdx = content.indexOf(args.old_string, idx + 1);
-    if (secondIdx !== -1) return { output: `Error: old_string is not unique in ${p}. Provide more context or use replace_all.` };
-    content = content.replace(args.old_string, args.new_string);
-  }
+// Best-effort line count for a file — used in inventory views and the
+// code-file study header. Falls back to 0 on read failure.
+function safeLineCount(p: string): number {
+  try { return readFileSync(p, "utf-8").split("\n").length; } catch { return 0; }
+}
 
-  writeFileSync(p, content);
-  // Invalidate read cache — a subsequent read should get the new content —
-  // but update the session-touched witness with the new mtime so a chain of
-  // edits in the same session can still check against the last-known state.
-  readCacheInvalidate(sessionId, p);
-  try { touchSession(sessionId, p, statSync(p).mtimeMs); } catch {}
+// Build the STUDY VIEW for a single code file. This is what `read(file)`
+// returns when no modifier is set: header with size info, first 20 lines of
+// the file (imports + top-of-file context), the full AST symbol outline
+// (with ranges), and a short "drill in" hint block. Capped at
+// MAX_READ_OUTPUT; oversized outlines are truncated with a query hint.
+function studyCodeFile(p: string, stat: Stats, sessionId?: string): ToolResult {
+  const relPath = relative(CWD, p) || p;
+  const ext = extname(p).toLowerCase();
+  const content = readFileSync(p, "utf-8");
+  const lines = content.split("\n");
+  const preambleLines = Math.min(20, lines.length);
+  const preamble = lines.slice(0, preambleLines).map((l, i) => `${i + 1}\t${l}`).join("\n");
 
-  // Generate unified diff
-  let diff = "";
+  let outlineText = "(no symbols detected)";
+  let symbolCount = 0;
   try {
-    const { createPatch } = require("diff");
-    diff = createPatch(relative(CWD, p) || p, original, content, "", "");
+    const symbols = fileSymbols(p);
+    if (symbols && symbols.length > 0) {
+      symbolCount = symbols.length;
+      const formatted = formatSymbols(symbols);
+      // Keep outline under ~3.5KB so the whole study view fits the cap.
+      if (formatted.length > 3500) {
+        outlineText = formatted.slice(0, 3500) +
+          `\n[outline truncated — ${symbols.length} top-level symbols. Use read('${relPath}', query: 'name') to narrow.]`;
+      } else {
+        outlineText = formatted;
+      }
+    }
   } catch {}
 
+  const header = `=== ${relPath} — ${lines.length} lines, ${(stat.size / 1024).toFixed(1)} KB, ${ext.slice(1) || "text"} ===`;
+  const hints = [
+    `read('${relPath}', symbol: 'NAME')       — exact source of a symbol (dot-nested: 'Class.method')`,
+    `read('${relPath}', query: 'substring')   — fuzzy match symbol names`,
+    `read('${relPath}', pattern: 'regex')     — AST-aware content search`,
+  ].join("\n");
+
+  let output = `${header}\n\n--- preamble (first ${preambleLines} lines) ---\n${preamble}\n\n--- symbols ---\n${outlineText}\n\n--- drill in ---\n${hints}`;
+  if (output.length > MAX_READ_OUTPUT) {
+    output = output.slice(0, MAX_READ_OUTPUT - 200) +
+      `\n\n[study view truncated — drill in with symbol/query/pattern]`;
+  }
+
+  if (sessionId) {
+    try {
+      readCacheMark(sessionId, p, readCacheKey(p, {}), stat.mtimeMs);
+      touchSession(sessionId, p, stat.mtimeMs);
+    } catch {}
+  }
   return {
-    output: `Updated ${p}`,
-    title: relative(CWD, p) || p,
-    metadata: { diff, diagnostics: [] },
+    output,
+    title: relPath,
+    metadata: { studyView: true, symbols: symbolCount, lines: lines.length, loaded: [p] },
   };
 }
 
-function execWrite(args: { file_path: string; content: string }, sessionId?: string): ToolResult {
-  const p = assertPath(args.file_path);
-  checkPermission("write", p);
-  const dir = dirname(p);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const existed = existsSync(p);
-  writeFileSync(p, args.content);
+// Return a non-code text file in full when it fits, or a head+tail view with
+// guidance when it doesn't. No offset/limit — if the agent needs a specific
+// region of a big text file, they should use read(path, pattern: 'regex').
+function studyTextFile(p: string, stat: Stats, sessionId?: string): ToolResult {
+  const relPath = relative(CWD, p) || p;
+  let content: string;
+  try { content = readFileSync(p, "utf-8"); } catch (e) {
+    return { output: `Error reading ${p}: ${(e as Error).message}`, title: relPath };
+  }
+  if (content.length <= MAX_READ_OUTPUT) {
+    if (sessionId) {
+      try {
+        readCacheMark(sessionId, p, readCacheKey(p, {}), stat.mtimeMs);
+        touchSession(sessionId, p, stat.mtimeMs);
+      } catch {}
+    }
+    return { output: content, title: relPath, metadata: { loaded: [p] } };
+  }
+  // Oversized text file — head + tail with guidance.
+  const slice = Math.floor((MAX_READ_OUTPUT - 400) / 2);
+  const head = content.slice(0, slice);
+  const tail = content.slice(-slice);
+  const output = [
+    `[clwnd: ${relPath} is ${(stat.size / 1024).toFixed(1)} KB (non-code, too large for one tool response). Showing head + tail.`,
+    `For targeted access, use read('${relPath}', pattern: 'regex').]`,
+    ``,
+    `--- head (first ~${Math.round(head.length / 1024)} KB) ---`,
+    head,
+    ``,
+    `--- tail (last ~${Math.round(tail.length / 1024)} KB) ---`,
+    tail,
+  ].join("\n");
+  return { output, title: relPath, metadata: { oversized: true, size: stat.size, loaded: [p] } };
+}
+
+// Rich-media dispatch that still exists independent of line counts. Images
+// are never rendered; PDFs are text-extracted in full; notebooks are cell-
+// dumped. All oversized variants truncate with guidance rather than
+// paginate.
+function studyRichMedia(p: string, stat: Stats): ToolResult | null {
+  const relPath = relative(CWD, p) || p;
+  const ext = extname(p).toLowerCase();
+  if (IMAGE_EXTS.has(ext)) {
+    return {
+      output: `[clwnd: ${relPath} is an image (${(stat.size / 1024).toFixed(1)} KB, ${ext.slice(1).toUpperCase()}). Image rendering is not served by clwnd's Read tool. Use \`bash file "${p}"\` or \`bash identify "${p}"\` for metadata, or let the user attach the image directly.]`,
+      title: relPath,
+      metadata: { filetype: "image", size: stat.size },
+    };
+  }
+  if (ext === PDF_EXT) {
+    try {
+      const text = execSync(`pdftotext -layout -q "${p}" - 2>/dev/null`, { encoding: "utf-8", timeout: 30000 });
+      const prefix = `[clwnd: ${relPath} (${(stat.size / 1024).toFixed(1)} KB PDF, extracted via pdftotext)]\n`;
+      if (prefix.length + text.length <= MAX_READ_OUTPUT) {
+        return { output: prefix + text, title: relPath, metadata: { filetype: "pdf", size: stat.size } };
+      }
+      const slice = Math.floor((MAX_READ_OUTPUT - 500) / 2);
+      return {
+        output: prefix +
+          `(${Math.round(text.length / 1024)} KB of extracted text — too large for one response. Showing head + tail. Use read('${relPath}', pattern: 'regex') for targeted search.)\n\n` +
+          `--- head ---\n${text.slice(0, slice)}\n\n--- tail ---\n${text.slice(-slice)}`,
+        title: relPath,
+        metadata: { filetype: "pdf", size: stat.size, truncated: true },
+      };
+    } catch {
+      return {
+        output: `[clwnd: ${relPath} is a PDF but pdftotext is not available. Install with \`apt install poppler-utils\` / \`brew install poppler\`.]`,
+        title: relPath,
+        metadata: { filetype: "pdf", size: stat.size },
+      };
+    }
+  }
+  if (ext === IPYNB_EXT) {
+    try {
+      const raw = JSON.parse(readFileSync(p, "utf-8")) as { cells?: Array<{ cell_type?: string; source?: string[] | string }> };
+      const cells = raw.cells ?? [];
+      const sections: string[] = [`[clwnd: ${relPath} — ${cells.length} cells, outputs omitted]`];
+      cells.forEach((c, i) => {
+        const src = Array.isArray(c.source) ? c.source.join("") : (c.source ?? "");
+        const kind = (c.cell_type ?? "unknown").toUpperCase();
+        sections.push(`--- cell ${i + 1} (${kind}) ---\n${src}`);
+      });
+      const body = sections.join("\n\n");
+      if (body.length <= MAX_READ_OUTPUT) {
+        return { output: body, title: relPath, metadata: { filetype: "notebook", cells: cells.length } };
+      }
+      // Oversized notebook — summarize cell structure, do not dump.
+      const headers = [`[clwnd: ${relPath} — ${cells.length} cells, total ${(body.length / 1024).toFixed(1)} KB. Too large for one response. Summarizing cell structure.]`];
+      cells.forEach((c, i) => {
+        const src = Array.isArray(c.source) ? c.source.join("") : (c.source ?? "");
+        const firstLine = src.split("\n")[0]?.slice(0, 80) ?? "";
+        headers.push(`  cell ${i + 1} (${c.cell_type ?? "unknown"}) — ${src.length} bytes — ${firstLine}`);
+      });
+      headers.push(``, `Use read('${relPath}', pattern: 'regex') for targeted search within cells.`);
+      return {
+        output: headers.join("\n"),
+        title: relPath,
+        metadata: { filetype: "notebook", cells: cells.length, truncated: true },
+      };
+    } catch (e) {
+      return { output: `Error parsing notebook ${p}: ${(e as Error).message}`, title: relPath };
+    }
+  }
+  return null;
+}
+
+// Compact inventory for directory/glob reads without a modifier. One line
+// per file with size and (for code files) top-level symbol count. Capped to
+// MAX_READ_OUTPUT; larger sets are truncated with a narrow-the-path hint.
+function inventoryTargets(paths: string[]): ToolResult {
+  const header = `=== ${paths.length} file(s) resolved ===`;
+  const lines: string[] = [header, ``];
+  let totalBytes = 0;
+  let shown = 0;
+  let bodyLen = header.length + 2;
+  for (const p of paths) {
+    let info: string;
+    try {
+      const stat = statSync(p);
+      totalBytes += stat.size;
+      const rel = relative(CWD, p) || p;
+      const lineCount = safeLineCount(p);
+      let extra = `${lineCount}L, ${(stat.size / 1024).toFixed(1)}KB`;
+      if (astSupported(p)) {
+        try {
+          const syms = fileSymbols(p);
+          extra += `, ${syms?.length ?? 0} top-level symbols`;
+        } catch {}
+      }
+      info = `${rel} — ${extra}`;
+    } catch {
+      info = `${p} — (stat failed)`;
+    }
+    if (bodyLen + info.length + 1 > MAX_READ_OUTPUT - 300) {
+      lines.push(`[+${paths.length - shown} more files — narrow the path for a shorter list]`);
+      break;
+    }
+    lines.push(info);
+    bodyLen += info.length + 1;
+    shown++;
+  }
+  lines.push(``);
+  lines.push(`total: ${(totalBytes / 1024).toFixed(1)} KB`);
+  lines.push(``);
+  lines.push(`drill in:`);
+  lines.push(`  read('<path>')                    — study a specific file`);
+  lines.push(`  read('<path>', symbol: 'NAME')    — exact symbol`);
+  lines.push(`  read('<path>', query: 'substr')   — fuzzy symbol match`);
+  lines.push(`  read('<path>', pattern: 'regex')  — content search`);
+  return {
+    output: lines.join("\n"),
+    title: `${paths.length} files`,
+    metadata: { count: paths.length, shown, totalBytes },
+  };
+}
+
+// Collect the source of a symbol across one or more target files. For a
+// single file, returns just the source. For many, each result is prefixed
+// with the file path so the caller knows where each hit lives. Output is
+// capped; a single oversized symbol gets degraded to outline+header rather
+// than silently returning nothing (earlier version returned a useless
+// "narrow the path" hint when a single symbol was too big to fit).
+function readBySymbol(targets: string[], symbol: string, sessionId?: string): ToolResult {
+  const sections: string[] = [];
+  let hits = 0;
+  let bodyLen = 0;
+  for (const p of targets) {
+    if (!astSupported(p)) continue;
+    let found: ReturnType<typeof readSymbol>;
+    try { found = readSymbol(p, symbol); } catch { continue; }
+    if (!found) continue;
+    hits++;
+    const relPath = relative(CWD, p) || p;
+    let section = targets.length === 1 ? found.source : `=== ${relPath} ===\n${found.source}`;
+    // Oversized-symbol degrade: if this single section is bigger than the
+    // whole budget, replace it with a header + child-symbol outline so the
+    // agent can drill in further rather than getting nothing.
+    if (bodyLen === 0 && section.length > MAX_READ_OUTPUT - 200) {
+      const childHint = (() => {
+        try {
+          const all = fileSymbols(p);
+          if (!all) return "";
+          const parts = symbol.split(".");
+          let cur = all;
+          let parent: Symbol | null = null;
+          for (const part of parts) {
+            parent = cur.find(s => s.name === part) ?? null;
+            if (!parent) break;
+            cur = parent.children ?? [];
+          }
+          if (!parent || !parent.children || parent.children.length === 0) return "";
+          const outline = parent.children
+            .map(c => `  ${c.kind} ${c.name} L${c.startLine}-${c.endLine}`)
+            .join("\n");
+          return `\n\nChildren of '${symbol}':\n${outline}\n\nDrill in with: read('${relPath}', symbol: '${symbol}.CHILD_NAME')`;
+        } catch { return ""; }
+      })();
+      section = `=== ${relPath} :: ${symbol} — lines ${found.startLine}-${found.endLine} (${found.source.length} chars, too large for one response) ===${childHint}`;
+    }
+    if (bodyLen + section.length + 2 > MAX_READ_OUTPUT - 200) {
+      sections.push(`\n[+${targets.length - hits} more file(s) to search — narrow the path]`);
+      break;
+    }
+    sections.push(section);
+    bodyLen += section.length + 2;
+    if (sessionId) {
+      try {
+        const stat = statSync(p);
+        readCacheMark(sessionId, p, readCacheKey(p, { symbol }), stat.mtimeMs);
+        touchSession(sessionId, p, stat.mtimeMs);
+      } catch {}
+    }
+  }
+  if (hits === 0) {
+    return {
+      output: `Symbol '${symbol}' not found in ${targets.length} file(s). Try read('<path>', query: '${symbol.split(".").pop() ?? symbol}') for a fuzzy match.`,
+      title: `symbol: ${symbol}`,
+    };
+  }
+  return {
+    output: sections.join("\n\n"),
+    title: hits === 1 ? `symbol: ${symbol}` : `symbol: ${symbol} (${hits} hits)`,
+    metadata: { hits, targets: targets.length },
+  };
+}
+
+// Fuzzy symbol name search across one or more files. Returns each matching
+// symbol's source, grouped by file. Property matches are deprioritized
+// (filtered out when non-property matches exist).
+function readByQuery(targets: string[], query: string, sessionId?: string): ToolResult {
+  const sections: string[] = [];
+  let totalMatches = 0;
+  let bodyLen = 0;
+  for (const p of targets) {
+    if (!astSupported(p)) continue;
+    let all: Symbol[] = [];
+    try { all = searchSymbols(p, query); } catch { continue; }
+    const nonProp = all.filter(s => s.kind !== "property");
+    const results = nonProp.length > 0 ? nonProp : all;
+    if (results.length === 0) continue;
+    const relPath = relative(CWD, p) || p;
+    let src: string[] = [];
+    try { src = readFileSync(p, "utf-8").split("\n"); } catch { continue; }
+    const perFile: string[] = [];
+    for (const s of results.slice(0, 5)) {
+      const range = s.startLine === s.endLine ? `L${s.startLine}` : `L${s.startLine}-${s.endLine}`;
+      const body = src.slice(s.startLine - 1, s.endLine)
+        .map((l, i) => `${s.startLine + i}\t${l}`).join("\n");
+      perFile.push(`--- ${s.kind} ${s.name} ${range} ---\n${body}`);
+    }
+    const suffix = results.length > 5 ? `\n[+${results.length - 5} more in this file]` : "";
+    const section = `=== ${relPath} — ${results.length} matches ===\n${perFile.join("\n\n")}${suffix}`;
+    if (bodyLen + section.length + 2 > MAX_READ_OUTPUT - 200) {
+      sections.push(`\n[output truncated — ${totalMatches}+ matches so far; narrow the query or path]`);
+      break;
+    }
+    sections.push(section);
+    bodyLen += section.length + 2;
+    totalMatches += results.length;
+    if (sessionId) {
+      try {
+        const stat = statSync(p);
+        readCacheMark(sessionId, p, readCacheKey(p, { query }), stat.mtimeMs);
+      } catch {}
+    }
+  }
+  if (totalMatches === 0) {
+    return {
+      output: `No symbols matching '${query}' in ${targets.length} file(s). Not every file is code — AST search only applies to ts/tsx/js/jsx/py/go/rs files.`,
+      title: `query: ${query}`,
+    };
+  }
+  return {
+    output: sections.join("\n\n"),
+    title: `query: ${query}`,
+    metadata: { totalMatches, filesWithMatches: sections.length },
+  };
+}
+
+// Content regex search across targets. Collects ALL matches first, then
+// picks the tightest display format that still fits the output cap. The
+// earlier version truncated matches blindly and Claude interpreted the
+// truncation as "I need to narrow", causing pattern-level pagination (36
+// sequential calls with different prefix patterns). Fix: a 3-tier format
+// ladder — full line / trimmed snippet / minimal location — so a busy
+// pattern still delivers every hit in a single call.
+type PatternMatch = {
+  file: string;
+  line: number;
+  symbol: string;
+  kind: string;
+  text: string;
+};
+
+function readByPattern(targets: string[], pattern: string, sessionId?: string): ToolResult {
+  let regex: RegExp;
+  try { regex = new RegExp(pattern); } catch (e) {
+    return { output: `Invalid regex '${pattern}': ${(e as Error).message}`, title: `pattern: ${pattern}` };
+  }
+
+  // Pass 1: collect every match across every target. No truncation here.
+  const matches: PatternMatch[] = [];
+  for (const p of targets) {
+    const relPath = relative(CWD, p) || p;
+    if (astSupported(p)) {
+      try {
+        const hits = astGrep(p, pattern);
+        for (const m of hits) {
+          matches.push({ file: relPath, line: m.line, symbol: m.symbol, kind: m.kind, text: m.text.trim() });
+        }
+      } catch {}
+    } else {
+      try {
+        const lines = readFileSync(p, "utf-8").split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          if (regex.test(lines[i])) {
+            matches.push({ file: relPath, line: i + 1, symbol: "(top-level)", kind: "text", text: lines[i].trim() });
+          }
+        }
+      } catch {}
+    }
+    if (sessionId) {
+      try {
+        const stat = statSync(p);
+        readCacheMark(sessionId, p, readCacheKey(p, { pattern }), stat.mtimeMs);
+      } catch {}
+    }
+  }
+
+  if (matches.length === 0) {
+    return { output: `No matches for pattern '${pattern}' in ${targets.length} file(s).`, title: `pattern: ${pattern}` };
+  }
+
+  // Pass 2: pick the format tier that fits. Single-file results elide the
+  // file prefix since it's redundant (Claude knows which file it asked for).
+  const files = new Set(matches.map(m => m.file));
+  const singleFile = files.size === 1;
+  const firstFile = matches[0].file;
+
+  const fmtFull = (m: PatternMatch): string => {
+    const loc = singleFile ? `${m.line}` : `${m.file}:${m.line}`;
+    return `${loc} [${m.symbol}] ${m.text}`;
+  };
+  const fmtCompact = (m: PatternMatch): string => {
+    const loc = singleFile ? `${m.line}` : `${m.file}:${m.line}`;
+    const snippet = m.text.length > 60 ? m.text.slice(0, 57) + "..." : m.text;
+    return `${loc} [${m.symbol}] ${snippet}`;
+  };
+  const fmtMinimal = (m: PatternMatch): string => {
+    const loc = singleFile ? `${m.line}` : `${m.file}:${m.line}`;
+    return `${loc} ${m.symbol}`;
+  };
+
+  const header = singleFile
+    ? `${firstFile} — ${matches.length} match(es) for /${pattern}/`
+    : `${matches.length} match(es) across ${files.size} file(s) for /${pattern}/`;
+  const headerLen = header.length + 1;
+
+  // Try each tier until one fits. The budget reserves ~200 chars for the
+  // header + truncation-notice just in case we fall through.
+  const budget = MAX_READ_OUTPUT - 200;
+  for (const fmt of [fmtFull, fmtCompact, fmtMinimal]) {
+    const rendered = matches.map(fmt);
+    let total = headerLen;
+    let lastFit = -1;
+    for (let i = 0; i < rendered.length; i++) {
+      total += rendered[i].length + 1;
+      if (total > budget) break;
+      lastFit = i;
+    }
+    if (lastFit === rendered.length - 1) {
+      // Everything fit in this tier.
+      return {
+        output: `${header}\n${rendered.join("\n")}`,
+        title: `pattern: ${pattern}`,
+        metadata: { matches: matches.length, files: files.size, tier: fmt === fmtFull ? "full" : fmt === fmtCompact ? "compact" : "minimal" },
+      };
+    }
+  }
+
+  // Even minimal format overflows — this means many THOUSANDS of matches.
+  // Keep the head and advise a narrower pattern.
+  const rendered = matches.map(fmtMinimal);
+  const kept: string[] = [];
+  let total = headerLen;
+  for (const r of rendered) {
+    if (total + r.length + 1 > budget - 120) break;
+    kept.push(r);
+    total += r.length + 1;
+  }
+  return {
+    output: `${header}\n${kept.join("\n")}\n[truncated — ${matches.length - kept.length} more match(es) not shown. Narrow the pattern or the path.]`,
+    title: `pattern: ${pattern}`,
+    metadata: { matches: matches.length, files: files.size, truncated: true, shown: kept.length },
+  };
+}
+
+// Entry point dispatched from the MCP runner. The accepted arg shape:
+//   { file_path, symbol?, query?, pattern? }
+// Legacy callers may still pass offset/limit — we accept them on the type
+// to avoid a TS error but ignore them at runtime (the tool schema no longer
+// advertises them, so the model has no reason to send them).
+function execRead(
+  args: { file_path: string; symbol?: string; query?: string; pattern?: string; offset?: number; limit?: number },
+  sessionId?: string,
+): ToolResult {
+  const rawPath = args.file_path;
+  if (!rawPath) return { output: "Error: file_path is required", title: "read" };
+
+  const targets = resolveReadTargets(rawPath);
+  if (targets.length === 0) {
+    return {
+      output: `No files resolved from '${rawPath}'. Check the path — it can be an absolute file, an absolute directory, or a glob pattern (e.g. '/src/**/*.ts').`,
+      title: rawPath,
+    };
+  }
+
+  // Per-target permission check — each resolved path goes through the
+  // same policy a single-file read would.
+  for (const t of targets) {
+    try { checkPermission("read", t); } catch (e) {
+      return { output: `Permission denied on ${t}: ${(e as Error).message}`, title: rawPath };
+    }
+  }
+
+  if (args.symbol) return readBySymbol(targets, args.symbol, sessionId);
+  if (args.query) return readByQuery(targets, args.query, sessionId);
+  if (args.pattern) return readByPattern(targets, args.pattern, sessionId);
+
+  // No modifier — single-target → study view; multi-target → inventory.
+  if (targets.length === 1) {
+    const p = targets[0];
+    let stat: Stats;
+    try { stat = statSync(p); } catch (e) {
+      return { output: `Error stat'ing ${p}: ${(e as Error).message}`, title: p };
+    }
+    // Rich media takes precedence over code/text detection.
+    const rich = studyRichMedia(p, stat);
+    if (rich) return rich;
+    if (astSupported(p)) return studyCodeFile(p, stat, sessionId);
+    return studyTextFile(p, stat, sessionId);
+  }
+  return inventoryTargets(targets);
+}
+
+// Extensions considered "code" for the purposes of tool routing. Files
+// with these extensions MUST go through do_code; files without them MUST
+// go through do_noncode. The split is intentionally strict so the agent
+// cannot reach for do_noncode to sidestep symbol-scoped edits.
+const CODE_EXTENSIONS = new Set([
+  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+  ".py", ".pyi",
+  ".go",
+  ".rs",
+  ".java",
+  ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx",
+  ".rb",
+  ".php",
+  ".cs",
+  ".kt", ".kts",
+  ".swift",
+  ".scala",
+  ".lua",
+  ".sh", ".bash", ".zsh", ".fish",
+  ".vue", ".svelte",
+  ".sql",
+]);
+
+function isCodeFile(filePath: string): boolean {
+  return CODE_EXTENSIONS.has(extname(filePath).toLowerCase());
+}
+
+// Session touch helper — invalidates the read cache for the path and
+// refreshes the session-touched mtime so subsequent edits see the new
+// baseline. Used by every successful code/non-code write.
+function recordWrite(p: string, sessionId?: string): void {
   readCacheInvalidate(sessionId, p);
   try { touchSession(sessionId, p, statSync(p).mtimeMs); } catch {}
+}
+
+// Standard staleness guard: if this session has previously touched the
+// file, reject any edit whose basis is older than the current mtime.
+// Matches the guard that used to live in execEdit. Returns an error
+// ToolResult if stale, or null if fresh.
+function checkStaleness(p: string, sessionId?: string): ToolResult | null {
+  if (!sessionId) return null;
+  const known = touchedMtime(sessionId, p);
+  if (known === undefined) return null;
+  try {
+    const current = statSync(p).mtimeMs;
+    if (current !== known) {
+      return {
+        output: `Error: ${p} has been modified since your last read in this session. Re-read the file before editing — its current state is not what your inputs assume.`,
+        title: relative(CWD, p) || p,
+      };
+    }
+  } catch {}
+  return null;
+}
+
+// do_code — the ONLY way to write code in clwnd. AST-grounded where a
+// grammar exists; every edit is re-parsed and the write is rejected if
+// the result has syntax errors. Rejects any file whose extension is NOT
+// in CODE_EXTENSIONS so the agent cannot accidentally reach for
+// do_noncode to bypass symbol scoping.
+function execDoCode(
+  args: {
+    file_path: string;
+    operation?: "create" | "replace" | "insert_before" | "insert_after" | "delete";
+    symbol?: string;
+    new_source?: string;
+  },
+  sessionId?: string,
+): ToolResult {
+  const p = assertPath(args.file_path);
+  checkPermission("do_code", p);
+  if (!isCodeFile(p)) {
+    return {
+      output: `Error: do_code is only for code files (extensions: ${[...CODE_EXTENSIONS].join(", ")}). '${p}' is not a code file — use do_noncode instead.`,
+      title: relative(CWD, p) || p,
+    };
+  }
+  const op = args.operation ?? "replace";
+  const relPath = relative(CWD, p) || p;
+
+  // ── create: new file only, no symbol. Validates syntax post-write. ──
+  if (op === "create") {
+    if (existsSync(p)) {
+      return {
+        output: `Error: ${p} already exists. Use operation 'replace' (with or without symbol) to modify it, or 'insert_after'/'insert_before' to add next to an existing symbol.`,
+        title: relPath,
+      };
+    }
+    if (args.new_source == null) {
+      return { output: `Error: operation 'create' requires new_source`, title: relPath };
+    }
+    const validation = validateSyntax(p, args.new_source);
+    if (!validation.ok) {
+      return { output: `Error: ${validation.error}. File NOT written.`, title: relPath };
+    }
+    const dir = dirname(p);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(p, args.new_source);
+    recordWrite(p, sessionId);
+    return {
+      output: `Created ${p} (${args.new_source.split("\n").length} lines).`,
+      title: relPath,
+      metadata: { operation: "create", lines: args.new_source.split("\n").length },
+    };
+  }
+
+  // Every other operation requires the file to already exist.
+  if (!existsSync(p)) {
+    return {
+      output: `Error: ${p} does not exist. Use operation 'create' to write a new file.`,
+      title: relPath,
+    };
+  }
+  const stale = checkStaleness(p, sessionId);
+  if (stale) return stale;
+
+  const original = readFileSync(p, "utf-8");
+  const lines = original.split("\n");
+
+  // ── replace without symbol: whole-file rewrite. Syntax-validated. ──
+  if (op === "replace" && !args.symbol) {
+    if (args.new_source == null) {
+      return { output: `Error: operation 'replace' without symbol requires new_source (the full new file content).`, title: relPath };
+    }
+    const validation = validateSyntax(p, args.new_source);
+    if (!validation.ok) {
+      return { output: `Error: ${validation.error}. File NOT written.`, title: relPath };
+    }
+    writeFileSync(p, args.new_source);
+    recordWrite(p, sessionId);
+    return {
+      output: `Rewrote ${p} (${args.new_source.split("\n").length} lines).`,
+      title: relPath,
+      metadata: { operation: "replace", whole_file: true },
+    };
+  }
+
+  // All remaining operations target a specific symbol.
+  if (!args.symbol) {
+    return { output: `Error: operation '${op}' requires a symbol.`, title: relPath };
+  }
+  const range = symbolLineRange(p, args.symbol);
+  if (!range) {
+    return {
+      output: `Error: symbol '${args.symbol}' not found in ${p}. Run read(${p}) to see the symbol outline first, then call do_code with an exact symbol name.`,
+      title: relPath,
+    };
+  }
+
+  let updated: string[];
+  if (op === "replace") {
+    if (args.new_source == null) {
+      return { output: `Error: operation 'replace' with symbol requires new_source (the new source for that symbol).`, title: relPath };
+    }
+    const newLines = args.new_source.split("\n");
+    updated = [
+      ...lines.slice(0, range.startLine - 1),
+      ...newLines,
+      ...lines.slice(range.endLine),
+    ];
+  } else if (op === "insert_before") {
+    if (args.new_source == null) {
+      return { output: `Error: operation 'insert_before' requires new_source.`, title: relPath };
+    }
+    const newLines = args.new_source.split("\n");
+    updated = [
+      ...lines.slice(0, range.startLine - 1),
+      ...newLines,
+      "",
+      ...lines.slice(range.startLine - 1),
+    ];
+  } else if (op === "insert_after") {
+    if (args.new_source == null) {
+      return { output: `Error: operation 'insert_after' requires new_source.`, title: relPath };
+    }
+    const newLines = args.new_source.split("\n");
+    updated = [
+      ...lines.slice(0, range.endLine),
+      "",
+      ...newLines,
+      ...lines.slice(range.endLine),
+    ];
+  } else if (op === "delete") {
+    updated = [
+      ...lines.slice(0, range.startLine - 1),
+      ...lines.slice(range.endLine),
+    ];
+  } else {
+    return { output: `Error: unknown operation '${op}'. Valid: create, replace, insert_before, insert_after, delete.`, title: relPath };
+  }
+
+  const newContent = updated.join("\n");
+  const validation = validateSyntax(p, newContent);
+  if (!validation.ok) {
+    return {
+      output: `Error: ${validation.error}. The edit would leave '${p}' with invalid syntax; write rejected. Re-check your new_source.`,
+      title: relPath,
+    };
+  }
+  writeFileSync(p, newContent);
+  recordWrite(p, sessionId);
+
   return {
-    output: `Wrote ${p}`,
-    title: relative(CWD, p) || p,
-    metadata: { filepath: p, exists: existed, diagnostics: [] },
+    output: `${op === "delete" ? "Deleted" : op === "replace" ? "Replaced" : "Inserted"} symbol '${args.symbol}' in ${p} (was lines ${range.startLine}-${range.endLine}).`,
+    title: relPath,
+    metadata: { operation: op, symbol: args.symbol, was: range, lines: updated.length },
+  };
+}
+
+// do_noncode — the ONLY way to write non-code files. Rejects any file
+// whose extension is in CODE_EXTENSIONS so it cannot be used as an
+// end-run around do_code's AST validation.
+function execDoNoncode(
+  args: { file_path: string; content: string; mode?: "write" | "append" | "prepend" },
+  sessionId?: string,
+): ToolResult {
+  const p = assertPath(args.file_path);
+  checkPermission("do_noncode", p);
+  if (isCodeFile(p)) {
+    return {
+      output: `Error: do_noncode refuses code files. '${p}' has a code extension — use do_code instead.`,
+      title: relative(CWD, p) || p,
+    };
+  }
+  const mode = args.mode ?? "write";
+  const relPath = relative(CWD, p) || p;
+  const dir = dirname(p);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+  const existed = existsSync(p);
+
+  // Staleness only matters for append/prepend to an existing file. "write"
+  // is a wholesale overwrite; the prior state is by definition obsolete.
+  if (existed && mode !== "write") {
+    const stale = checkStaleness(p, sessionId);
+    if (stale) return stale;
+  }
+
+  let next: string;
+  if (mode === "write") {
+    next = args.content;
+  } else if (mode === "append") {
+    const existing = existed ? readFileSync(p, "utf-8") : "";
+    next = existing + args.content;
+  } else if (mode === "prepend") {
+    const existing = existed ? readFileSync(p, "utf-8") : "";
+    next = args.content + existing;
+  } else {
+    return { output: `Error: unknown mode '${mode}'. Valid: write, append, prepend.`, title: relPath };
+  }
+
+  writeFileSync(p, next);
+  recordWrite(p, sessionId);
+  return {
+    output: `${mode === "write" ? (existed ? "Overwrote" : "Created") : mode === "append" ? "Appended to" : "Prepended to"} ${p} (${next.length} bytes).`,
+    title: relPath,
+    metadata: { mode, existed, size: next.length },
   };
 }
 
@@ -559,7 +1240,73 @@ function appendRing(prev: string, chunk: string): string {
   return "[... earlier output evicted ...]\n" + next.slice(next.length - BASH_RING_CAP);
 }
 
+// File-inspection commands banned from bash. The agent gets these capabilities
+// from `read` (study view, symbol, query, pattern, glob) and MUST NOT wrap
+// them via bash. The filter parses every shell segment separated by
+// pipes / boolean chains / semicolons and rejects the whole call if ANY of
+// them starts with a banned command. Redirects to `read` with a concrete
+// alternative so the agent can recover without guessing.
+const BASH_BANNED_COMMANDS = new Set([
+  "ls", "find", "grep", "rg", "ripgrep", "cat", "head", "tail", "sed", "awk",
+  "cut", "uniq", "wc", "more", "less", "tree", "du", "file", "od", "xxd",
+  "strings", "zcat", "bzcat", "xzcat", "zgrep", "xargs",
+]);
+
+// Normalize a single segment of a compound command to its first executable
+// token. Handles env-var-prefixed commands (`FOO=bar cat x`), leading flags
+// and spaces, and path-qualified commands (`/usr/bin/cat`).
+function firstCommandToken(segment: string): string | null {
+  const trimmed = segment.trim();
+  if (!trimmed) return null;
+  // Strip leading environment assignments like FOO=bar baz.
+  const tokens = trimmed.split(/\s+/);
+  let i = 0;
+  while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+  if (i >= tokens.length) return null;
+  const tok = tokens[i];
+  // Strip backticks and leading `!` negation.
+  const clean = tok.replace(/^[!`'"]+/, "").replace(/[`'"]+$/, "");
+  // Return the basename so `/usr/bin/cat` matches `cat`.
+  return clean.split("/").pop() ?? clean;
+}
+
+// Return a rejection ToolResult if the command contains a banned segment,
+// else null. The filter is deliberately a conservative parser — if the
+// shell syntax is too gnarly to split cleanly, we assume clean (no false
+// rejections) and rely on the description to guide the agent.
+function checkBashBan(command: string): ToolResult | null {
+  // Split on common shell operators: pipes, boolean chains, statement sep.
+  // Does not understand nested quoting perfectly — good enough for the
+  // obvious-bypass cases we're trying to block.
+  const segments = command.split(/\||\&\&|\|\||;|\n/);
+  for (const seg of segments) {
+    const tok = firstCommandToken(seg);
+    if (tok && BASH_BANNED_COMMANDS.has(tok)) {
+      return {
+        output:
+          `[clwnd: bash command '${tok}' is banned — file inspection must go through \`read\`.\n` +
+          `  ls / tree / du / file          → read(<directory>)\n` +
+          `  find                           → read('<dir>') for a tree, or read('<dir>/**/*.ext') as a glob\n` +
+          `  cat / head / tail / more / less → read(<file>)\n` +
+          `  grep / rg / sed -n / awk       → read(<file_or_dir>, pattern: 'regex')\n` +
+          `Rewrite the call to use read(...) and try again. If you genuinely need a shell-only capability that bash actually provides (runtime, package managers, git, etc.), call that directly.]`,
+        title: `banned: ${tok}`,
+        metadata: { banned: tok, command },
+      };
+    }
+  }
+  return null;
+}
+
 async function execBash(args: { command: string; description?: string; timeout?: number }): Promise<ToolResult> {
+  // Banned-command check runs BEFORE permission so the agent learns the
+  // redirect even in environments where bash permission would have been
+  // denied anyway.
+  const banned = checkBashBan(args.command);
+  if (banned) {
+    trace("bash.banned", { cmd: (banned.metadata as any)?.banned });
+    return banned;
+  }
   checkPermission("bash", args.command);
   const timeout = args.timeout ?? 120_000;
   let stdout = "";
@@ -652,113 +1399,6 @@ async function execBash(args: { command: string; description?: string; timeout?:
   };
 }
 
-function execGlob(args: { pattern: string; path?: string }): ToolResult {
-  const dir = assertPath(args.path ?? CWD);
-  checkPermission("glob", dir);
-  // Sort matches newest-first by mtime to match native Claude Code's behavior
-  // ("sorted by modification time"). Recently-touched files are almost always
-  // what Claude wants next, and matching the native convention means Claude
-  // doesn't have to re-prioritize the list before choosing a follow-up read.
-  try {
-    const out = execSync(
-      `shopt -s globstar nullglob; cd "${dir}" && printf '%s\\0' ${args.pattern} 2>/dev/null | ` +
-      `xargs -0 -r stat -c '%Y %n' 2>/dev/null | sort -rn | head -100 | cut -d' ' -f2-`,
-      { encoding: "utf-8", timeout: 10000, shell: "/bin/bash" },
-    );
-    const files = out.trim().split("\n").filter(Boolean);
-    return {
-      output: files.join("\n") || "No matches found",
-      title: relative(CWD, dir) || args.pattern,
-      metadata: { count: files.length, truncated: files.length >= 100 },
-    };
-  } catch {
-    return { output: "No matches found", title: args.pattern, metadata: { count: 0, truncated: false } };
-  }
-}
-
-function execGrep(args: { pattern: string; path?: string; include?: string }): ToolResult {
-  const target = assertPath(args.path ?? CWD);
-  checkPermission("grep", target);
-
-  // Single file + AST supported → AST grep with symbol context
-  try {
-    const stat = statSync(target);
-    if (stat.isFile() && astSupported(target)) {
-      const matches = astGrep(target, args.pattern);
-      const truncated = matches.length > 100;
-      const shown = truncated ? matches.slice(0, 100) : matches;
-      const output = formatGrepMatches(shown, CWD);
-      return {
-        output: output + (truncated ? `\n[+${matches.length - 100} more matches]` : ""),
-        title: args.pattern,
-        metadata: { matches: matches.length, truncated },
-      };
-    }
-  } catch {}
-
-  // Directory or non-AST file → rg for raw search, then enrich code file hits with symbols
-  let cmd = `rg --no-heading --line-number`;
-  if (args.include) cmd += ` --glob "${args.include}"`;
-  cmd += ` -- "${args.pattern}" "${target}" | head -100`;
-  try {
-    const out = execSync(cmd, { encoding: "utf-8", timeout: 15000 });
-    const lines = out.trim().split("\n").filter(Boolean);
-    if (lines.length === 0) return { output: "No matches found", title: args.pattern, metadata: { matches: 0, truncated: false } };
-
-    // Enrich: for each hit in a code file, try to add the enclosing symbol
-    const enriched: string[] = [];
-    const fileSymbolCache = new Map<string, Map<number, { name: string; kind: string }>>();
-
-    for (const line of lines) {
-      // rg output: file:line:text or line:text (single file)
-      const match = line.match(/^(.+?):(\d+):(.*)$/);
-      if (!match) { enriched.push(line); continue; }
-
-      const [, file, lineNum, text] = match;
-      const absFile = resolve(target, file);
-      const num = parseInt(lineNum, 10);
-
-      if (astSupported(absFile) || astSupported(file)) {
-        // Build symbol map for this file (cached)
-        const filePath = existsSync(absFile) ? absFile : resolve(CWD, file);
-        if (!fileSymbolCache.has(filePath)) {
-          try {
-            const syms = fileSymbols(filePath);
-            const map = new Map<number, { name: string; kind: string }>();
-            if (syms) {
-              const fill = (ss: Symbol[], parent = "") => {
-                for (const s of ss) {
-                  const full = parent ? `${parent}.${s.name}` : s.name;
-                  for (let l = s.startLine; l <= s.endLine; l++) map.set(l, { name: full, kind: s.kind });
-                  if (s.children) fill(s.children, full);
-                }
-              };
-              fill(syms);
-            }
-            fileSymbolCache.set(filePath, map);
-          } catch {
-            fileSymbolCache.set(filePath, new Map());
-          }
-        }
-        const sym = fileSymbolCache.get(filePath)?.get(num);
-        if (sym) {
-          enriched.push(`${file}:${lineNum}: [${sym.kind} ${sym.name}] ${text.trim()}`);
-          continue;
-        }
-      }
-      enriched.push(line);
-    }
-
-    return {
-      output: enriched.join("\n"),
-      title: args.pattern,
-      metadata: { matches: lines.length, truncated: lines.length >= 100 },
-    };
-  } catch {
-    return { output: "No matches found", title: args.pattern, metadata: { matches: 0, truncated: false } };
-  }
-}
-
 async function execPermissionPrompt(args: { tool_name: string; input?: Record<string, unknown> }, sessionId?: string): Promise<ToolResult> {
   trace("mcp.permission.prompted", { tool: args.tool_name, sessionId });
   if (!permissionCallback) {
@@ -793,37 +1433,33 @@ export function getExternalToolNames(sessionId: string): string[] {
   return (externalTools.get(sessionId) ?? []).map(t => t.name);
 }
 
-// ─── Session-scoped visible tools (OC decides what Claude sees) ─────────────
+// ─── Session-scoped visible tools ─────────────────────────────────────────
+//
+// Clwnd's native tools (read, do_code, do_noncode, bash, permission_prompt)
+// are ALWAYS advertised to Claude — they're clwnd's authoritative surface
+// and do not get filtered by what OC happens to know about. OC's tool
+// vocabulary (edit, write, glob, grep, etc.) is the legacy set clwnd has
+// replaced; the mapping layer that used to translate them is gone.
+//
+// This map tracks EXTERNAL MCP tool names only — the context7s and the
+// like. tools/list passes clwnd's natives through unconditionally and
+// filters externals by this set (set by the plugin from opts.tools).
+const sessionVisibleExternals = new Map<string, Set<string>>();
 
-// OC tool name → clwnd MCP tool name
-const OC_TO_CLWND: Record<string, string> = {
-  read: "read", edit: "edit", write: "write", bash: "bash", glob: "glob", grep: "grep",
-};
-const CLWND_NATIVE = new Set(Object.values(OC_TO_CLWND));
-
-const sessionVisibleTools = new Map<string, Set<string>>();
-
-/** Set the visible tool set for a session — derived from OC's opts.tools */
-export function setVisibleTools(sessionId: string, ocToolNames: string[]): void {
-  const visible = new Set<string>();
-  visible.add("permission_prompt"); // always available — internal to clwnd
-  for (const name of ocToolNames) {
-    const clwndName = OC_TO_CLWND[name];
-    if (clwndName) visible.add(clwndName);
-    // External tools are added by name as-is
-    const ext = externalTools.get(sessionId) ?? [];
-    if (ext.some(t => t.name === name)) visible.add(name);
-  }
-  sessionVisibleTools.set(sessionId, visible);
+/** Record the external MCP tool names for a session. Called by the daemon
+ *  when the plugin hums a prompt — the list is the subset of opts.tools
+ *  that don't match any of clwnd's native tool names. */
+export function setVisibleTools(sessionId: string, externalToolNames: string[]): void {
+  sessionVisibleExternals.set(sessionId, new Set(externalToolNames));
 }
 
 export function clearVisibleTools(sessionId: string): void {
-  sessionVisibleTools.delete(sessionId);
+  sessionVisibleExternals.delete(sessionId);
 }
 
-function getVisibleToolSet(sessionId: string | undefined): Set<string> | null {
+function getVisibleExternalSet(sessionId: string | undefined): Set<string> | null {
   if (!sessionId) return null;
-  return sessionVisibleTools.get(sessionId) ?? null;
+  return sessionVisibleExternals.get(sessionId) ?? null;
 }
 
 // ─── External MCP client — daemon executes tools directly ──────────────────
@@ -981,12 +1617,27 @@ export async function executeTool(name: string, args: Record<string, unknown>, _
   if (name !== "permission_prompt") trace("mcp.tool.executed", { tool: name });
   switch (name) {
     case "read": return execRead(args as any, sessionId);
-    case "edit": return execEdit(args as any, sessionId);
-    case "write": return execWrite(args as any, sessionId);
+    case "do_code": return execDoCode(args as any, sessionId);
+    case "do_noncode": return execDoNoncode(args as any, sessionId);
     case "bash": return execBash(args as any);
-    case "glob": return execGlob(args as any);
-    case "grep": return execGrep(args as any);
     case "permission_prompt": return execPermissionPrompt(args as any, sessionId);
+    // Replaced-and-banned tools. Return a redirect instead of "Unknown tool"
+    // so an agent that somehow still sees one of these learns the right
+    // substitute without wasting another round-trip.
+    case "edit":
+    case "write":
+      return {
+        output: `[clwnd: tool '${name}' no longer exists. Use do_code for code files (AST-grounded symbol replacement, insertion, deletion) or do_noncode for config/docs/text (write/append/prepend).]`,
+        title: `replaced: ${name}`,
+        metadata: { replaced: name },
+      };
+    case "glob":
+    case "grep":
+      return {
+        output: `[clwnd: tool '${name}' no longer exists. Use read — it absorbs glob and grep via its file_path/pattern modifiers. read('/path/**/*.ts') for glob; read('/path', pattern: 'regex') for AST-aware grep with enclosing-symbol context.]`,
+        title: `replaced: ${name}`,
+        metadata: { replaced: name },
+      };
     default: return { output: `Unknown tool: ${name}` };
   }
 }
@@ -1009,13 +1660,23 @@ export async function handleMcpRequest(body: { jsonrpc: string; id?: number | st
       return null; // no response for notifications
 
     case "tools/list": {
+      // Clwnd's native TOOLS are always advertised — they're the
+      // authoritative filesystem surface. The permission layer
+      // (allowedToolSet / checkPermission) handles per-session gating.
+      // External MCP tools (context7 etc.) get filtered by whatever OC
+      // advertised via setVisibleTools.
+      //
+      // permission_prompt is ALWAYS advertised regardless of allowedTools
+      // — Claude CLI is spawned with --permission-prompt-tool pointing at
+      // mcp__clwnd__permission_prompt, and the process exits immediately
+      // if the tool isn't in the MCP tools/list response.
+      const nativeAllowed = allowedToolSet
+        ? TOOLS.filter(t => t.name === "permission_prompt" || allowedToolSet!.has(t.name))
+        : TOOLS;
       const ext = sessionId ? (externalTools.get(sessionId) ?? []) : [];
-      const visible = getVisibleToolSet(sessionId);
-      // If visible set exists, filter — OC decides what Claude sees
-      const allTools = visible
-        ? [...TOOLS, ...ext].filter(t => visible.has(t.name))
-        : [...TOOLS, ...ext];
-      return { jsonrpc: "2.0", id: body.id, result: { tools: allTools } };
+      const visibleExt = getVisibleExternalSet(sessionId);
+      const externalAllowed = visibleExt ? ext.filter(t => visibleExt.has(t.name)) : ext;
+      return { jsonrpc: "2.0", id: body.id, result: { tools: [...nativeAllowed, ...externalAllowed] } };
     }
 
     case "tools/call": {
