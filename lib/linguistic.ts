@@ -334,6 +334,218 @@ function resolveGeneric(source: string, anchor: string): ScopeMatch | null {
   return { startIndex: lineStart, endIndex: lineEnd, anchor, scope: "phrase" };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Anchor discovery — the read side.
+//
+// resolveScope finds ONE anchor given by the caller. discoverAnchors
+// finds ALL anchors in a file — the structural outline for non-code,
+// parallel to fileSymbols for code. Called by read's studyTextFile path
+// to show the agent what's targetable before they edit.
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface Anchor {
+  /** The text that addresses this anchor in do_noncode target mode. */
+  target: string;
+  /** What kind of scope it governs. */
+  scope: "phrase" | "paragraph";
+  /** 1-based line number for display. */
+  line: number;
+  /** Nesting depth (0 = top-level, 1 = child, etc.) */
+  depth: number;
+}
+
+/**
+ * Discover all addressable anchors in a non-code file. Returns them in
+ * source order. The agent can pass any anchor's `target` string to
+ * do_noncode(target: ...) for precise editing.
+ */
+export function discoverAnchors(source: string, filePath: string): Anchor[] {
+  const ext = extname(filePath).toLowerCase();
+  const basename = filePath.split("/").pop() ?? "";
+
+  if (ext === ".md" || ext === ".mdx" || ext === ".markdown") return discoverMarkdown(source);
+  if (ext === ".json" || ext === ".jsonc") return discoverJson(source);
+  if (ext === ".yaml" || ext === ".yml") return discoverYaml(source);
+  if (ext === ".toml") return discoverToml(source);
+  if (ext === ".ini" || ext === ".cfg" || ext === ".conf") return discoverToml(source);
+  if (ext === ".env" || basename.startsWith(".env")) return discoverEnv(source);
+
+  // Generic: look for indentation-based structure
+  return discoverGeneric(source);
+}
+
+function lineNumber(source: string, index: number): number {
+  let line = 1;
+  for (let i = 0; i < index && i < source.length; i++) {
+    if (source[i] === "\n") line++;
+  }
+  return line;
+}
+
+function discoverMarkdown(source: string): Anchor[] {
+  const anchors: Anchor[] = [];
+  const re = /^(#{1,6})\s+(.+)$/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    const level = m[1].length;
+    anchors.push({
+      target: m[0],
+      scope: "paragraph",
+      line: lineNumber(source, m.index),
+      depth: level - 1,
+    });
+  }
+  return anchors;
+}
+
+function discoverEnv(source: string): Anchor[] {
+  const anchors: Anchor[] = [];
+  const re = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    anchors.push({
+      target: m[1],
+      scope: "phrase",
+      line: lineNumber(source, m.index),
+      depth: 0,
+    });
+  }
+  return anchors;
+}
+
+function discoverJson(source: string): Anchor[] {
+  // Walk top-level and one-deep keys. Full recursive JSON walking is
+  // overkill — the agent can drill deeper with read(file, pattern).
+  const anchors: Anchor[] = [];
+  try {
+    const obj = JSON.parse(source);
+    if (typeof obj !== "object" || obj === null) return anchors;
+    // Find each key's line in the source for display
+    for (const key of Object.keys(obj)) {
+      const keyPattern = new RegExp(`"${escapeRegex(key)}"\\s*:`);
+      const match = keyPattern.exec(source);
+      const line = match ? lineNumber(source, match.index) : 0;
+      anchors.push({ target: key, scope: "phrase", line, depth: 0 });
+      // One level deep for objects
+      const val = obj[key];
+      if (val && typeof val === "object" && !Array.isArray(val)) {
+        for (const subkey of Object.keys(val)) {
+          const subPattern = new RegExp(`"${escapeRegex(subkey)}"\\s*:`);
+          // Search after the parent key
+          const subSource = match ? source.slice(match.index) : source;
+          const subMatch = subPattern.exec(subSource);
+          const subLine = subMatch ? lineNumber(source, (match?.index ?? 0) + subMatch.index) : 0;
+          anchors.push({ target: `${key}.${subkey}`, scope: "phrase", line: subLine, depth: 1 });
+        }
+      }
+    }
+  } catch {
+    // Invalid JSON — fall through to generic
+    return discoverGeneric(source);
+  }
+  return anchors;
+}
+
+function discoverYaml(source: string): Anchor[] {
+  const anchors: Anchor[] = [];
+  const re = /^(\s*)([A-Za-z_][A-Za-z0-9_.-]*)\s*:/gm;
+  let m: RegExpExecArray | null;
+  const depthStack: number[] = []; // indent levels
+  while ((m = re.exec(source)) !== null) {
+    const indent = m[1].length;
+    const key = m[2];
+    // Determine depth from indentation
+    while (depthStack.length > 0 && depthStack[depthStack.length - 1] >= indent) {
+      depthStack.pop();
+    }
+    const depth = depthStack.length;
+    depthStack.push(indent);
+    // Build dot-path for nested keys
+    // For the outline we show top-level and first-level only
+    if (depth <= 1) {
+      anchors.push({
+        target: key,
+        scope: indent === 0 ? "paragraph" : "phrase",
+        line: lineNumber(source, m.index),
+        depth,
+      });
+    }
+  }
+  return anchors;
+}
+
+function discoverToml(source: string): Anchor[] {
+  const anchors: Anchor[] = [];
+  const lines = source.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Section headers: [name] or [[name]]
+    const sectionMatch = line.match(/^\[(\[)?([^\]]+)\]?\]/);
+    if (sectionMatch) {
+      anchors.push({
+        target: `[${sectionMatch[2]}]`,
+        scope: "paragraph",
+        line: i + 1,
+        depth: sectionMatch[1] ? 1 : 0, // [[]] is nested
+      });
+      continue;
+    }
+    // Top-level keys: key = value
+    const keyMatch = line.match(/^\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*=/);
+    if (keyMatch) {
+      anchors.push({
+        target: keyMatch[1],
+        scope: "phrase",
+        line: i + 1,
+        depth: 0,
+      });
+    }
+  }
+  return anchors;
+}
+
+function discoverGeneric(source: string): Anchor[] {
+  // For unknown formats, look for lines that appear to be "headers" —
+  // non-indented, non-blank lines that are followed by indented content
+  // or that look like labels (end with : or are ALL CAPS etc.)
+  const anchors: Anchor[] = [];
+  const lines = source.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    const indent = line.length - line.trimStart().length;
+    if (indent > 0) continue; // skip indented lines
+    // Does this line look like a header/label?
+    const trimmed = line.trim();
+    const isLabel = trimmed.endsWith(":") ||
+      /^[A-Z][A-Z0-9_\s]{2,}$/.test(trimmed) || // ALL CAPS
+      /^[-=#*]{3,}/.test(trimmed); // separator lines
+    if (!isLabel) continue;
+    anchors.push({
+      target: trimmed,
+      scope: "paragraph",
+      line: i + 1,
+      depth: 0,
+    });
+  }
+  return anchors;
+}
+
+/**
+ * Format discovered anchors as a compact outline string, parallel to
+ * formatSymbols for code. Shows what the agent can target with
+ * do_noncode(target: ...).
+ */
+export function formatAnchors(anchors: Anchor[]): string {
+  if (anchors.length === 0) return "(no addressable anchors detected)";
+  const lines: string[] = [];
+  for (const a of anchors) {
+    const pad = "  ".repeat(a.depth);
+    lines.push(`${pad}${a.scope === "paragraph" ? "§" : "·"} ${a.target}  L${a.line}`);
+  }
+  return lines.join("\n");
+}
+
 // ─── Util ──────────────────────────────────────────────────────────────────
 
 function escapeRegex(s: string): string {

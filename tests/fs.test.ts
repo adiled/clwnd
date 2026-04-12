@@ -103,6 +103,53 @@ describe("read", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  read: non-code anchor outlines
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("read: non-code anchors", () => {
+  test("markdown shows heading anchors", async () => {
+    const p = seed("read-md.md", "# Title\n\nIntro.\n\n## Setup\n\nSteps here.\n\n## Usage\n\nUse it.\n\n### Advanced\n\nMore.\n");
+    const out = await post("read", { file_path: p });
+    expect(out).toContain("# Title");
+    expect(out).toContain("## Setup");
+    expect(out).toContain("## Usage");
+    expect(out).toContain("### Advanced");
+    expect(out).toContain("anchors");
+  });
+
+  test("env shows variable anchors", async () => {
+    const p = seed("read-env.env", "HOST=localhost\nPORT=3000\nDATABASE_URL=postgres://db\n");
+    const out = await post("read", { file_path: p });
+    expect(out).toContain("HOST");
+    expect(out).toContain("PORT");
+    expect(out).toContain("DATABASE_URL");
+  });
+
+  test("json shows key anchors", async () => {
+    const p = seed("read-json.json", '{\n  "name": "app",\n  "version": "1.0.0",\n  "dependencies": {\n    "lodash": "^4.0.0"\n  }\n}\n');
+    const out = await post("read", { file_path: p });
+    expect(out).toContain("name");
+    expect(out).toContain("version");
+    expect(out).toContain("dependencies");
+    expect(out).toContain("dependencies.lodash");
+  });
+
+  test("yaml shows key anchors", async () => {
+    const p = seed("read-yaml.yaml", "server:\n  port: 3000\n  host: localhost\nredis:\n  url: redis://r\n");
+    const out = await post("read", { file_path: p });
+    expect(out).toContain("server");
+    expect(out).toContain("redis");
+  });
+
+  test("toml shows section anchors", async () => {
+    const p = seed("read-toml.toml", "[server]\nport = 3000\n\n[database]\nurl = \"pg://db\"\n");
+    const out = await post("read", { file_path: p });
+    expect(out).toContain("[server]");
+    expect(out).toContain("[database]");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  do_code — create
 // ═══════════════════════════════════════════════════════════════════════════
 

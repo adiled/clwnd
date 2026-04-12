@@ -10,7 +10,7 @@ import { resolve, dirname, relative, extname, join as pathJoin } from "path";
 import { trace } from "../log.ts";
 import { penny } from "../lib/penny.ts";
 import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, astGrep, searchSymbols, validateSyntax, symbolByteRange, type Symbol } from "../lib/ast.ts";
-import { resolveScope } from "../lib/linguistic.ts";
+import { resolveScope, discoverAnchors, formatAnchors } from "../lib/linguistic.ts";
 
 let CWD = process.env.CLWND_CWD ?? process.cwd();
 
@@ -591,30 +591,64 @@ function studyTextFile(p: string, stat: Stats, sessionId?: string): ToolResult {
   try { content = readFileSync(p, "utf-8"); } catch (e) {
     return { output: `Error reading ${p}: ${(e as Error).message}`, title: relPath };
   }
-  if (content.length <= MAX_READ_OUTPUT) {
-    if (sessionId) {
-      try {
-        readCacheMark(sessionId, p, readCacheKey(p, {}), stat.mtimeMs);
-        touchSession(sessionId, p);
-      } catch {}
+
+  const lines = content.split("\n");
+  const preambleLines = Math.min(20, lines.length);
+  const preamble = lines.slice(0, preambleLines).map((l, i) => `${i + 1}\t${l}`).join("\n");
+
+  // Discover addressable anchors — the non-code equivalent of symbols.
+  let anchorText = "(no addressable anchors detected)";
+  let anchorCount = 0;
+  try {
+    const anchors = discoverAnchors(content, p);
+    if (anchors.length > 0) {
+      anchorCount = anchors.length;
+      const formatted = formatAnchors(anchors);
+      if (formatted.length > 3500) {
+        anchorText = formatted.slice(0, 3500) +
+          `\n[outline truncated — ${anchors.length} anchors. Use read('${relPath}', pattern: 'regex') to narrow.]`;
+      } else {
+        anchorText = formatted;
+      }
     }
-    return { output: content, title: relPath, metadata: { loaded: [p] } };
-  }
-  // Oversized text file — head + tail with guidance.
-  const slice = Math.floor((MAX_READ_OUTPUT - 400) / 2);
-  const head = content.slice(0, slice);
-  const tail = content.slice(-slice);
-  const output = [
-    `[clwnd: ${relPath} is ${(stat.size / 1024).toFixed(1)} KB (non-code, too large for one tool response). Showing head + tail.`,
-    `For targeted access, use read('${relPath}', pattern: 'regex').]`,
-    ``,
-    `--- head (first ~${Math.round(head.length / 1024)} KB) ---`,
-    head,
-    ``,
-    `--- tail (last ~${Math.round(tail.length / 1024)} KB) ---`,
-    tail,
+  } catch {}
+
+  const ext = extname(p).toLowerCase();
+  const header = `=== ${relPath} — ${lines.length} lines, ${(stat.size / 1024).toFixed(1)} KB, ${ext.slice(1) || "text"} ===`;
+  const hints = [
+    `read('${relPath}', pattern: 'regex')              — search content`,
+    `do_noncode('${relPath}', target: 'ANCHOR', content: '...')  — edit a specific anchor`,
   ].join("\n");
-  return { output, title: relPath, metadata: { oversized: true, size: stat.size, loaded: [p] } };
+
+  let output: string;
+  if (content.length <= MAX_READ_OUTPUT && anchorCount === 0) {
+    // Small file with no structure — show full content (legacy behavior for plain text)
+    output = content;
+  } else {
+    // Structured study view — preamble + anchor outline + drill-in hints
+    output = `${header}\n\n--- preamble (first ${preambleLines} lines) ---\n${preamble}\n\n--- anchors ---\n${anchorText}\n\n--- edit ---\n${hints}`;
+    // If the file is small enough, append the full content below the outline
+    if (content.length <= MAX_READ_OUTPUT - output.length - 200) {
+      output += `\n\n--- full content ---\n${content}`;
+    }
+  }
+
+  if (output.length > MAX_READ_OUTPUT) {
+    output = output.slice(0, MAX_READ_OUTPUT - 200) +
+      `\n\n[study view truncated — use pattern or target to drill in]`;
+  }
+
+  if (sessionId) {
+    try {
+      readCacheMark(sessionId, p, readCacheKey(p, {}), stat.mtimeMs);
+      touchSession(sessionId, p);
+    } catch {}
+  }
+  return {
+    output,
+    title: relPath,
+    metadata: { studyView: true, anchors: anchorCount, lines: lines.length, loaded: [p] },
+  };
 }
 
 // Rich-media dispatch that still exists independent of line counts. Images
