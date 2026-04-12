@@ -43,8 +43,18 @@ const languages = new Map<string, any>();
 const queries = new Map<string, any>();
 
 interface LanguageEntry {
-  /** What `require()` resolves to for this language's grammar binary. */
-  requirePath: string;
+  /**
+   * Runtime: "native" uses node-tree-sitter (C++ bindings via require()),
+   * "wasm" uses web-tree-sitter (WASM via Language.load()). Default: native.
+   * WASM is the fallback for grammars that have no working native npm
+   * package (vue, and eventually sql). The public API is identical — the
+   * runtime difference is hidden behind getLanguage/getQuery.
+   */
+  runtime?: "native" | "wasm";
+  /** What `require()` resolves to for native grammars. Ignored for WASM. */
+  requirePath?: string;
+  /** Path to the .wasm file for WASM grammars. Resolved relative to VENDORED_WASM_DIR. */
+  wasmFile?: string;
   /**
    * tags.scm file paths (relative to node_modules) to compile into the
    * query for this language. Listed in order — JS+TS combine because TS
@@ -89,6 +99,11 @@ const EXT_TO_LANG: Record<string, LanguageEntry> = {
   // Bash ships no tags.scm — we vendor a minimal one.
   ".sh":   { requirePath: "tree-sitter-bash",                  queryPaths: [], vendoredExtra: "bash.scm" },
   ".bash": { requirePath: "tree-sitter-bash",                  queryPaths: [], vendoredExtra: "bash.scm" },
+  // ── WASM grammars — no native npm package available ──────────────────
+  // Vue SFC. tree-sitter-vue@0.2.1 (only npm version) has dead V8 bindings.
+  // We compiled the WASM from tree-sitter-grammars/tree-sitter-vue via
+  // tree-sitter-cli@0.24.3 + emscripten and vendor it at lib/wasm/.
+  ".vue":  { runtime: "wasm", wasmFile: "tree-sitter-vue.wasm", queryPaths: [], vendoredExtra: "vue.scm" },
 };
 
 // Locate vendored query files at runtime. We try a few candidate paths
@@ -117,6 +132,58 @@ function findVendoredQueryDir(): string {
 }
 const VENDORED_QUERY_DIR = findVendoredQueryDir();
 
+function findVendoredWasmDir(): string {
+  const candidates = [
+    join(HERE, "wasm"),                  // dist/daemon/wasm (post-tsup) OR lib/wasm (dev)
+    join(HERE, "..", "lib", "wasm"),     // dist/daemon → ../lib/wasm (fallback)
+    join(HERE, "..", "..", "lib", "wasm"),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return candidates[0];
+}
+const VENDORED_WASM_DIR = findVendoredWasmDir();
+
+// ─── WASM runtime (web-tree-sitter) ───────────────────────────────────────
+// Secondary parser runtime for grammars that have no native npm package
+// (vue, eventually sql). Loaded lazily — the require("web-tree-sitter")
+// only fires the first time a .vue file is encountered. Native grammars
+// never touch this code path.
+let WasmParser: any = null;
+let wasmInitialized = false;
+
+async function getWasmParser(): Promise<any> {
+  if (!WasmParser) {
+    const mod = require("web-tree-sitter");
+    WasmParser = mod.Parser ?? mod.default?.Parser ?? mod;
+  }
+  if (!wasmInitialized && typeof WasmParser.init === "function") {
+    await WasmParser.init();
+    wasmInitialized = true;
+  }
+  return WasmParser;
+}
+
+async function getWasmLanguage(ext: string): Promise<any | null> {
+  if (languages.has(ext)) return languages.get(ext)!;
+  const entry = EXT_TO_LANG[ext];
+  if (!entry?.wasmFile) return null;
+  try {
+    const WP = await getWasmParser();
+    const WLanguage = WP.Language ?? (require("web-tree-sitter").Language);
+    const wasmPath = join(VENDORED_WASM_DIR, entry.wasmFile);
+    const lang = await WLanguage.load(wasmPath);
+    languages.set(ext, lang);
+    return lang;
+  } catch (e) {
+    process.stderr.write?.(`[clwnd] failed to load WASM grammar for ${ext}: ${(e as Error).message}\n`);
+    return null;
+  }
+}
+
+// ─── Native runtime (node-tree-sitter) ────────────────────────────────────
+
 function getParser(): any {
   if (!Parser) Parser = require("tree-sitter");
   return Parser;
@@ -125,12 +192,9 @@ function getParser(): any {
 function getLanguage(ext: string): any | null {
   if (languages.has(ext)) return languages.get(ext)!;
   const entry = EXT_TO_LANG[ext];
-  if (!entry) return null;
+  if (!entry || entry.runtime === "wasm") return null; // WASM handled via async path
   try {
-    const mod = require(entry.requirePath);
-    // Real tree-sitter grammar packages export `{ language }` (the native
-    // binding). Some older wrappers used `.default` or the module itself.
-    // The lookup chain handles all observed shapes.
+    const mod = require(entry.requirePath!);
     const lang = mod.language ?? mod.default?.language ?? mod.default ?? mod;
     languages.set(ext, lang);
     return lang;
@@ -151,31 +215,53 @@ function stripDirectives(scm: string): string {
   return scm.replace(/\(#[a-z-]+![^)]*\)/g, "");
 }
 
+function loadQueryScm(entry: LanguageEntry): string {
+  const parts: string[] = [];
+  for (const rel of entry.queryPaths) {
+    const p = require.resolve(rel, { paths: [process.cwd(), HERE, join(HERE, "..")] });
+    parts.push(stripDirectives(readFileSync(p, "utf-8")));
+  }
+  if (entry.vendoredExtra) {
+    const p = join(VENDORED_QUERY_DIR, entry.vendoredExtra);
+    parts.push(stripDirectives(readFileSync(p, "utf-8")));
+  }
+  return parts.join("\n");
+}
+
 function getQuery(ext: string): any | null {
   if (queries.has(ext)) return queries.get(ext)!;
   const entry = EXT_TO_LANG[ext];
+  if (!entry || entry.runtime === "wasm") return null; // WASM queries compiled via async path
   const lang = getLanguage(ext);
-  if (!entry || !lang) return null;
+  if (!lang) return null;
   try {
-    const parts: string[] = [];
-    for (const rel of entry.queryPaths) {
-      const path = require.resolve(rel, { paths: [process.cwd(), HERE, join(HERE, "..")] });
-      parts.push(stripDirectives(readFileSync(path, "utf-8")));
-    }
-    if (entry.vendoredExtra) {
-      const path = join(VENDORED_QUERY_DIR, entry.vendoredExtra);
-      parts.push(stripDirectives(readFileSync(path, "utf-8")));
-    }
-    const scm = parts.join("\n");
+    const scm = loadQueryScm(entry);
     const P = getParser();
     const q = new P.Query(lang, scm);
     queries.set(ext, q);
     return q;
   } catch (e) {
-    // Surface the failure on first call, then cache the null so we don't
-    // re-throw on every parse. Misconfigured query files should be loud
-    // during development but quiet in production.
     process.stderr.write?.(`[clwnd] failed to compile query for ${ext}: ${(e as Error).message}\n`);
+    queries.set(ext, null);
+    return null;
+  }
+}
+
+async function getWasmQuery(ext: string): Promise<any | null> {
+  if (queries.has(ext)) return queries.get(ext)!;
+  const entry = EXT_TO_LANG[ext];
+  if (!entry) return null;
+  const lang = await getWasmLanguage(ext);
+  if (!lang) return null;
+  try {
+    const scm = loadQueryScm(entry);
+    // web-tree-sitter@0.25: new Query(language, source)
+    const { Query: WQuery } = require("web-tree-sitter");
+    const q = new WQuery(lang, scm);
+    queries.set(ext, q);
+    return q;
+  } catch (e) {
+    process.stderr.write?.(`[clwnd] failed to compile WASM query for ${ext}: ${(e as Error).message}\n`);
     queries.set(ext, null);
     return null;
   }
@@ -220,47 +306,91 @@ interface AstCacheEntry {
 const AST_CACHE_MAX = 100;
 const astCache = new Map<string, AstCacheEntry>();
 
-function cachedParse(filePath: string): AstCacheEntry | null {
+function cacheStore(filePath: string, mtime: number, symbols: Symbol[], source: string): AstCacheEntry {
+  const entry: AstCacheEntry = { mtime, symbols, source };
+  if (astCache.size >= AST_CACHE_MAX) {
+    const oldest = astCache.keys().next().value;
+    if (oldest) astCache.delete(oldest);
+  }
+  astCache.set(filePath, entry);
+  return entry;
+}
+
+function cacheHit(filePath: string): AstCacheEntry | null {
   let stat;
   try { stat = statSync(filePath); } catch { return null; }
   if (stat.size > MAX_FILE_SIZE) return null;
-
-  const mtime = stat.mtimeMs;
   const existing = astCache.get(filePath);
-  if (existing && existing.mtime === mtime) {
-    // LRU refresh: re-insert so this entry is "most recent"
+  if (existing && existing.mtime === stat.mtimeMs) {
     astCache.delete(filePath);
     astCache.set(filePath, existing);
     return existing;
   }
+  return null;
+}
+
+function cachedParse(filePath: string): AstCacheEntry | null {
+  const hit = cacheHit(filePath);
+  if (hit) return hit;
 
   const ext = extname(filePath).toLowerCase();
+  const entry = EXT_TO_LANG[ext];
+  if (!entry) return null;
+  if (entry.runtime === "wasm") return null; // WASM handled by async path
+
   const lang = getLanguage(ext);
-  if (!lang) return null;
   const query = getQuery(ext);
-  if (!query) return null;
+  if (!lang || !query) return null;
 
   let source: string;
   try { source = readFileSync(filePath, "utf-8"); } catch { return null; }
 
   try {
+    const stat = statSync(filePath);
     const P = getParser();
     const parser = new P();
     parser.setLanguage(lang);
-    // tree-sitter 0.21 default bufferSize trips on files over ~32KB and
-    // throws "Invalid argument". Raise to 4MB (covers anything below
-    // MAX_FILE_SIZE with headroom).
     const tree = parser.parse(source, null, { bufferSize: 4 * 1024 * 1024 });
-    const symbols = extractSymbolsViaQuery(tree.rootNode, query, EXT_TO_LANG[ext]);
-    const entry: AstCacheEntry = { mtime, symbols, source };
-
-    if (astCache.size >= AST_CACHE_MAX) {
-      const oldest = astCache.keys().next().value;
-      if (oldest) astCache.delete(oldest);
-    }
-    astCache.set(filePath, entry);
-    return entry;
+    const symbols = extractSymbolsViaQuery(tree.rootNode, query, entry);
+    return cacheStore(filePath, stat.mtimeMs, symbols, source);
   } catch {
+    return null;
+  }
+}
+
+/**
+ * Async variant of cachedParse for WASM grammars. Falls through to the
+ * sync native path for non-WASM extensions so callers can always use this.
+ */
+async function cachedParseAsync(filePath: string): Promise<AstCacheEntry | null> {
+  const hit = cacheHit(filePath);
+  if (hit) return hit;
+
+  const ext = extname(filePath).toLowerCase();
+  const langEntry = EXT_TO_LANG[ext];
+  if (!langEntry) return null;
+
+  // Non-WASM: delegate to sync path
+  if (langEntry.runtime !== "wasm") return cachedParse(filePath);
+
+  // WASM: async load
+  const lang = await getWasmLanguage(ext);
+  const query = await getWasmQuery(ext);
+  if (!lang || !query) return null;
+
+  let source: string;
+  try { source = readFileSync(filePath, "utf-8"); } catch { return null; }
+
+  try {
+    const stat = statSync(filePath);
+    const WP = await getWasmParser();
+    const parser = new WP();
+    parser.setLanguage(lang);
+    const tree = parser.parse(source);
+    const symbols = extractSymbolsViaQuery(tree.rootNode, query, langEntry);
+    return cacheStore(filePath, stat.mtimeMs, symbols, source);
+  } catch (e) {
+    process.stderr.write?.(`[clwnd] WASM parse failed for ${filePath}: ${(e as Error).message}\n`);
     return null;
   }
 }
@@ -403,6 +533,12 @@ function extractSymbolsViaQuery(rootNode: any, query: any, langEntry: LanguageEn
 
 export function fileSymbols(filePath: string): Symbol[] | null {
   return cachedParse(filePath)?.symbols ?? null;
+}
+
+/** Async variant — handles both native and WASM grammars. */
+export async function fileSymbolsAsync(filePath: string): Promise<Symbol[] | null> {
+  const entry = await cachedParseAsync(filePath);
+  return entry?.symbols ?? null;
 }
 
 /**
@@ -563,6 +699,68 @@ export function formatSymbols(symbols: Symbol[], indent = 0): string {
 
 export function isSupported(filePath: string): boolean {
   return extname(filePath).toLowerCase() in EXT_TO_LANG;
+}
+
+export function isWasmLanguage(filePath: string): boolean {
+  const entry = EXT_TO_LANG[extname(filePath).toLowerCase()];
+  return entry?.runtime === "wasm";
+}
+
+/** Async validateSyntax for WASM grammars. Native grammars fall through to sync. */
+export async function validateSyntaxAsync(filePath: string, source: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const ext = extname(filePath).toLowerCase();
+  const entry = EXT_TO_LANG[ext];
+  if (!entry || entry.runtime !== "wasm") return validateSyntax(filePath, source);
+  const lang = await getWasmLanguage(ext);
+  if (!lang) return { ok: true }; // unsupported, skip
+  try {
+    const WP = await getWasmParser();
+    const parser = new WP();
+    parser.setLanguage(lang);
+    const tree = parser.parse(source);
+    if (tree.rootNode.hasError) {
+      // Walk for first error — same logic as sync validateSyntax
+      function findError(node: any): string | null {
+        if (node.type === "ERROR" || node.isMissing) {
+          return `parse error at line ${node.startPosition.row + 1} col ${node.startPosition.column + 1}: ${node.type === "ERROR" ? "unexpected tokens" : `missing ${node.type}`}`;
+        }
+        for (let i = 0; i < node.childCount; i++) {
+          const r = findError(node.child(i));
+          if (r) return r;
+        }
+        return null;
+      }
+      const detail = findError(tree.rootNode) ?? "tree contains error nodes";
+      return { ok: false, error: detail };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: `WASM parser threw: ${(e as Error).message}` };
+  }
+}
+
+/** Async symbol byte range for WASM grammars. */
+export async function symbolByteRangeAsync(filePath: string, symbolPath: string): Promise<{ startIndex: number; endIndex: number; startLine: number; endLine: number } | null> {
+  const entry = await cachedParseAsync(filePath);
+  if (!entry) return null;
+  const parts = symbolPath.split(".");
+  let current: Symbol[] = entry.symbols;
+  let found: Symbol | null = null;
+  for (const rawPart of parts) {
+    const { name, occurrence } = parseSegment(rawPart);
+    let count = 0;
+    found = null;
+    for (const s of current) {
+      if (s.name === name) {
+        count++;
+        if (count === occurrence) { found = s; break; }
+      }
+    }
+    if (!found) return null;
+    current = found.children ?? [];
+  }
+  if (!found) return null;
+  return { startIndex: found.startIndex, endIndex: found.endIndex, startLine: found.startLine, endLine: found.endLine };
 }
 
 /**

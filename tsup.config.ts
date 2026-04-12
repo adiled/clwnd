@@ -26,6 +26,7 @@ const TREE_SITTER_GRAMMARS = [
   "tree-sitter-php",
   "tree-sitter-c-sharp",
   "tree-sitter-bash",
+  "web-tree-sitter", // WASM runtime for vue/sql (no native npm package)
 ];
 
 export default defineConfig({
@@ -55,6 +56,21 @@ export default defineConfig({
       console.log(`[onSuccess] copied ${files.filter(f => f.endsWith(".scm")).length} query files → dist/daemon/queries/`);
     } catch (e) {
       console.error("[onSuccess] failed to copy queries:", e);
+    }
+    // Copy vendored WASM grammars (vue, eventually sql)
+    const wasmSrc = path.resolve("lib/wasm");
+    const wasmDst = path.resolve("dist/daemon/wasm");
+    try {
+      await fs.mkdir(wasmDst, { recursive: true });
+      const wfiles = await fs.readdir(wasmSrc);
+      for (const f of wfiles) {
+        if (f.endsWith(".wasm")) {
+          await fs.copyFile(path.join(wasmSrc, f), path.join(wasmDst, f));
+        }
+      }
+      console.log(`[onSuccess] copied ${wfiles.filter(f => f.endsWith(".wasm")).length} wasm files → dist/daemon/wasm/`);
+    } catch (e) {
+      console.error("[onSuccess] failed to copy wasm:", e);
     }
   },
 });

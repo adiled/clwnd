@@ -154,11 +154,12 @@ LANGUAGE COVERAGE — two tiers:
     .php                           (PHP)
     .cs                            (C#)
     .sh .bash                      (Bash / POSIX shell)
+    .vue                           (Vue SFC — via WASM runtime)
 
   Accepted but TEXT-ONLY (create + whole-file replace work; symbol-scoped
   operations will fail with "symbol not found" because we don't have a
   tree-sitter grammar registered for these yet):
-    .kt .kts .swift .scala .lua .zsh .fish .vue .svelte .sql
+    .kt .kts .swift .scala .lua .zsh .fish .svelte .sql
 
 Anything else → use do_noncode.
 
