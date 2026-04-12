@@ -125,7 +125,8 @@ export const clwndPlugin: Plugin = async (input) => {
       };
       if (replaced[input.toolID]) {
         output.description = replaced[input.toolID];
-        output.parameters = { type: "object", properties: {} };
+        // Don't touch output.parameters — OC expects a Zod schema, not a plain object.
+        // Rewriting the description to "DISABLED" is enough — the model won't call it.
       }
     },
     "chat.headers": async (ctx, output) => {

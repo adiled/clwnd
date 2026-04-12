@@ -841,9 +841,17 @@ export class ClwndModel implements LanguageModelV3 {
     })();
     if (isBrokeredToolReturn(opts.prompt) && !isPermReturn) {
       trace("brokered.return", { sid });
+      // Emit a minimal text block before finish so OC creates a new
+      // assistant message. Without this, OC's prompt loop sees
+      // lastAssistantMsg as the PREVIOUS message (which has the brokered
+      // tool call with providerExecuted=false), hasToolCalls stays true,
+      // and the loop re-enters — sending the user's message again.
+      const textId = `brokered-${Date.now()}`;
       return {
         stream: new ReadableStream<LanguageModelV3StreamPart>({
           start(controller) {
+            controller.enqueue({ type: "text-start", id: textId });
+            controller.enqueue({ type: "text-end", id: textId });
             controller.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: zeroUsage() });
             controller.close();
           },
