@@ -93,14 +93,25 @@ const BROKERED_TOOLS = new Set(["webfetch", "websearch", "todowrite"]);
 // clwnd's dispatcher bounces them as unknown. The agent wastes round-trips
 // discovering what's gone.
 const KNOWN_TOOLS = new Set([
+  // clwnd native surface
   "read", "do_code", "do_noncode", "bash",
+  // Brokered through provider (OC executes, result relayed)
   "webfetch", "websearch", "todowrite",
-  "task", "skill", "todoread", "taskoutput", "taskstop",
-  "question", "clwnd_permission", "permission_prompt",
-  "cronCreate", "cronDelete", "cronList",
+  // OC's own tools
+  "task", "skill", "todoread", "taskoutput", "taskstop", "question",
+  // clwnd internal
+  "clwnd_permission", "permission_prompt",
+  // ALL Claude CLI built-in tools — blocked via --disallowedTools in the
+  // daemon spawn. Listed here so OC doesn't forward them as "external
+  // MCP tools" when it sees them in its own registry.
+  "cronCreate", "cronDelete", "cronList", "monitor", "remoteTrigger", "scheduleWakeup",
+  "taskCreate", "taskGet", "taskList", "taskUpdate",
   "notebookedit", "codesearch", "applypatch", "ls",
+  "agent", "explore", "sendMessage",
+  "enterPlanMode", "exitPlanMode", "enterWorktree", "exitWorktree",
+  "askUserQuestion",
   // Replaced-and-banned. Do not forward. Do not re-enable.
-  "edit", "write", "glob", "grep",
+  "edit", "write", "multiedit", "glob", "grep",
 ]);
 
 // Map OC's snake_case schema fields to the camelCase Claude CLI expects.

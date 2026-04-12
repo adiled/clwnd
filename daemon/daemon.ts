@@ -241,9 +241,29 @@ class ClaudeNest {
       // tool for every permission decision instead of auto-approving
       "--permission-mode", "default",
       "--permission-prompt-tool", "mcp__clwnd__permission_prompt",
-      // Disable built-in tools — our MCP server replaces file/bash tools,
-      // and interactive tools would hang in -p mode
-      "--disallowedTools", "Read,Edit,Write,Bash,Glob,Grep,ToolSearch,Agent,NotebookEdit,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree,AskUserQuestion",
+      // Disable ALL Claude CLI built-in tools. clwnd's MCP server provides
+      // the filesystem surface (read, do_code, do_noncode, bash); OC
+      // provides session tools (task, skill, todowrite) via brokered
+      // pass-through; and webfetch/websearch are brokered too. Everything
+      // else is either replaced, irrelevant in -p mode, or actively
+      // confusing (the agent sees CronCreate/Monitor/Explore and tries
+      // to use them, but they don't work in a piped subprocess).
+      "--disallowedTools", [
+        // Filesystem — replaced by mcp__clwnd__read/do_code/do_noncode/bash
+        "Read", "Edit", "Write", "MultiEdit", "ApplyPatch", "Bash", "Glob", "Grep",
+        // Navigation — replaced by mcp__clwnd__read (symbol/query/pattern)
+        "ToolSearch", "NotebookEdit", "CodeSearch",
+        // Agent/subagent — doesn't work in -p piped mode
+        "Agent", "Explore", "SendMessage",
+        // Plan/worktree — OC owns these concepts
+        "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+        // Interactive — would hang waiting for user input in -p mode
+        "AskUserQuestion",
+        // Background tasks — Claude CLI's task system, not OC's
+        "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop",
+        // Scheduling — Claude CLI cron/monitor/loop, not relevant in subprocess
+        "CronCreate", "CronDelete", "CronList", "Monitor", "RemoteTrigger", "ScheduleWakeup",
+      ].join(","),
       // Register our MCP server — strict mode prevents ambient .mcp.json discovery
       "--mcp-config", mcpConfig,
       "--strict-mcp-config",
