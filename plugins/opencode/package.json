@@ -1,6 +1,6 @@
 {
   "name": "@clwnd/opencode",
-  "version": "0.19.1",
+  "version": "0.19.2",
   "description": "clwnd for opencode",
   "type": "module",
   "main": "dist/index.js",
@@ -44,9 +44,15 @@
     "@opencode-ai/plugin": ">=1.3.5"
   },
   "peerDependenciesMeta": {
-    "@opentui/core": { "optional": true },
-    "@opentui/solid": { "optional": true },
-    "solid-js": { "optional": true }
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.3.5",
