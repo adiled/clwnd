@@ -10,6 +10,7 @@ import { resolve, dirname, relative, extname, join as pathJoin } from "path";
 import { trace } from "../log.ts";
 import { penny } from "../lib/penny.ts";
 import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, astGrep, searchSymbols, validateSyntax, symbolByteRange, type Symbol } from "../lib/ast.ts";
+import { resolveScope } from "../lib/linguistic.ts";
 
 let CWD = process.env.CLWND_CWD ?? process.cwd();
 
@@ -198,30 +199,55 @@ WORKFLOW: before calling do_code on an existing file, read it first — both to 
   },
   {
     name: "do_noncode",
-    description: `Write or modify a non-code file. This is the ONLY way to author non-code in clwnd — no in-place string editing, no pattern matching, no symbol vocabulary (there is no AST for non-code). You hand over content; clwnd writes it. Three modes: write (create or overwrite), append (add to the end), prepend (add to the beginning).
+    description: `Write or modify a non-code file. This is the ONLY way to author non-code in clwnd.
 
 ACCEPTS: anything that is NOT a code file. Configs (json, yaml, toml, ini, env), docs (md, txt, rst), markup (html, xml, svg), stylesheets (css, scss, less), data (csv, tsv, jsonl), logs, plain text.
 
-REFUSES: any file whose extension puts it in do_code's territory. If you need to change a code file, use do_code with a symbol or a full-file replace — there is no escape hatch.
+REFUSES: any file whose extension puts it in do_code's territory. If you need to change a code file, use do_code.
 
-MODES:
+TWO APPROACHES:
 
-  mode: 'write' (default)
-    Create the file if it doesn't exist, or overwrite it entirely if it does. A fresh write does not require prior context. An overwrite of an existing file does require a prior read in the same session (staleness guard) UNLESS you genuinely don't care what was there.
+  1. TARGET MODE — precise editing by content anchor (preferred for existing files)
+     Pass the 'target' parameter with the text you want to edit. clwnd finds it
+     by content (not line number), resolves its scope (how much it "owns"), and
+     replaces just that scope with your new content. The content addresses itself.
 
-  mode: 'append'
-    Append content to the end of an existing file. Requires the file to exist and to have been read in this session (staleness guard). Content is added verbatim — include your own leading newline if needed.
+     Examples:
+       do_noncode(file, target: '## Installation', content: '## Installation\\nnpm install clwnd\\n')
+         → finds the Installation heading, replaces it + everything under it until the next heading
+       do_noncode(file, target: 'DATABASE_URL', content: 'DATABASE_URL=postgres://new-host/db\\n')
+         → finds the DATABASE_URL line in an .env, replaces just that line
+       do_noncode(file, target: 'dependencies.lodash', content: '  "lodash": "^5.0.0",\\n')
+         → finds the lodash key in package.json, replaces the key-value pair
+       do_noncode(file, target: 'server', content: 'server:\\n  port: 9090\\n  host: 0.0.0.0\\n')
+         → finds the server key in a YAML file, replaces its entire block
+       do_noncode(file, target: '[database]', content: '[database]\\nhost = newhost\\nport = 5432\\n')
+         → finds the [database] TOML section, replaces through next section
 
-  mode: 'prepend'
-    Prepend content to the beginning of an existing file. Same staleness requirement as append.
+     Scope is inferred from format:
+       Markdown headings  → paragraph (until next same-or-higher heading)
+       Env KEY=value      → phrase (the line)
+       JSON/YAML key      → phrase (key + value, supports dot paths)
+       TOML [section]     → paragraph (until next section)
+       Generic            → phrase (the line) or paragraph (if indented content follows)
 
-Typical uses: writing a README, updating a config, appending a changelog entry, dumping JSON output to disk, creating a new markdown note.`,
+  2. CLASSIC MODES — whole-file operations
+     mode: 'write'   — create or overwrite entirely (default)
+     mode: 'append'  — add content to the end
+     mode: 'prepend' — add content to the beginning
+
+     For existing files, read first (staleness guard). Write mode doesn't
+     require prior context.
+
+WORKFLOW: read the file first to see its content, then use target mode to
+edit a specific part, or use write/append/prepend for whole-file operations.`,
     inputSchema: {
       type: "object" as const,
       properties: {
         file_path: { type: "string", description: "Absolute path to a non-code file. Code extensions (ts, py, go, rs, java, etc.) are rejected — use do_code for those." },
-        content: { type: "string", description: "The content to write/append/prepend. Written exactly as provided." },
-        mode: { type: "string", description: "One of: write, append, prepend. Default: write." },
+        content: { type: "string", description: "The new content. In target mode: replaces the targeted scope. In classic modes: written/appended/prepended as-is." },
+        target: { type: "string", description: "Content anchor to target for editing. The exact text that identifies what you want to change — a markdown heading ('## Setup'), an env var name ('DATABASE_URL'), a JSON key path ('dependencies.lodash'), a YAML key ('server.port'), a TOML section ('[database]'). clwnd finds it by content and replaces its scope. Mutually exclusive with mode." },
+        mode: { type: "string", description: "Classic whole-file mode: write (default), append, prepend. Ignored if target is set." },
       },
       required: ["file_path", "content"],
     },
@@ -1213,7 +1239,7 @@ function execDoCode(
 // whose extension is in CODE_EXTENSIONS so it cannot be used as an
 // end-run around do_code's AST validation.
 function execDoNoncode(
-  args: { file_path: string; content: string; mode?: "write" | "append" | "prepend" },
+  args: { file_path: string; content: string; mode?: "write" | "append" | "prepend"; target?: string },
   sessionId?: string,
 ): ToolResult {
   const p = assertPath(args.file_path);
@@ -1231,6 +1257,36 @@ function execDoNoncode(
 
   const existed = existsSync(p);
 
+  // ── target mode: linguistic scope splice ──────────────────────────
+  // When `target` is provided, find the anchor in the file by content,
+  // resolve its scope (how much text it "owns"), and replace just that
+  // scope with the new content. No line numbers, no old/new strings —
+  // the anchor IS the address.
+  if (args.target) {
+    if (!existed) {
+      return { output: `Error: target '${args.target}' requires the file to exist. Use mode 'write' to create a new file.`, title: relPath };
+    }
+    const stale = checkStaleness(p, sessionId);
+    if (stale) return stale;
+    const original = readFileSync(p, "utf-8");
+    const match = resolveScope(original, args.target, p);
+    if (!match) {
+      return {
+        output: `Error: target '${args.target}' not found in ${p}. Read the file first to see its content, then pass the exact anchor text you want to target.`,
+        title: relPath,
+      };
+    }
+    const next = original.slice(0, match.startIndex) + args.content + original.slice(match.endIndex);
+    writeFileSync(p, next);
+    recordWrite(p, sessionId, next);
+    return {
+      output: `Replaced ${match.scope} '${args.target}' in ${p} (bytes ${match.startIndex}-${match.endIndex} → ${args.content.length} bytes new).`,
+      title: relPath,
+      metadata: { mode: "target", target: args.target, scope: match.scope, was: { start: match.startIndex, end: match.endIndex }, size: next.length },
+    };
+  }
+
+  // ── classic modes: write / append / prepend ───────────────────────
   // Staleness only matters for append/prepend to an existing file. "write"
   // is a wholesale overwrite; the prior state is by definition obsolete.
   if (existed && mode !== "write") {
