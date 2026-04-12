@@ -432,11 +432,16 @@ describe("e2e-serve: session basics", () => {
     const resp = await sendMessage(sid, "List all your tools. Just the tool names, one per line.");
     const text = extractResponseText(resp).toLowerCase();
 
-    // Every clwnd MCP tool must appear in the agent's response.
-    // If any is missing, the OC plugin cache is stale or the daemon's
-    // tools/list is filtering them out — the exact bug that caused the
-    // "no do_code in my toolkit" symptom on osx.
-    const required = ["do_code", "do_noncode", "read", "bash"];
+    // Every clwnd MCP tool must appear with its full mcp__clwnd__ prefix.
+    // Claude CLI exposes MCP tools as mcp__<server>__<name>. If the agent
+    // says "do_code" but not "mcp__clwnd__do_code", the tool is either
+    // not registered via MCP or the agent is hallucinating its name.
+    const required = [
+      "mcp__clwnd__do_code",
+      "mcp__clwnd__do_noncode",
+      "mcp__clwnd__read",
+      "mcp__clwnd__bash",
+    ];
     for (const tool of required) {
       expect(text).toContain(tool);
     }
