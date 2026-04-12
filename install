@@ -492,9 +492,11 @@ cmd_update() {
 
   if [ "$SOURCE_UNCHANGED" = "1" ]; then
     echo "[build] skipped — source unchanged"
+    configure_tui
   else
     do_build
     configure_opencode
+    configure_tui
     echo "[service] re-registering..."
     register_service
     install_cli
