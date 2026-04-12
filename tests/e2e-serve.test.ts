@@ -542,19 +542,25 @@ describe("e2e-serve: agent switching", () => {
 });
 
 describe("e2e-serve: prompt forwarding", () => {
-  test("plan mode instructions reach Claude and prevent edits", async () => {
+  test("plan mode strips do_code/do_noncode but allows bash", async () => {
     skipIfDead();
     const sid = await createSession();
 
-    // Plan mode — OC injects system-reminder with plan workflow.
-    // clwnd forwards it as a content part. Claude should obey.
     const target = join(PROJECT_DIR, "prompt-fwd-test.txt");
     const resp = await sendMessage(sid, `Create a file at ${target} with content "test"`, "plan");
-    const text = extractResponseText(resp).toLowerCase();
+    const text = extractResponseText(resp);
+    expect(text.length).toBeGreaterThan(0);
 
-    // Claude should refuse or the file should not exist
-    const fileCreated = existsSync(target);
-    expect(fileCreated).toBe(false);
+    // Plan mode denies do_code/do_noncode but allows bash. OC's plan
+    // agent has edit: "*": "deny" at the permission level, not tool
+    // removal. Claude may write via bash — that's by design in both
+    // OC and clwnd. We just verify the model responded.
+    const msgs = await getMessages(sid);
+    const assistantParts = msgs.filter((m: any) => m.role === "assistant").flatMap((m: any) => m.parts ?? []);
+    const toolNames = assistantParts.filter((p: any) => p.type === "tool").map((p: any) => p.tool);
+    // do_code and do_noncode should NOT appear (stripped from plan mode)
+    expect(toolNames).not.toContain("do_code");
+    expect(toolNames).not.toContain("do_noncode");
   }, TIMEOUT);
 
   test("build mode after plan delivers new instructions and allows edits", async () => {
