@@ -1273,30 +1273,50 @@ async function handleTendrilReach(msg: Record<string, unknown>): Promise<void> {
   try {
     if (tool === "task" && sharedClient) {
       const client = sharedClient as any;
-      // Find the active session for this tendril
-      const sid = msg.sid as string;
-      if (!sid) throw new Error("no session for tendril");
+      const parentSid = msg.sid as string;
+      if (!parentSid) throw new Error("no session for tendril");
 
-      // Send a subtask part to OC — OC's prompt loop runs handleSubtask
+      const agentType = (args.subagent_type as string) ?? "build";
+      const description = (args.description as string) ?? "subtask";
+      const prompt = args.prompt as string;
+      const taskId = args.task_id as string | undefined;
+
+      // Resume existing subtask session or create a new child session
+      let childSid: string;
+      if (taskId) {
+        childSid = taskId;
+      } else {
+        const created = await client.session.create({
+          body: { parentID: parentSid, title: `${description} (@${agentType})` },
+        });
+        childSid = (created.data as any)?.id;
+        if (!childSid) throw new Error("failed to create child session");
+      }
+
+      trace("tendril.task.started", { callId, parentSid, childSid, agent: agentType });
+
+      // Run the subtask on the CHILD session (not the parent — parent is locked mid-turn)
       const resp = await client.session.prompt({
-        path: { id: sid },
+        path: { id: childSid },
         body: {
-          parts: [{
-            type: "subtask",
-            prompt: args.prompt as string,
-            description: args.description as string,
-            agent: args.subagent_type as string ?? "build",
-          }],
+          parts: [{ type: "text", text: prompt }],
+          model: { providerID: "opencode-clwnd", modelID: "claude-sonnet-4-5" },
+          agent: agentType,
         },
       });
 
-      // Extract the text result from the response
       const data = resp.data as any;
       const parts = data?.parts ?? [];
       const textPart = parts.findLast((p: any) => p.type === "text");
-      const result = textPart?.text ?? "(task completed with no text output)";
+      const result = [
+        `task_id: ${childSid}`,
+        "",
+        "<task_result>",
+        textPart?.text ?? "(task completed with no text output)",
+        "</task_result>",
+      ].join("\n");
 
-      trace("tendril.resolved", { tool, callId, len: result.length });
+      trace("tendril.task.resolved", { callId, childSid, len: result.length });
       hum({ chi: "tendril-result", callId, result });
     } else {
       hum({ chi: "tendril-result", callId, result: `Error: unknown tendril tool '${tool}'` });
