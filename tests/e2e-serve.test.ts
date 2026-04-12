@@ -14,7 +14,7 @@ const PROJECT_DIR = join(SUITE_DIR, "project");
 const TIMEOUT = 180_000;
 const SEED_FIXTURE = join(import.meta.dir, "fixtures", "seed-session.json");
 const DUMMY_MODEL = { providerID: "piano", modelID: "pianoV2" };
-const FREE_MODEL = { providerID: "opencode", modelID: "mimo-v2-pro-free" };
+const FREE_MODEL = { providerID: "opencode", modelID: "big-pickle" };
 
 // Track sessions created during each test for cleanup
 const activeSessions: string[] = [];
