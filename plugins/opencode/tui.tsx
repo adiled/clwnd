@@ -2,6 +2,17 @@
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { createSignal, onCleanup, createMemo, Show } from "solid-js"
 
+const VERSION = (() => {
+  try {
+    const fs = require("fs")
+    const path = require("path")
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8"))
+    return pkg.version ?? "?"
+  } catch {
+    return "?"
+  }
+})()
+
 interface DaemonData {
   status: "connected" | "disconnected"
   procs: number
@@ -73,10 +84,23 @@ function SidebarView(props: { api: any; session_id: string }) {
     return `saved: ${String(d.readDedup)} dedup · ${String(d.bashCapped)} capped`
   })
 
+  // green = active procs, secondary = idle (connected, nothing running), muted = disconnected
+  const dotColor = createMemo(() => {
+    const d = data()
+    if (d.status === "disconnected") return theme().textMuted
+    if (d.procs > 0) return theme().success
+    return theme().secondary
+  })
+
   return (
     <box>
-      <text fg={theme().text}><b>clwnd</b></text>
-      <text fg={data().status === "connected" ? theme().success : theme().error}>{statusLine()}</text>
+      <text fg={theme().textMuted}>
+        <span style={{ fg: dotColor() }}>{"•"}</span>
+        {" "}
+        <b>{"clwnd"}</b>
+        {" "}
+        <span>{VERSION}</span>
+      </text>
       <text fg={theme().textMuted}>{procsLine()}</text>
       <Show when={savingsLine() !== ""}>
         <text fg={theme().textMuted}>{savingsLine()}</text>

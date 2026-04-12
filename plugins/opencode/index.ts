@@ -111,6 +111,23 @@ export const clwndPlugin: Plugin = async (input) => {
         }
       }
     },
+    // Suppress OC's builtin tools that clwnd has replaced. We can't remove
+    // them from OC's registry, but we can rewrite their descriptions so the
+    // model never picks them. Without this, the model sees "edit", "write",
+    // "glob", "grep" in the active tool list, tries to call them, and gets
+    // an invalid-tool bounce because Claude CLI has --disallowedTools'd them.
+    "tool.definition": async (input, output) => {
+      const replaced: Record<string, string> = {
+        edit: "DISABLED — use do_code instead.",
+        write: "DISABLED — use do_code for code files, do_noncode for non-code files.",
+        glob: "DISABLED — use read with a glob pattern or directory path instead.",
+        grep: "DISABLED — use read with the pattern parameter instead.",
+      };
+      if (replaced[input.toolID]) {
+        output.description = replaced[input.toolID];
+        output.parameters = { type: "object", properties: {} };
+      }
+    },
     "chat.headers": async (ctx, output) => {
       output.headers["x-clwnd-agent"] = typeof ctx.agent === "string"
         ? ctx.agent
