@@ -241,6 +241,10 @@ async function awakenHum(): Promise<void> {
             continue;
           }
           if (msg.chi === "pulse") { trace("hum.pulse", { kind: msg.kind, sid: msg.sid }); continue; }
+          if (msg.chi === "tendril-reach") {
+            handleTendrilReach(msg);
+            continue;
+          }
           // Dispatch stream events to the per-session listener. Every clwnd
           // hum event that belongs to a stream carries sid — pulses, breaths
           // and echoes (handled above) do not, and they reach all sessions by
@@ -651,7 +655,7 @@ export function clearSessionState(sid: string): void {
 }
 
 const AGENT_DENY: Record<string, Set<string>> = {
-  plan: new Set(["do_code", "do_noncode"]),
+  plan: new Set(["do_code", "do_noncode", "task"]),
 };
 
 function deriveAllowedTools(sid: string, opts: LanguageModelV3CallOptions): string[] {
@@ -659,7 +663,7 @@ function deriveAllowedTools(sid: string, opts: LanguageModelV3CallOptions): stri
   let agentName = agent;
   try { const p = JSON.parse(agent); if (p?.name) agentName = p.name; } catch {}
   const denied = AGENT_DENY[agentName] ?? new Set();
-  const all = ["read", "do_code", "do_noncode", "bash", "webfetch"];
+  const all = ["read", "do_code", "do_noncode", "bash", "webfetch", "task"];
   const result = all.filter(t => !denied.has(t));
   const key = result.join(",");
   const prev = lastAllowedTools.get(sid);
@@ -1259,6 +1263,49 @@ export class ClwndModel implements LanguageModelV3 {
 let sharedClient: unknown = null;
 let sharedPluginInput: ClwndConfig["pluginInput"] = undefined;
 export function setSharedClient(client: unknown): void { sharedClient = client; }
+
+async function handleTendrilReach(msg: Record<string, unknown>): Promise<void> {
+  const tool = msg.tool as string;
+  const args = msg.args as Record<string, unknown>;
+  const callId = msg.callId as string;
+  trace("tendril.executing", { tool, callId });
+
+  try {
+    if (tool === "task" && sharedClient) {
+      const client = sharedClient as any;
+      // Find the active session for this tendril
+      const sid = msg.sid as string;
+      if (!sid) throw new Error("no session for tendril");
+
+      // Send a subtask part to OC — OC's prompt loop runs handleSubtask
+      const resp = await client.session.prompt({
+        path: { id: sid },
+        body: {
+          parts: [{
+            type: "subtask",
+            prompt: args.prompt as string,
+            description: args.description as string,
+            agent: args.subagent_type as string ?? "build",
+          }],
+        },
+      });
+
+      // Extract the text result from the response
+      const data = resp.data as any;
+      const parts = data?.parts ?? [];
+      const textPart = parts.findLast((p: any) => p.type === "text");
+      const result = textPart?.text ?? "(task completed with no text output)";
+
+      trace("tendril.resolved", { tool, callId, len: result.length });
+      hum({ chi: "tendril-result", callId, result });
+    } else {
+      hum({ chi: "tendril-result", callId, result: `Error: unknown tendril tool '${tool}'` });
+    }
+  } catch (e) {
+    trace("tendril.failed", { tool, callId, err: String(e) });
+    hum({ chi: "tendril-result", callId, result: `Error: ${e instanceof Error ? e.message : String(e)}` });
+  }
+}
 export function setSharedPluginInput(input: ClwndConfig["pluginInput"]): void { sharedPluginInput = input; }
 
 export function createClwnd(config: ClwndConfig = {}) {

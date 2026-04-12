@@ -234,6 +234,32 @@ WORKFLOW: read(file) first → see anchor outline → do_noncode(file, target, c
     },
   },
   {
+    name: "task",
+    description: `Launch a subagent to handle a complex task autonomously in a separate context window. The subagent gets its own conversation, its own tools (read, do_code, do_noncode, bash), and returns a compact summary when done. Your main context stays clean — you only see the final result, not the intermediate work.
+
+Use task when:
+  - Research across multiple files/repos that would bloat your context
+  - Multi-step work you can delegate (code review, refactoring a module, writing tests)
+  - Parallel work — launch multiple tasks in one message for concurrent execution
+
+Don't use task when:
+  - Simple file reads (use read directly)
+  - Single-file edits (use do_code directly)
+  - Quick questions (just answer them)
+
+The subagent starts fresh unless you provide task_id to resume a previous task session.`,
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        description: { type: "string", description: "Short (3-5 word) description of the task" },
+        prompt: { type: "string", description: "Detailed instructions for the subagent" },
+        subagent_type: { type: "string", description: "Agent type to use (e.g. 'build', 'plan', or a custom agent name)" },
+        task_id: { type: "string", description: "Resume a previous task session by passing its task_id" },
+      },
+      required: ["description", "prompt", "subagent_type"],
+    },
+  },
+  {
     name: "permission_prompt",
     description: "Handle permission prompts from Claude CLI. Called automatically via --permission-prompt-tool.",
     inputSchema: {
@@ -1788,6 +1814,44 @@ async function executeExternalTool(sessionId: string, toolName: string, args: Re
 }
 
 
+// Proxy tool execution — holds the MCP call, hums to the plugin, waits
+// for the result. The plugin registers a matching tool via OC's tool:
+// hook. OC executes it (with full promptOps for task, etc.) and the
+// plugin hums the result back. Same pattern as permission_prompt.
+type TendrilHold = { resolve: (result: string) => void; tool: string };
+const TENDRIL_HOLDS = new Map<string, TendrilHold>();
+let tendrilCallback: ((tool: string, args: Record<string, unknown>, callId: string, sessionId?: string) => void) | null = null;
+
+export function setTendrilCallback(cb: typeof tendrilCallback): void { tendrilCallback = cb; }
+
+export function resolveTendril(callId: string, result: string): boolean {
+  const hold = TENDRIL_HOLDS.get(callId);
+  if (!hold) return false;
+  TENDRIL_HOLDS.delete(callId);
+  hold.resolve(result);
+  return true;
+}
+
+async function execTendril(name: string, args: Record<string, unknown>, sessionId?: string): Promise<ToolResult> {
+  const callId = `proxy-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  trace("tendril.reach.hold", { tool: name, callId, sid: sessionId });
+
+  if (tendrilCallback) tendrilCallback(name, args, callId, sessionId);
+
+  const result = await new Promise<string>((resolve) => {
+    TENDRIL_HOLDS.set(callId, { resolve, tool: name });
+    setTimeout(() => {
+      if (TENDRIL_HOLDS.has(callId)) {
+        TENDRIL_HOLDS.delete(callId);
+        trace("tendril.reach.timeout", { tool: name, callId });
+        resolve(`Error: ${name} timed out after 5 minutes`);
+      }
+    }, 5 * 60_000);
+  });
+
+  return { output: result, title: name, metadata: { proxy: true, callId } };
+}
+
 export async function executeTool(name: string, args: Record<string, unknown>, _callId?: string, sessionId?: string): Promise<ToolResult> {
   if (name !== "permission_prompt") trace("mcp.tool.executed", { tool: name });
   switch (name) {
@@ -1796,6 +1860,7 @@ export async function executeTool(name: string, args: Record<string, unknown>, _
     case "do_noncode": return execDoNoncode(args as any, sessionId);
     case "bash": return execBash(args as any);
     case "permission_prompt": return execPermissionPrompt(args as any, sessionId);
+    case "task": return execTendril("task", args, sessionId);
     // Replaced-and-banned tools. Return a redirect instead of "Unknown tool"
     // so an agent that somehow still sees one of these learns the right
     // substitute without wasting another round-trip.

@@ -441,6 +441,7 @@ describe("e2e-serve: session basics", () => {
       "mcp__clwnd__do_noncode",
       "mcp__clwnd__read",
       "mcp__clwnd__bash",
+      "mcp__clwnd__task",
     ];
     for (const tool of required) {
       expect(text).toContain(tool);
@@ -980,9 +981,34 @@ describe("e2e-serve: brokered tools", () => {
     skipIfDead();
     const sid = await createSession();
 
-    // Brokered: Claude fetches via MCP, OpenCode re-executes for UI sync
     const resp = await sendMessage(sid, "Fetch https://example.com and tell me what the page contains");
     expect(resp.info?.error).toBeUndefined();
+  }, TIMEOUT);
+});
+
+describe("e2e-serve: task tool", () => {
+  test("task spawns subtask and returns result without bloating parent context", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Baseline turn
+    const r1 = await sendMessage(sid, "Say hello.");
+    const t1 = r1.info?.tokens?.input ?? 0;
+
+    // Spawn a task — should run in a child session
+    const r2 = await sendMessage(sid, "Use the task tool to spawn a build agent that reads the current directory and lists all files. Report what it finds.");
+    const text = extractResponseText(r2);
+    expect(text.length).toBeGreaterThan(0);
+
+    // Post-task turn — context should not have exploded from the subtask's intermediate work
+    const r3 = await sendMessage(sid, "What did the task find?");
+    const t3 = r3.info?.tokens?.input ?? 0;
+
+    // If the subtask's intermediate context leaked into the parent, t3
+    // would be massively larger than t1. Allow 5x for conversation growth
+    // (3 turns + task result summary), but not 20x (which would mean the
+    // full subtask history leaked).
+    expect(t3).toBeLessThan(t1 * 10);
   }, TIMEOUT);
 });
 

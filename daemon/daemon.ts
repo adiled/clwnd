@@ -1320,6 +1320,14 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       break;
     }
 
+    case "tendril-result": {
+      const callId = msg.callId as string;
+      const result = msg.result as string;
+      trace("tendril.result", { callId, len: result?.length });
+      resolveTendril(callId, result ?? "");
+      break;
+    }
+
     case "release-permit": {
       const askId = msg.askId as string;
       const decision = msg.decision as "allow" | "deny";
@@ -1535,7 +1543,7 @@ Bun.serve({
 
 // ─── MCP HTTP Server (persistent, no cold start) ────────────────────────────
 
-import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms, setAllowedTools as mcpSetAllowed, setPermissionCallback, setMetaCallback, setExternalTools, clearExternalTools, setMcpServerConfigs, clearMcpServerConfigs, setVisibleTools, clearVisibleTools, clearReadCache, type ExternalToolDef } from "../mcp/tools.ts";
+import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms, setAllowedTools as mcpSetAllowed, setPermissionCallback, setMetaCallback, setExternalTools, clearExternalTools, setMcpServerConfigs, clearMcpServerConfigs, setVisibleTools, clearVisibleTools, clearReadCache, setTendrilCallback, resolveTendril, type ExternalToolDef } from "../mcp/tools.ts";
 
 // Fixed port so the plugin (and anything else local) can reach the MCP
 // HTTP endpoint without discovery. Override with CLWND_MCP_PORT if the
@@ -1703,6 +1711,15 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>, s
       }
     }, 5_000);
   });
+});
+
+// Tendril: tool calls that reach across the hum back to OC for execution.
+// The daemon holds the MCP response, hums the call to the plugin, plugin
+// executes via OC's tool pipeline, hums the result back. Same shape as
+// the permission hold but for actual tool execution (task subtasks etc.).
+setTendrilCallback((tool, args, callId, sessionId) => {
+  trace("tendril.reach", { tool, callId, sid: sessionId });
+  hum(sessionId ?? "", { chi: "tendril-reach", tool, args, callId });
 });
 
 // Wire tool metadata to hum — OC gets it out-of-band, Claude CLI never sees it
