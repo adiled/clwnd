@@ -139,53 +139,31 @@ RULES:
   },
   {
     name: "do_code",
-    description: `Write or modify a code file. This is the ONLY way to author code in clwnd — there is no string-replace edit, no fuzzy match, no "old_string / new_string" vocabulary. Edits are grounded in the tree-sitter AST: you target a symbol by name, you provide the new source for it, and clwnd re-parses the result before writing. Any edit that would leave the file syntactically invalid is rejected without touching disk.
+    description: `Author code. You are writing code — think like a developer in the target language.
 
-LANGUAGE COVERAGE — two tiers:
+COMMON SENSE — apply these every time, don't wait to be told:
+  - IMPORTS: if your new code references a module, type, or function that isn't already imported, add the import. Don't write code that won't compile because an import is missing.
+  - STYLE: read the file first. Match the existing conventions — semicolons or not, single quotes or double, tabs or spaces, trailing commas. Don't impose your own preference on someone else's codebase.
+  - TYPES: if the file is TypeScript, write TypeScript. If it's Python with type hints, add type hints. Don't downgrade typed code to untyped because you're being lazy.
+  - NAMING: camelCase in JS/TS, snake_case in Python/Rust/Ruby, PascalCase for classes everywhere. Follow the language's conventions, not a generic one.
+  - COMPLETENESS: don't write placeholder comments like "// implement this" or "# TODO". Write the actual implementation. If you can't implement it, say so in your response, don't hide it in a comment.
+  - ERROR HANDLING: if the existing code handles errors (try/catch, Result types, error returns), your new code should too. Don't add a function that ignores errors when every neighbor handles them.
+  - SCOPE: change what was asked. Don't refactor neighboring code, don't "clean up" imports you didn't touch, don't add features that weren't requested.
 
-  Full AST grounding (re-parsed on write, symbol-scoped operations work):
-    .ts .tsx .js .jsx .mjs .cjs   (TypeScript / JavaScript)
-    .py .pyi                       (Python)
-    .go                            (Go)
-    .rs                            (Rust)
-    .java                          (Java)
-    .c .h                          (C)
-    .cc .cpp .cxx .hpp .hxx        (C++)
-    .rb                            (Ruby)
-    .php                           (PHP)
-    .cs                            (C#)
-    .sh .bash                      (Bash / POSIX shell)
-    .vue                           (Vue SFC — via WASM runtime)
+LANGUAGE COVERAGE (AST-grounded — re-parsed, symbol-scoped edits work):
+  .ts .tsx .js .jsx .mjs .cjs  .py .pyi  .go  .rs  .java  .c .h
+  .cc .cpp .cxx .hpp .hxx  .rb  .php  .cs  .sh .bash  .vue
+  Also accepted (text-only, no symbol ops): .kt .kts .swift .scala .lua .zsh .fish .svelte .sql
+  Anything else → use do_noncode.
 
-  Accepted but TEXT-ONLY (create + whole-file replace work; symbol-scoped
-  operations will fail with "symbol not found" because we don't have a
-  tree-sitter grammar registered for these yet):
-    .kt .kts .swift .scala .lua .zsh .fish .svelte .sql
+OPERATIONS:
+  create           — new file. Syntax-validated before write.
+  replace + symbol — splice one symbol. Pass the FULL new source of that symbol.
+  replace (no sym) — whole-file rewrite. Use only when most lines are changing.
+  insert_after/before — add code adjacent to a symbol anchor.
+  delete           — remove a symbol.
 
-Anything else → use do_noncode.
-
-FIVE OPERATIONS — pick one via the 'operation' field:
-
-  operation: 'create'
-    Create a brand-new code file. The file must not already exist. Required: new_source. Content is re-parsed for syntax and the file is only written if parsing succeeds.
-    Example: do_code('/src/auth/handler.ts', operation: 'create', new_source: 'export function handle() { … }')
-
-  operation: 'replace' WITH symbol
-    Replace the full source of an existing symbol. Required: symbol, new_source. The symbol's AST-derived line range is found, those lines are spliced out, new_source is inserted, and the whole file is re-parsed. The new_source should be the complete new source of the symbol (including its header and body).
-    Example: do_code('/src/auth/handler.ts', operation: 'replace', symbol: 'Server.start', new_source: 'async start(port: number) { … }')
-
-  operation: 'replace' WITHOUT symbol
-    Full-file rewrite. Required: new_source is the entire new file content. Re-parsed before writing. Use this only when every line is changing; prefer symbol-scoped replace when possible.
-
-  operation: 'insert_after'  /  'insert_before'
-    Add a new symbol immediately after / before an existing one. Required: symbol (the anchor), new_source (the new code block). A blank-line separator is added automatically. Re-parsed.
-    Example: do_code('/src/auth/handler.ts', operation: 'insert_after', symbol: 'Server.start', new_source: 'async stop() { … }')
-
-  operation: 'delete'
-    Remove a symbol from the file. Required: symbol. No new_source. Re-parsed.
-    Example: do_code('/src/auth/handler.ts', operation: 'delete', symbol: 'deprecatedHelper')
-
-WORKFLOW: before calling do_code on an existing file, read it first — both to see the symbol outline AND to clear clwnd's staleness guard, which rejects edits whose baseline is older than the current mtime. Typical loop: read(file) → do_code(file, operation, symbol, new_source) → read(file, symbol: ...) to verify.`,
+WORKFLOW: read(file) first → see symbol outline → do_code(file, symbol, new_source). The read is required (staleness guard). After editing, verify with read(file, symbol: 'name').`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -201,46 +179,36 @@ WORKFLOW: before calling do_code on an existing file, read it first — both to 
     name: "do_noncode",
     description: `Write or modify a non-code file. This is the ONLY way to author non-code in clwnd.
 
-ACCEPTS: anything that is NOT a code file. Configs (json, yaml, toml, ini, env), docs (md, txt, rst), markup (html, xml, svg), stylesheets (css, scss, less), data (csv, tsv, jsonl), logs, plain text.
+COMMON SENSE — apply these every time:
+  - FORMAT: you're editing a structured document. Respect its format. If the YAML uses 2-space indent, don't switch to 4. If the JSON has trailing newlines, keep them. If the env file has no quotes around values, don't add them.
+  - MARKDOWN: headings have hierarchy. Don't put an ### under a # with no ## in between. Keep heading levels consistent with the rest of the document. Preserve blank lines between sections — they're the paragraph boundaries.
+  - JSON: it must be valid JSON after your edit. Watch for trailing commas (illegal in JSON), missing quotes on keys, unescaped special characters. If the file uses 2-space indent, use 2-space indent.
+  - YAML: indentation IS the structure. A wrong indent changes the meaning, not just the formatting. If you're editing a nested key, match the exact indentation of its siblings.
+  - ENV: one KEY=value per line. No spaces around = unless the file already has them. Don't quote values unless the existing file quotes them. Preserve comments.
+  - TOML: sections are [name]. Keys are name = value. Don't mix styles. Don't put keys above the first section if the file doesn't already do that.
+  - PROSE: when editing documentation, write clearly. Don't leave placeholder text. Don't add marketing fluff. If you're updating a section, make sure cross-references in other sections still make sense.
+  - SCOPE: change what was asked. Don't reformat the whole file, don't "fix" neighboring sections, don't reorganize structure that wasn't requested.
 
-REFUSES: any file whose extension puts it in do_code's territory. If you need to change a code file, use do_code.
+ACCEPTS: anything NOT a code file — configs, docs, markup, stylesheets, data, plain text.
+REFUSES: code files → use do_code.
 
 TWO APPROACHES:
 
-  1. TARGET MODE — precise editing by content anchor (preferred for existing files)
-     Pass the 'target' parameter with the text you want to edit. clwnd finds it
-     by content (not line number), resolves its scope (how much it "owns"), and
-     replaces just that scope with your new content. The content addresses itself.
+  1. TARGET MODE (preferred for existing files)
+     Pass 'target' with the text you want to edit. clwnd finds it by content,
+     resolves its linguistic scope, replaces just that scope.
+       do_noncode(file, target: '## Setup', content: '## Setup\\nNew instructions.\\n')
+       do_noncode(file, target: 'DATABASE_URL', content: 'DATABASE_URL=postgres://new/db\\n')
+       do_noncode(file, target: 'server', content: 'server:\\n  port: 9090\\n')
+       do_noncode(file, target: '[database]', content: '[database]\\nhost = new\\n')
 
-     Examples:
-       do_noncode(file, target: '## Installation', content: '## Installation\\nnpm install clwnd\\n')
-         → finds the Installation heading, replaces it + everything under it until the next heading
-       do_noncode(file, target: 'DATABASE_URL', content: 'DATABASE_URL=postgres://new-host/db\\n')
-         → finds the DATABASE_URL line in an .env, replaces just that line
-       do_noncode(file, target: 'dependencies.lodash', content: '  "lodash": "^5.0.0",\\n')
-         → finds the lodash key in package.json, replaces the key-value pair
-       do_noncode(file, target: 'server', content: 'server:\\n  port: 9090\\n  host: 0.0.0.0\\n')
-         → finds the server key in a YAML file, replaces its entire block
-       do_noncode(file, target: '[database]', content: '[database]\\nhost = newhost\\nport = 5432\\n')
-         → finds the [database] TOML section, replaces through next section
-
-     Scope is inferred from format:
-       Markdown headings  → paragraph (until next same-or-higher heading)
-       Env KEY=value      → phrase (the line)
-       JSON/YAML key      → phrase (key + value, supports dot paths)
-       TOML [section]     → paragraph (until next section)
-       Generic            → phrase (the line) or paragraph (if indented content follows)
+     Scope is inferred: markdown headings → paragraph, env vars → line,
+     JSON/YAML keys → value block, TOML sections → until next section.
 
   2. CLASSIC MODES — whole-file operations
-     mode: 'write'   — create or overwrite entirely (default)
-     mode: 'append'  — add content to the end
-     mode: 'prepend' — add content to the beginning
+     mode: 'write' (default), 'append', 'prepend'
 
-     For existing files, read first (staleness guard). Write mode doesn't
-     require prior context.
-
-WORKFLOW: read the file first to see its content, then use target mode to
-edit a specific part, or use write/append/prepend for whole-file operations.`,
+WORKFLOW: read(file) first → see anchor outline → do_noncode(file, target, content).`,
     inputSchema: {
       type: "object" as const,
       properties: {
