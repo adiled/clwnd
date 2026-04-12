@@ -80,7 +80,12 @@ function mapToolName(name: string): string {
   return TOOL_NAME_MAP[name] ?? name;
 }
 
-const BROKERED_TOOLS = new Set(["webfetch", "websearch", "todowrite"]);
+// Only todowrite is brokered (OC executes it — Claude CLI has no native
+// implementation). WebFetch and WebSearch are NOT brokered — Claude CLI
+// has working native implementations, and brokering them caused OC's
+// prompt loop to re-send the user's message (providerExecuted=false on
+// the tool part → hasToolCalls stayed true → loop never exited).
+const BROKERED_TOOLS = new Set(["todowrite"]);
 
 // Tools handled natively by clwnd — anything NOT in this set from opts.tools
 // is treated as an external MCP tool and forwarded to Claude CLI for dispatch.

@@ -908,6 +908,31 @@ describe("e2e-serve: model switch history (#7)", () => {
   }, TIMEOUT);
 });
 
+describe("e2e-serve: brokered tools", () => {
+  test("webfetch does not duplicate user message", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Ask the agent to fetch a URL — triggers Claude CLI's native WebFetch.
+    // Before the fix (when webfetch was brokered), OC's prompt loop would
+    // re-enter and re-send the user's message because providerExecuted=false
+    // kept hasToolCalls true. Now Claude CLI handles WebFetch natively
+    // (providerExecuted=true) so the loop exits cleanly.
+    const resp = await sendMessage(sid, "Fetch https://example.com and print the page content.");
+    const text = extractResponseText(resp).toLowerCase();
+    expect(text.length).toBeGreaterThan(0);
+    // Should mention something from example.com
+    expect(text).toMatch(/example|domain|illustrative|iana/i);
+
+    // Second turn should work without the previous message being re-sent
+    const resp2 = await sendMessage(sid, "What was the page title?");
+    const text2 = extractResponseText(resp2).toLowerCase();
+    expect(text2.length).toBeGreaterThan(0);
+    // Should recall from context, not re-fetch
+    expect(text2).toMatch(/example|domain/i);
+  }, TIMEOUT);
+});
+
 describe("e2e-serve: token efficiency", () => {
   test("multi-turn conversation does not duplicate context", async () => {
     skipIfDead();
