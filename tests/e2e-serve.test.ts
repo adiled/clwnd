@@ -425,6 +425,23 @@ describe("e2e-serve: session basics", () => {
     expect(text).toContain("4");
   }, TIMEOUT);
 
+  test("agent sees all clwnd MCP tools", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    const resp = await sendMessage(sid, "List all your tools. Just the tool names, one per line.");
+    const text = extractResponseText(resp).toLowerCase();
+
+    // Every clwnd MCP tool must appear in the agent's response.
+    // If any is missing, the OC plugin cache is stale or the daemon's
+    // tools/list is filtering them out — the exact bug that caused the
+    // "no do_code in my toolkit" symptom on osx.
+    const required = ["do_code", "do_noncode", "read", "bash"];
+    for (const tool of required) {
+      expect(text).toContain(tool);
+    }
+  }, TIMEOUT);
+
   test("session continuity across turns", async () => {
     skipIfDead();
     const sid = await createSession();
