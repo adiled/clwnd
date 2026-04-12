@@ -642,6 +642,14 @@ export function clearSessionHashes(sid: string): void {
   lastAllowedTools.delete(sid);
 }
 
+export function clearSessionState(sid: string): void {
+  clearSessionHashes(sid);
+  sessionLastAgent.delete(sid);
+  sessionPetalCounts.delete(sid);
+  sessionJustCompacted.delete(sid);
+  lastReminder.delete(sid);
+}
+
 const AGENT_DENY: Record<string, Set<string>> = {
   plan: new Set(["do_code", "do_noncode"]),
 };

@@ -1345,6 +1345,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         clearExternalTools(sid);
         clearMcpServerConfigs(sid);
         clearVisibleTools(sid);
+        clearReadCache(sid);
         sessions.delete(sid);
         saveSessions(sid);
         trace("hum.session.cleaned", { sid });
@@ -1534,7 +1535,7 @@ Bun.serve({
 
 // ─── MCP HTTP Server (persistent, no cold start) ────────────────────────────
 
-import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms, setAllowedTools as mcpSetAllowed, setPermissionCallback, setMetaCallback, setExternalTools, clearExternalTools, setMcpServerConfigs, clearMcpServerConfigs, setVisibleTools, clearVisibleTools, type ExternalToolDef } from "../mcp/tools.ts";
+import { handleMcpRequest, setCwd as mcpSetCwd, setPermissions as mcpSetPerms, setAllowedTools as mcpSetAllowed, setPermissionCallback, setMetaCallback, setExternalTools, clearExternalTools, setMcpServerConfigs, clearMcpServerConfigs, setVisibleTools, clearVisibleTools, clearReadCache, type ExternalToolDef } from "../mcp/tools.ts";
 
 // Fixed port so the plugin (and anything else local) can reach the MCP
 // HTTP endpoint without discovery. Override with CLWND_MCP_PORT if the

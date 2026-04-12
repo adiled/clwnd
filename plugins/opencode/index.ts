@@ -3,7 +3,7 @@ import { tool } from "@opencode-ai/plugin";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
-import { createClwnd, setSharedClient, setSharedPluginInput, setLogClient, hum, trace, log } from "./provider.ts";
+import { createClwnd, setSharedClient, setSharedPluginInput, setLogClient, hum, trace, log, clearSessionState } from "./provider.ts";
 import { loadConfig, type ClwndConfig } from "../../lib/config.ts";
 import { duskIn } from "../../lib/hum.ts";
 
@@ -93,6 +93,16 @@ export const clwndPlugin: Plugin = async (input) => {
         const completed = props.info.metadata?.time?.completed;
         if (sid && role) {
           hum({ chi: "petal-cell", sid, event: etype, role, model, provider, messageId, parentId, completed });
+        }
+      }
+
+      // Session deleted — clean up plugin + daemon state
+      if (etype === "session.deleted") {
+        const sid = props.sessionID ?? props.id;
+        if (sid) {
+          trace("session.deleted", { sid });
+          clearSessionState(sid);
+          hum({ chi: "cleanup", sid });
         }
       }
 
