@@ -5,7 +5,6 @@ import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { createClwnd, setSharedClient, setSharedPluginInput, setLogClient, hum, trace, log, clearSessionState } from "./provider.ts";
 import { loadConfig, type ClwndConfig } from "../../lib/config.ts";
-import { duskIn } from "../../lib/hum.ts";
 
 // ─── Small Model Discovery ──────────────────────────────────────────────────
 // Provider config lives in opencode.json (managed by install script).
@@ -106,20 +105,6 @@ export const clwndPlugin: Plugin = async (input) => {
         }
       }
 
-      // OC-handled compaction: opt-in via clwnd.json
-      if (loadConfig().ocCompaction && etype === "session.compacted") {
-        const sid = props.sessionID;
-        if (sid) {
-          // Deduplicate — multiple plugin instances receive the same event
-          const key = `compacted:${sid}`;
-          if ((globalThis as any)[key]) return;
-          (globalThis as any)[key] = true;
-          setTimeout(() => delete (globalThis as any)[key], 5000);
-
-          trace("session.compacted", { sid });
-          hum({ chi: "cancel", sid, reason: "compaction", dusk: duskIn(5_000) });
-        }
-      }
     },
     "chat.headers": async (ctx, output) => {
       output.headers["x-clwnd-agent"] = typeof ctx.agent === "string"

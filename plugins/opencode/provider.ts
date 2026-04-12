@@ -816,12 +816,28 @@ export class ClwndModel implements LanguageModelV3 {
       };
     }
 
-    // Compaction is an OC-owned flow — OC has already decided the history
-    // should be replaced with a summary, so we don't need to graft the old
-    // turns into the JSONL. We still forward the request to Claude CLI so
-    // the summary is generated on the user's actual model.
-    const skipGraft = isCompaction;
-    if (skipGraft) trace("graft.skip", { method: "doStream", sid, reason: "compaction" });
+    // Curate: OC wants to compaction-summarize. Instead, we prune the JSONL
+    // (strip thinking, trim old tool_results) and return a minimal response.
+    // No model call, no summary bloat, no compaction contagion.
+    if (isCompaction) {
+      trace("curate.intercepted", { sid });
+      hum({ chi: "curate", sid, dusk: duskIn(10_000) });
+      sessionJustCompacted.set(sid, "curated" as any);
+      const cId = `curate-${Date.now()}`;
+      return {
+        stream: new ReadableStream<LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: "text-start", id: cId });
+            controller.enqueue({ type: "text-end", id: cId });
+            controller.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: zeroUsage() });
+            controller.close();
+          },
+        }),
+      };
+    }
+
+    const skipGraft = sessionJustCompacted.get(sid) === "curated" as any;
+    if (skipGraft) trace("graft.skip", { method: "doStream", sid, reason: "post-curate" });
 
     // Hash-dedup of per-turn hygiene fields. systemPrompt / permissions /
     // allowedTools rarely change during a session — the daemon falls back to
@@ -933,7 +949,13 @@ export class ClwndModel implements LanguageModelV3 {
     // re-serializing the whole history over the hum socket.
     let prevPetalCount = 0;
     let elidePriorPetals = false;
-    if (!skipGraft) {
+    if (skipGraft) {
+      // Post-curate: JSONL was pruned, daemon will respawn. Reset petal
+      // baseline so the next normal turn doesn't see a spurious drop.
+      sessionPetalCounts.set(sid, priorPetals.length);
+      sessionJustCompacted.delete(sid);
+      trace("curate.postTurn", { sid, petals: priorPetals.length });
+    } else {
       prevPetalCount = sessionPetalCounts.get(sid) ?? 0;
       sessionPetalCounts.set(sid, priorPetals.length);
       const dropped = prevPetalCount - priorPetals.length;
@@ -947,11 +969,6 @@ export class ClwndModel implements LanguageModelV3 {
         pendingPenny.priorPetalsElided++;
         trace("priorPetals.elided", { sid, count: priorPetals.length });
       }
-    }
-    if (isCompaction) {
-      // Mark so the NEXT build turn (the post-compaction one) recognizes
-      // the transition and triggers the cancel + truncate flow.
-      sessionJustCompacted.set(sid, true);
     }
 
     // Extract external MCP tools from opts.tools — anything OC has that

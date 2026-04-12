@@ -8,7 +8,7 @@ import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
 import { sigil, rid as makeRid, echo, pulse, isDusk, classifySuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type DroneState, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
 import { droneThink, setDroneWorkspace, releaseDroneSession } from "../lib/drone-llm.ts";
-import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, lastUuid, sanitizeJsonl, type GraftResult } from "../lib/session.ts";
+import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, lastUuid, sanitizeJsonl, pruneJsonl, type GraftResult } from "../lib/session.ts";
 import { penny, pennyAdd, pennyLoad, pennySave, pennyReset, type PennyDelta } from "../lib/penny.ts";
 
 
@@ -1322,6 +1322,35 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           // User interrupt: send control_cancel_request — process stays alive
           nest.interrupt(sid);
         }
+      }
+      break;
+    }
+
+    case "curate": {
+      // Provider intercepted OC compaction — prune the JSONL instead of
+      // letting OC summarize. Kill the process, prune, respawn on next prompt.
+      const sid = msg.sid as string;
+      const session = sessions.get(sid);
+      if (session) {
+        nest.fell(sid, sid);
+        if (session.claudeSessionPath) {
+          try {
+            const result = pruneJsonl(session.claudeSessionPath);
+            trace("curate.pruned", {
+              sid,
+              trimmed: result.trimmed,
+              stripped: result.stripped,
+              before: result.bytes.before,
+              after: result.bytes.after,
+              saved: result.bytes.before - result.bytes.after,
+            });
+          } catch (e) {
+            trace("curate.failed", { sid, err: String(e) });
+          }
+        }
+        session.lastSyncedPetal = null;
+        session.needsRespawn = true;
+        saveSessions(sid);
       }
       break;
     }

@@ -546,6 +546,70 @@ export interface SanitizeResult {
   rules: string[];
 }
 
+// ─── JSONL Curation (replaces OC compaction) ──────────────────────────────
+// Surgically prune the JSONL instead of summarizing. Strips thinking blocks,
+// trims old tool_result payloads to a one-liner, preserves recent turns
+// intact. Deterministic, free, lossless where it matters.
+
+interface PruneResult { trimmed: number; stripped: number; bytes: { before: number; after: number } }
+
+export function pruneJsonl(path: string, opts?: { protectRecent?: number; trimThreshold?: number }): PruneResult {
+  const protectRecent = opts?.protectRecent ?? 4;
+  const trimThreshold = opts?.trimThreshold ?? 300;
+  let entries: ClaudeEntry[];
+  try { entries = readEntries(path); } catch { return { trimmed: 0, stripped: 0, bytes: { before: 0, after: 0 } }; }
+  if (entries.length === 0) return { trimmed: 0, stripped: 0, bytes: { before: 0, after: 0 } };
+
+  const beforeBytes = entries.reduce((s, e) => s + JSON.stringify(e).length, 0);
+
+  // Find protection boundary — last N user turns (and everything after them)
+  let protectedIdx = entries.length;
+  let userCount = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].type === "user") userCount++;
+    if (userCount >= protectRecent) { protectedIdx = i; break; }
+  }
+
+  let trimmed = 0;
+  let stripped = 0;
+
+  for (let i = 0; i < entries.length; i++) {
+    if (i >= protectedIdx) continue;
+    const e = entries[i];
+
+    // Strip thinking blocks from old assistant turns
+    if (e.type === "assistant" && "message" in e) {
+      const asst = e as ClaudeAssistantEntry;
+      const before = asst.message.content.length;
+      asst.message.content = asst.message.content.filter(c => c.type !== "thinking");
+      stripped += before - asst.message.content.length;
+    }
+
+    // Trim old tool_result content to first line
+    if (e.type === "user" && "message" in e) {
+      const user = e as ClaudeUserEntry;
+      for (const c of user.message.content) {
+        if (c.type === "tool_result") {
+          const tr = c as ClaudeContentToolResult;
+          if (typeof tr.content === "string" && tr.content.length > trimThreshold) {
+            const firstLine = tr.content.split("\n")[0] ?? "";
+            tr.content = `${firstLine}\n(curated: ${tr.content.length} chars trimmed)`;
+            trimmed++;
+          }
+        }
+      }
+    }
+  }
+
+  if (trimmed === 0 && stripped === 0) {
+    return { trimmed: 0, stripped: 0, bytes: { before: beforeBytes, after: beforeBytes } };
+  }
+
+  writeFileSync(path, entries.map(e => JSON.stringify(e)).join("\n") + "\n");
+  const afterBytes = entries.reduce((s, e) => s + JSON.stringify(e).length, 0);
+  return { trimmed, stripped, bytes: { before: beforeBytes, after: afterBytes } };
+}
+
 export function sanitizeJsonl(path: string): SanitizeResult {
   let entries: ClaudeEntry[];
   try { entries = readEntries(path); } catch { return { removed: 0, fixed: 0, rules: [] }; }
