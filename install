@@ -143,22 +143,46 @@ do_build() {
   echo "[build] compiling..."
   bun run build
 
-  # Dev mode: copy plugin to .opencode/plugins/ so OC auto-loads it
-  if [ -n "$CLWND_DEV" ]; then
-    local PLUGINS_DIR="$HOME/.opencode/plugins"
-    mkdir -p "$PLUGINS_DIR"
-    cp "$CLWND_SRC/plugins/opencode/dist/index.js" "$PLUGINS_DIR/clwnd.js"
-    echo "[build] copied plugin to $PLUGINS_DIR/clwnd.js"
-  fi
+  # Dev mode no longer copies a single .js file — the plugin ref in
+  # opencode.json + tui.json now points at the package directory so OC
+  # can resolve both server and TUI entries from exports.
 }
 
 plugin_ref() {
-  # Use npm package by default; file:// only if CLWND_DEV is set
+  # npm package by default; file:// package directory in dev mode.
+  # Must be the DIRECTORY (not a single .js file) so OC can resolve
+  # both exports["."] (server) and exports["./tui"] (TUI).
   if [ -n "$CLWND_DEV" ]; then
-    echo "file://$CLWND_SRC/plugins/opencode/dist/index.js"
+    echo "file://$CLWND_SRC/plugins/opencode"
   else
     echo "@clwnd/opencode"
   fi
+}
+
+configure_tui() {
+  echo "[config] tui.json..."
+  local PLUGIN_REF
+  PLUGIN_REF=$(plugin_ref)
+  local TUI_CONFIG_DIR
+  TUI_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+  local TUI_CONFIG="$TUI_CONFIG_DIR/tui.json"
+  mkdir -p "$TUI_CONFIG_DIR"
+
+  bun -e "
+const fs = require('fs');
+const configPath = '${TUI_CONFIG}';
+const pluginRef = '${PLUGIN_REF}';
+
+let config = {};
+try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
+
+if (!config.plugin) config.plugin = [];
+config.plugin = config.plugin.filter(p => typeof p !== 'string' || (!p.includes('clwnd') && !p.includes('@clwnd')));
+config.plugin.push(pluginRef);
+console.log('  set tui plugin: ' + pluginRef);
+
+fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+"
 }
 
 configure_opencode() {
@@ -410,6 +434,7 @@ cmd_install() {
   register_service
 
   configure_opencode
+  configure_tui
 
   echo "[cli] installing clwnd command..."
   install_cli
