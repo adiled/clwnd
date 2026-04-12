@@ -1408,6 +1408,66 @@ function checkBashBan(command: string): ToolResult | null {
   return null;
 }
 
+// File-write commands banned from bash. The agent writes files through
+// do_code (code) and do_noncode (non-code), not through bash. This
+// catches shell redirects, tee, cp-to-create, and scripting-language
+// one-liners that write files. Legitimate write operations (git, npm,
+// builds) don't match these patterns — they write to .git/, node_modules/,
+// dist/ as side effects of their primary operation, not via explicit
+// file-creation syntax.
+const BASH_WRITE_PATTERNS = [
+  /[^|&;]\s*>\s*[^&|]/, // shell redirect: > file (but not >&2, ||, &&)
+  /[^|&;]\s*>>\s*/,     // append redirect: >> file
+  /\btee\s/,            // tee command
+  /\bdd\s/,             // dd command
+  /\binstall\s+-/,      // install -m (GNU coreutils install)
+  /\bmkdir\s/,          // mkdir (creating directories — use do_noncode)
+  /\btouch\s/,          // touch (creating empty files)
+  /\bcp\s/,             // cp (copying files)
+  /\bmv\s/,             // mv (moving/renaming files)
+  /\bchmod\s/,          // chmod
+  /\bchown\s/,          // chown
+  /\bln\s/,             // ln (symlinks)
+  /\brm\s/,             // rm (deleting files)
+  /\brmdir\s/,          // rmdir
+  /\bpython[23]?\s+-c\b.*(?:open|write|Path)/i,   // python -c with file write
+  /\bnode\s+-e\b.*(?:writeFile|fs\.)/i,            // node -e with fs write
+  /\bruby\s+-e\b.*(?:File\.|IO\.)/i,              // ruby -e with file write
+  /\bperl\s+-[ep]\b.*(?:open|print)/i,            // perl one-liner with write
+];
+
+// Commands that ARE allowed to write (they modify the project as a side
+// effect of their primary operation — builds, version control, packages).
+const BASH_WRITE_ALLOWED = [
+  /^\s*git\s/,
+  /^\s*npm\s/, /^\s*yarn\s/, /^\s*pnpm\s/, /^\s*bun\s/,
+  /^\s*pip\s/, /^\s*uv\s/, /^\s*cargo\s/, /^\s*go\s/,
+  /^\s*make\s/, /^\s*cmake\s/,
+  /^\s*docker\s/, /^\s*docker-compose\s/,
+  /^\s*tsc\b/, /^\s*tsup\b/, /^\s*esbuild\b/, /^\s*vite\b/, /^\s*webpack\b/,
+  /^\s*pytest\b/, /^\s*jest\b/, /^\s*vitest\b/,
+  /^\s*rustc\b/, /^\s*gcc\b/, /^\s*g\+\+\b/, /^\s*clang\b/,
+];
+
+function checkBashWrite(command: string): ToolResult | null {
+  // Allow-listed commands can write (builds, git, packages)
+  if (BASH_WRITE_ALLOWED.some(p => p.test(command))) return null;
+
+  for (const pattern of BASH_WRITE_PATTERNS) {
+    if (pattern.test(command)) {
+      return {
+        output:
+          `[clwnd: file writes go through do_code (code files) or do_noncode (non-code files), not bash.\n` +
+          `Bash is for: git, builds (npm/make/tsc), tests (pytest/jest), package managers, and runtime commands.\n` +
+          `Rewrite using do_code or do_noncode.]`,
+        title: "bash write blocked",
+        metadata: { command: command.slice(0, 100) },
+      };
+    }
+  }
+  return null;
+}
+
 async function execBash(args: { command: string; description?: string; timeout?: number }): Promise<ToolResult> {
   // Banned-command check runs BEFORE permission so the agent learns the
   // redirect even in environments where bash permission would have been
@@ -1416,6 +1476,11 @@ async function execBash(args: { command: string; description?: string; timeout?:
   if (banned) {
     trace("bash.banned", { cmd: (banned.metadata as any)?.banned });
     return banned;
+  }
+  const writeBlock = checkBashWrite(args.command);
+  if (writeBlock) {
+    trace("bash.write.blocked", { cmd: args.command.slice(0, 100) });
+    return writeBlock;
   }
   checkPermission("bash", args.command);
   const timeout = args.timeout ?? 120_000;

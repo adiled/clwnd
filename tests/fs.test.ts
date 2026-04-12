@@ -488,4 +488,25 @@ describe("bash", () => {
     const out = await post("bash", { command: "exit 42" });
     expect(out).toContain("42");
   });
+
+  test("blocks file write commands", async () => {
+    for (const cmd of [
+      'echo "test" > /tmp/x.txt',
+      "tee /tmp/x.txt",
+      "cp a.txt b.txt",
+      "mv a.txt b.txt",
+      "rm a.txt",
+      "touch newfile.txt",
+      "mkdir newdir",
+      'python3 -c "open(\'x\',\'w\').write(\'y\')"',
+    ]) {
+      const out = await post("bash", { command: cmd });
+      expect(out).toMatch(/do_code|do_noncode/i);
+    }
+  });
+
+  test("allows legitimate write operations", async () => {
+    const out = await post("bash", { command: "git status" });
+    expect(out).not.toMatch(/do_code|do_noncode/i);
+  });
 });
