@@ -476,14 +476,39 @@ export function symbolByteRange(filePath: string, symbolPath: string): { startIn
   return { startIndex: found.startIndex, endIndex: found.endIndex, startLine: found.startLine, endLine: found.endLine };
 }
 
+/**
+ * Parse a symbol path segment like "foo" or "foo#2" into a name and a
+ * 1-based occurrence index. Bare "foo" defaults to occurrence 1.
+ *
+ * The #N disambiguation syntax lets agents address the Nth same-named
+ * symbol at a given scope level — C++ overloads, Python re-definitions,
+ * Ruby reopened classes, etc. formatSymbols annotates the outline with
+ * the suffix when duplicates exist, so the agent sees exactly what to
+ * pass to do_code.
+ */
+function parseSegment(seg: string): { name: string; occurrence: number } {
+  const m = seg.match(/^(.+)#(\d+)$/);
+  if (m) return { name: m[1], occurrence: parseInt(m[2], 10) };
+  return { name: seg, occurrence: 1 };
+}
+
 function findSymbol(filePath: string, symbolPath: string): Symbol | null {
   const entry = cachedParse(filePath);
   if (!entry) return null;
   const parts = symbolPath.split(".");
   let current: Symbol[] = entry.symbols;
   let found: Symbol | null = null;
-  for (const part of parts) {
-    found = current.find(s => s.name === part) ?? null;
+  for (const rawPart of parts) {
+    const { name, occurrence } = parseSegment(rawPart);
+    // Find the Nth symbol with this name at the current scope level.
+    let count = 0;
+    found = null;
+    for (const s of current) {
+      if (s.name === name) {
+        count++;
+        if (count === occurrence) { found = s; break; }
+      }
+    }
     if (!found) return null;
     current = found.children ?? [];
   }
@@ -505,13 +530,30 @@ export function readSymbol(filePath: string, symbolPath: string): { source: stri
   return { source, startLine: found.startLine, endLine: found.endLine };
 }
 
-/** Format symbols as a compact outline string. */
+/**
+ * Format symbols as a compact outline string. When the same name appears
+ * more than once at the same scope level (C++ overloads, Python re-defs,
+ * etc.), the second and subsequent occurrences get a `#N` suffix so the
+ * agent knows to pass e.g. `do_code(symbol: "foo#2")` to address them.
+ */
 export function formatSymbols(symbols: Symbol[], indent = 0): string {
+  // Count occurrences per name at this level to decide whether to annotate.
+  const nameCount = new Map<string, number>();
+  for (const s of symbols) nameCount.set(s.name, (nameCount.get(s.name) ?? 0) + 1);
+
   const lines: string[] = [];
+  const nameOccurrence = new Map<string, number>();
   for (const s of symbols) {
+    const occ = (nameOccurrence.get(s.name) ?? 0) + 1;
+    nameOccurrence.set(s.name, occ);
     const pad = "  ".repeat(indent);
     const range = s.startLine === s.endLine ? `L${s.startLine}` : `L${s.startLine}-${s.endLine}`;
-    lines.push(`${pad}${s.kind} ${s.name} ${range}`);
+    // Only add #N suffix when there are duplicates at this scope level.
+    // First occurrence gets #1 only if there IS a second, to avoid noise
+    // on the normal case.
+    const hasDupes = (nameCount.get(s.name) ?? 0) > 1;
+    const suffix = hasDupes ? `#${occ}` : "";
+    lines.push(`${pad}${s.kind} ${s.name}${suffix} ${range}`);
     if (s.children && s.children.length > 0) {
       lines.push(formatSymbols(s.children, indent + 1));
     }

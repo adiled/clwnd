@@ -296,20 +296,48 @@ const readCache = new Map<string, Map<string, number>>();
 const readCachePathIndex = new Map<string, Map<string, Set<string>>>(); // sid → path → Set<cacheKey>
 
 // Separate "Claude has touched this file in this session" ground-truth map.
-// Used ONLY by the Edit staleness guard. Unlike readCache (which drops
-// entries on Edit so the next Read sees fresh content), sessionTouched keeps
-// tracking across edits — an edit _establishes_ a known mtime, and the next
-// edit should see that mtime as the baseline. Without this separation, back-
-// to-back edits after an external mutation would go unnoticed.
-const sessionTouched = new Map<string, Map<string, number>>();
+// Used ONLY by the staleness guard. Unlike readCache (which drops entries
+// on Edit so the next Read sees fresh content), sessionTouched keeps
+// tracking across edits — an edit _establishes_ a known baseline, and the
+// next edit should see that baseline as current. Without this separation,
+// back-to-back edits after an external mutation would go unnoticed.
+//
+// v0.17 switched from mtime-only to content hash. mtime has 1-second
+// resolution on most filesystems — a read + write + read + write within
+// one second would show the same mtime and the guard would miss the change.
+// Content hash catches that because the bytes actually differ. The hash is
+// cheap (djb2 over the first 64KB) and only computed on read/write, not
+// on every access — it's a snapshot-at-touch, not a live check.
+interface TouchBaseline {
+  hash: string;
+  mtime: number;
+  size: number;
+}
 
-function touchSession(sessionId: string | undefined, absPath: string, mtime: number): void {
+const sessionTouched = new Map<string, Map<string, TouchBaseline>>();
+
+function contentHash(content: string): string {
+  // djb2 over the first 64KB — fast, sufficient for same-content detection.
+  // Not cryptographic, not meant to be. A full-file hash on a 5MB file
+  // would add 2-3ms per touch; 64KB prefix hash adds <0.1ms.
+  const end = Math.min(content.length, 65536);
+  let h = 5381;
+  for (let i = 0; i < end; i++) h = ((h << 5) + h + content.charCodeAt(i)) | 0;
+  return h.toString(36) + ":" + content.length;
+}
+
+function touchSession(sessionId: string | undefined, absPath: string, content?: string): void {
   if (!sessionId) return;
   let m = sessionTouched.get(sessionId);
   if (!m) { m = new Map(); sessionTouched.set(sessionId, m); }
-  m.set(absPath, mtime);
+  try {
+    const stat = statSync(absPath);
+    const src = content ?? readFileSync(absPath, "utf-8");
+    m.set(absPath, { hash: contentHash(src), mtime: stat.mtimeMs, size: stat.size });
+  } catch {}
 }
-function touchedMtime(sessionId: string | undefined, absPath: string): number | undefined {
+
+function touchedBaseline(sessionId: string | undefined, absPath: string): TouchBaseline | undefined {
   if (!sessionId) return undefined;
   return sessionTouched.get(sessionId)?.get(absPath);
 }
@@ -517,7 +545,7 @@ function studyCodeFile(p: string, stat: Stats, sessionId?: string): ToolResult {
   if (sessionId) {
     try {
       readCacheMark(sessionId, p, readCacheKey(p, {}), stat.mtimeMs);
-      touchSession(sessionId, p, stat.mtimeMs);
+      touchSession(sessionId, p);
     } catch {}
   }
   return {
@@ -540,7 +568,7 @@ function studyTextFile(p: string, stat: Stats, sessionId?: string): ToolResult {
     if (sessionId) {
       try {
         readCacheMark(sessionId, p, readCacheKey(p, {}), stat.mtimeMs);
-        touchSession(sessionId, p, stat.mtimeMs);
+        touchSession(sessionId, p);
       } catch {}
     }
     return { output: content, title: relPath, metadata: { loaded: [p] } };
@@ -736,7 +764,7 @@ function readBySymbol(targets: string[], symbol: string, sessionId?: string): To
       try {
         const stat = statSync(p);
         readCacheMark(sessionId, p, readCacheKey(p, { symbol }), stat.mtimeMs);
-        touchSession(sessionId, p, stat.mtimeMs);
+        touchSession(sessionId, p);
       } catch {}
     }
   }
@@ -1000,29 +1028,34 @@ function isCodeFile(filePath: string): boolean {
 }
 
 // Session touch helper — invalidates the read cache for the path and
-// refreshes the session-touched mtime so subsequent edits see the new
-// baseline. Used by every successful code/non-code write.
-function recordWrite(p: string, sessionId?: string): void {
+// refreshes the session-touched baseline so subsequent edits see the
+// new content as their basis. Used by every successful code/non-code write.
+function recordWrite(p: string, sessionId?: string, writtenContent?: string): void {
   readCacheInvalidate(sessionId, p);
-  try { touchSession(sessionId, p, statSync(p).mtimeMs); } catch {}
+  touchSession(sessionId, p, writtenContent);
 }
 
-// Standard staleness guard: if this session has previously touched the
-// file, reject any edit whose basis is older than the current mtime.
-// Matches the guard that used to live in execEdit. Returns an error
-// ToolResult if stale, or null if fresh.
+// Staleness guard: if this session has previously touched the file,
+// reject any edit whose content hash differs from the baseline. The hash
+// catches sub-second rewrites that mtime (1s resolution) would miss. The
+// mtime + size check is a fast pre-filter so we avoid re-reading the file
+// when stat alone proves nothing changed (the common case).
 function checkStaleness(p: string, sessionId?: string): ToolResult | null {
   if (!sessionId) return null;
-  const known = touchedMtime(sessionId, p);
-  if (known === undefined) return null;
+  const baseline = touchedBaseline(sessionId, p);
+  if (!baseline) return null;
   try {
-    const current = statSync(p).mtimeMs;
-    if (current !== known) {
-      return {
-        output: `Error: ${p} has been modified since your last read in this session. Re-read the file before editing — its current state is not what your inputs assume.`,
-        title: relative(CWD, p) || p,
-      };
-    }
+    const stat = statSync(p);
+    // Fast path: stat didn't change → file is definitely the same.
+    if (stat.mtimeMs === baseline.mtime && stat.size === baseline.size) return null;
+    // Stat changed — could be a formatter re-saving with same content, or
+    // a real external mutation. Read + hash to tell them apart.
+    const current = readFileSync(p, "utf-8");
+    if (contentHash(current) === baseline.hash) return null;
+    return {
+      output: `Error: ${p} has been modified since your last read in this session (content hash mismatch). Re-read the file before editing — its current state is not what your inputs assume.`,
+      title: relative(CWD, p) || p,
+    };
   } catch {}
   return null;
 }
@@ -1070,7 +1103,7 @@ function execDoCode(
     const dir = dirname(p);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     writeFileSync(p, args.new_source);
-    recordWrite(p, sessionId);
+    recordWrite(p, sessionId, args.new_source);
     return {
       output: `Created ${p} (${args.new_source.split("\n").length} lines).`,
       title: relPath,
@@ -1100,7 +1133,7 @@ function execDoCode(
       return { output: `Error: ${validation.error}. File NOT written.`, title: relPath };
     }
     writeFileSync(p, args.new_source);
-    recordWrite(p, sessionId);
+    recordWrite(p, sessionId, args.new_source);
     return {
       output: `Rewrote ${p} (${args.new_source.split("\n").length} lines).`,
       title: relPath,
@@ -1166,7 +1199,7 @@ function execDoCode(
     };
   }
   writeFileSync(p, newContent);
-  recordWrite(p, sessionId);
+  recordWrite(p, sessionId, newContent);
 
   return {
     output: `${op === "delete" ? "Deleted" : op === "replace" ? "Replaced" : "Inserted"} symbol '${args.symbol}' in ${p} (was lines ${range.startLine}-${range.endLine}).`,
@@ -1218,7 +1251,7 @@ function execDoNoncode(
   }
 
   writeFileSync(p, next);
-  recordWrite(p, sessionId);
+  recordWrite(p, sessionId, next);
   return {
     output: `${mode === "write" ? (existed ? "Overwrote" : "Created") : mode === "append" ? "Appended to" : "Prepended to"} ${p} (${next.length} bytes).`,
     title: relPath,
