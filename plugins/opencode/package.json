@@ -7,6 +7,9 @@
   "exports": {
     ".": {
       "import": "./dist/index.js"
+    },
+    "./tui": {
+      "import": "./dist/tui.js"
     }
   },
   "files": [
