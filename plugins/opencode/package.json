@@ -41,10 +41,12 @@
     "@ai-sdk/provider-utils": "^4.0.21"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.3.5",
-    "@opentui/core": "^0.1.97",
-    "@opentui/solid": "^0.1.97",
-    "solid-js": "^1.9.12"
+    "@opencode-ai/plugin": ">=1.3.5"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": { "optional": true },
+    "@opentui/solid": { "optional": true },
+    "solid-js": { "optional": true }
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.3.5",
