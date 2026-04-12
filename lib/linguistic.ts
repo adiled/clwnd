@@ -39,90 +39,135 @@ export interface ScopeMatch {
   scope: "word" | "phrase" | "sentence" | "paragraph";
 }
 
+export interface ScopeResult {
+  match: ScopeMatch | null;
+  /** Total number of matches found for this anchor (before disambiguation). */
+  totalMatches: number;
+  /** Error message when ambiguous or not found. */
+  error?: string;
+}
+
 /**
- * Find an anchor in text and resolve its scope. Returns null if the
- * anchor doesn't match anything in the source.
+ * Parse a target string like "## Setup" or "## Setup#2" into the anchor
+ * text and a 1-based occurrence index. Same #N convention as do_code's
+ * symbol disambiguation.
  */
-export function resolveScope(source: string, anchor: string, filePath: string): ScopeMatch | null {
+function parseTarget(target: string): { anchor: string; occurrence: number } {
+  const m = target.match(/^(.+)#(\d+)$/);
+  if (m) return { anchor: m[1], occurrence: parseInt(m[2], 10) };
+  return { anchor: target, occurrence: 1 };
+}
+
+/**
+ * Pick the Nth match from an array. Returns a ScopeResult with either
+ * the match or a clear error explaining ambiguity.
+ */
+function pickOccurrence(matches: ScopeMatch[], anchor: string, occurrence: number): ScopeResult {
+  if (matches.length === 0) return { match: null, totalMatches: 0 };
+  if (occurrence > matches.length) {
+    return {
+      match: null,
+      totalMatches: matches.length,
+      error: `'${anchor}' has ${matches.length} match(es) but you asked for #${occurrence}. Use #1 through #${matches.length}.`,
+    };
+  }
+  if (matches.length > 1 && occurrence === 1) {
+    // First match, but there are ambiguous duplicates. Still return it
+    // (backward compat) but surface a warning in the anchor field so
+    // the agent knows disambiguation is available.
+    const m = { ...matches[0], anchor: `${anchor} (1 of ${matches.length} — use ${anchor}#N to disambiguate)` };
+    return { match: m, totalMatches: matches.length };
+  }
+  return { match: matches[occurrence - 1], totalMatches: matches.length };
+}
+
+/**
+ * Find an anchor in text and resolve its scope. Returns a ScopeResult
+ * with the match, total match count, and an error if ambiguous.
+ *
+ * Supports #N disambiguation: "## Setup#2" targets the second ## Setup
+ * heading. Bare "## Setup" targets the first (with a warning if there
+ * are duplicates).
+ */
+export function resolveScope(source: string, target: string, filePath: string): ScopeResult {
+  const { anchor, occurrence } = parseTarget(target);
   const ext = extname(filePath).toLowerCase();
 
-  // Format-aware resolution first — these know their own structure.
+  let finder: (s: string, a: string) => ScopeMatch[];
+
   switch (ext) {
     case ".md": case ".mdx": case ".markdown":
-      return resolveMarkdown(source, anchor);
+      finder = findAllMarkdown; break;
     case ".env": case ".env.local": case ".env.development": case ".env.production":
-      return resolveEnvLine(source, anchor);
+      finder = findAllEnv; break;
     case ".json": case ".jsonc":
-      return resolveJsonKey(source, anchor);
+      finder = findAllJson; break;
     case ".yaml": case ".yml":
-      return resolveYamlKey(source, anchor);
+      finder = findAllYaml; break;
     case ".toml":
-      return resolveTomlSection(source, anchor);
+      finder = findAllToml; break;
     case ".ini": case ".cfg": case ".conf":
-      return resolveIniSection(source, anchor);
+      finder = findAllToml; break;
+    default: {
+      const basename = filePath.split("/").pop() ?? "";
+      if (basename.startsWith(".env")) {
+        finder = findAllEnv;
+      } else {
+        finder = findAllGeneric;
+      }
+    }
   }
 
-  // Also catch .env files that don't have a standard extension but the
-  // filename starts with .env (e.g., .env.staging)
-  const basename = filePath.split("/").pop() ?? "";
-  if (basename.startsWith(".env")) {
-    return resolveEnvLine(source, anchor);
-  }
-
-  // Generic fallback: find the anchor as a literal string and scope it
-  // as a phrase (the line it appears on) or paragraph (if it looks like
-  // a section header).
-  return resolveGeneric(source, anchor);
+  const matches = finder(source, anchor);
+  return pickOccurrence(matches, anchor, occurrence);
 }
 
 // ─── Markdown ──────────────────────────────────────────────────────────────
-// A heading is a paragraph anchor. Its scope runs from the heading line
-// to just before the next heading of the same or higher level (or EOF).
 
-function resolveMarkdown(source: string, anchor: string): ScopeMatch | null {
-  // Is the anchor a heading pattern?
+function findAllMarkdown(source: string, anchor: string): ScopeMatch[] {
   const headingMatch = anchor.match(/^(#{1,6})\s+/);
-  if (headingMatch) {
-    const level = headingMatch[1].length;
-    const idx = source.indexOf(anchor);
-    if (idx === -1) return null;
+  if (!headingMatch) return findAllGeneric(source, anchor);
+  const level = headingMatch[1].length;
+  const matches: ScopeMatch[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const idx = source.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
     // Scope: from this heading to the next heading of same-or-higher level, or EOF
     const after = source.slice(idx + anchor.length);
     const peerPattern = new RegExp(`^#{1,${level}}\\s`, "m");
     const peerMatch = peerPattern.exec(after);
-    const endIndex = peerMatch
-      ? idx + anchor.length + peerMatch.index
-      : source.length;
-    // Trim trailing whitespace from the scope
-    let end = endIndex;
-    while (end > idx && (source[end - 1] === "\n" || source[end - 1] === "\r")) end--;
-    // But keep one trailing newline for clean splicing
-    if (end < source.length && source[end] === "\n") end++;
-    return { startIndex: idx, endIndex: end, anchor, scope: "paragraph" };
+    let endIndex = peerMatch ? idx + anchor.length + peerMatch.index : source.length;
+    while (endIndex > idx && (source[endIndex - 1] === "\n" || source[endIndex - 1] === "\r")) endIndex--;
+    if (endIndex < source.length && source[endIndex] === "\n") endIndex++;
+    matches.push({ startIndex: idx, endIndex, anchor, scope: "paragraph" });
+    searchFrom = idx + anchor.length;
   }
-
-  // Not a heading — fall through to generic
-  return resolveGeneric(source, anchor);
+  return matches;
 }
 
 // ─── Env files ─────────────────────────────────────────────────────────────
-// Each line is a phrase: KEY=value. The anchor is the key name.
 
-function resolveEnvLine(source: string, anchor: string): ScopeMatch | null {
-  // Match KEY= at start of line (possibly with export prefix)
-  const pattern = new RegExp(`^(export\\s+)?${escapeRegex(anchor)}\\s*=`, "m");
-  const match = pattern.exec(source);
-  if (!match) return null;
-  const startIndex = match.index;
-  // Scope: the entire line (including the newline)
-  const lineEnd = source.indexOf("\n", startIndex);
-  const endIndex = lineEnd === -1 ? source.length : lineEnd + 1;
-  return { startIndex, endIndex, anchor, scope: "phrase" };
+function findAllEnv(source: string, anchor: string): ScopeMatch[] {
+  // Match KEY= at start of line — exact key match (word boundary after key name)
+  const pattern = new RegExp(`^(export\\s+)?${escapeRegex(anchor)}\\s*=`, "gm");
+  const matches: ScopeMatch[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(source)) !== null) {
+    const startIndex = m.index;
+    const lineEnd = source.indexOf("\n", startIndex);
+    const endIndex = lineEnd === -1 ? source.length : lineEnd + 1;
+    matches.push({ startIndex, endIndex, anchor, scope: "phrase" });
+  }
+  return matches;
 }
 
 // ─── JSON ──────────────────────────────────────────────────────────────────
-// Target a key by its path (e.g., "dependencies.lodash" or "name").
-// Scope: the key-value pair including trailing comma if present.
+
+function findAllJson(source: string, anchor: string): ScopeMatch[] {
+  const result = resolveJsonKey(source, anchor);
+  return result ? [result] : [];
+}
 
 function resolveJsonKey(source: string, anchor: string): ScopeMatch | null {
   const parts = anchor.split(".");
@@ -201,8 +246,11 @@ function findJsonValueEnd(source: string, start: number): number {
 }
 
 // ─── YAML ──────────────────────────────────────────────────────────────────
-// Target a key at the top level (e.g., "server" or "server.port").
-// Scope: the key + its value block (everything indented under it).
+
+function findAllYaml(source: string, anchor: string): ScopeMatch[] {
+  const result = resolveYamlKey(source, anchor);
+  return result ? [result] : [];
+}
 
 function resolveYamlKey(source: string, anchor: string): ScopeMatch | null {
   const parts = anchor.split(".");
@@ -243,7 +291,11 @@ function resolveYamlKey(source: string, anchor: string): ScopeMatch | null {
 }
 
 // ─── TOML ──────────────────────────────────────────────────────────────────
-// Sections are [name] headers. Keys are name = value lines.
+
+function findAllToml(source: string, anchor: string): ScopeMatch[] {
+  const result = resolveTomlSection(source, anchor);
+  return result ? [result] : [];
+}
 
 function resolveTomlSection(source: string, anchor: string): ScopeMatch | null {
   // Try as a section header first: [anchor] or [[anchor]]
@@ -270,68 +322,64 @@ function resolveTomlSection(source: string, anchor: string): ScopeMatch | null {
 }
 
 // ─── INI / conf ────────────────────────────────────────────────────────────
-
-function resolveIniSection(source: string, anchor: string): ScopeMatch | null {
-  // Same shape as TOML sections
-  return resolveTomlSection(source, anchor);
-}
+// (uses findAllToml — same shape)
 
 // ─── Generic fallback ──────────────────────────────────────────────────────
-// For unknown formats: find the anchor as a literal string. If it looks
-// like a section header (starts a line, followed by content underneath
-// at greater indentation or until a blank-line boundary), scope it as a
-// paragraph. Otherwise scope it as the line it appears on (phrase).
 
-function resolveGeneric(source: string, anchor: string): ScopeMatch | null {
-  const idx = source.indexOf(anchor);
-  if (idx === -1) return null;
+function findAllGeneric(source: string, anchor: string): ScopeMatch[] {
+  const matches: ScopeMatch[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const idx = source.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
 
-  // Find the line this anchor is on
-  let lineStart = idx;
-  while (lineStart > 0 && source[lineStart - 1] !== "\n") lineStart--;
-  let lineEnd = source.indexOf("\n", idx);
-  if (lineEnd === -1) lineEnd = source.length;
-  else lineEnd++; // include the newline
+    let lineStart = idx;
+    while (lineStart > 0 && source[lineStart - 1] !== "\n") lineStart--;
+    let lineEnd = source.indexOf("\n", idx);
+    if (lineEnd === -1) lineEnd = source.length;
+    else lineEnd++;
 
-  // Is this anchor at the start of its line (a "header")?
-  const isLineStart = idx === lineStart || source.slice(lineStart, idx).trim() === "";
-  if (!isLineStart) {
-    // Mid-line anchor: scope is just the line (phrase)
-    return { startIndex: lineStart, endIndex: lineEnd, anchor, scope: "phrase" };
-  }
-
-  // Line-start anchor: check if subsequent lines are "owned" by it
-  // (indented deeper, or non-blank before a blank-line boundary)
-  let pos = lineEnd;
-  const anchorIndent = idx - lineStart;
-  while (pos < source.length) {
-    const nextNl = source.indexOf("\n", pos);
-    const line = nextNl === -1 ? source.slice(pos) : source.slice(pos, nextNl);
-    if (line.trim() === "") {
-      // Blank line: check if content continues after
-      pos = nextNl === -1 ? source.length : nextNl + 1;
-      // Peek at next non-blank line
-      let peek = pos;
-      while (peek < source.length && source.slice(peek, source.indexOf("\n", peek) === -1 ? source.length : source.indexOf("\n", peek)).trim() === "") {
-        const nl = source.indexOf("\n", peek);
-        peek = nl === -1 ? source.length : nl + 1;
-      }
-      if (peek >= source.length) break;
-      const peekLine = source.slice(peek, source.indexOf("\n", peek) === -1 ? source.length : source.indexOf("\n", peek));
-      const peekIndent = peekLine.length - peekLine.trimStart().length;
-      if (peekIndent <= anchorIndent) break; // peer or parent
-      pos = nextNl === -1 ? source.length : nextNl + 1;
+    const isLineStart = idx === lineStart || source.slice(lineStart, idx).trim() === "";
+    if (!isLineStart) {
+      matches.push({ startIndex: lineStart, endIndex: lineEnd, anchor, scope: "phrase" });
+      searchFrom = lineEnd;
       continue;
     }
-    const lineIndent = line.length - line.trimStart().length;
-    if (lineIndent <= anchorIndent) break;
-    pos = nextNl === -1 ? source.length : nextNl + 1;
-  }
 
-  if (pos > lineEnd) {
-    return { startIndex: lineStart, endIndex: pos, anchor, scope: "paragraph" };
+    // Line-start anchor: check for paragraph scope
+    let pos = lineEnd;
+    const anchorIndent = idx - lineStart;
+    while (pos < source.length) {
+      const nextNl = source.indexOf("\n", pos);
+      const line = nextNl === -1 ? source.slice(pos) : source.slice(pos, nextNl);
+      if (line.trim() === "") {
+        pos = nextNl === -1 ? source.length : nextNl + 1;
+        let peek = pos;
+        while (peek < source.length) {
+          const pnl = source.indexOf("\n", peek);
+          const pl = pnl === -1 ? source.slice(peek) : source.slice(peek, pnl);
+          if (pl.trim() !== "") break;
+          peek = pnl === -1 ? source.length : pnl + 1;
+        }
+        if (peek >= source.length) break;
+        const peekLine = source.slice(peek, source.indexOf("\n", peek) === -1 ? source.length : source.indexOf("\n", peek));
+        if ((peekLine.length - peekLine.trimStart().length) <= anchorIndent) break;
+        pos = nextNl === -1 ? source.length : nextNl + 1;
+        continue;
+      }
+      if ((line.length - line.trimStart().length) <= anchorIndent) break;
+      pos = nextNl === -1 ? source.length : nextNl + 1;
+    }
+
+    matches.push({
+      startIndex: lineStart,
+      endIndex: pos > lineEnd ? pos : lineEnd,
+      anchor,
+      scope: pos > lineEnd ? "paragraph" : "phrase",
+    });
+    searchFrom = matches[matches.length - 1].endIndex;
   }
-  return { startIndex: lineStart, endIndex: lineEnd, anchor, scope: "phrase" };
+  return matches;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

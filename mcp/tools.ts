@@ -1271,20 +1271,24 @@ function execDoNoncode(
     const stale = checkStaleness(p, sessionId);
     if (stale) return stale;
     const original = readFileSync(p, "utf-8");
-    const match = resolveScope(original, args.target, p);
-    if (!match) {
-      return {
-        output: `Error: target '${args.target}' not found in ${p}. Read the file first to see its content, then pass the exact anchor text you want to target.`,
-        title: relPath,
-      };
+    const result = resolveScope(original, args.target, p);
+    if (!result.match) {
+      const hint = result.error
+        ? result.error
+        : `target '${args.target}' not found in ${p}. Read the file first to see its content, then pass the exact anchor text you want to target.`;
+      return { output: `Error: ${hint}`, title: relPath };
     }
+    const match = result.match;
     const next = original.slice(0, match.startIndex) + args.content + original.slice(match.endIndex);
     writeFileSync(p, next);
     recordWrite(p, sessionId, next);
+    const disambigNote = result.totalMatches > 1
+      ? ` (${result.totalMatches} matches — use ${args.target}#N to target a specific one)`
+      : "";
     return {
-      output: `Replaced ${match.scope} '${args.target}' in ${p} (bytes ${match.startIndex}-${match.endIndex} → ${args.content.length} bytes new).`,
+      output: `Replaced ${match.scope} '${match.anchor}' in ${p} (bytes ${match.startIndex}-${match.endIndex} → ${args.content.length} bytes new).${disambigNote}`,
       title: relPath,
-      metadata: { mode: "target", target: args.target, scope: match.scope, was: { start: match.startIndex, end: match.endIndex }, size: next.length },
+      metadata: { mode: "target", target: args.target, scope: match.scope, totalMatches: result.totalMatches, was: { start: match.startIndex, end: match.endIndex }, size: next.length },
     };
   }
 

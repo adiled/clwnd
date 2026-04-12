@@ -432,6 +432,39 @@ describe("do_noncode: target", () => {
     const out = await post("do_noncode", { file_path: p, target: "## Nonexistent", content: "x" });
     expect(out).toContain("not found");
   });
+
+  test("duplicate headings: warns about ambiguity", async () => {
+    const p = seed("target-dup.md", "# Title\n\n## Setup\n\nFirst setup.\n\n## Usage\n\nUse it.\n\n## Setup\n\nSecond setup.\n");
+    await post("read", { file_path: p });
+    const out = await post("do_noncode", { file_path: p, target: "## Setup", content: "## Setup\n\nReplaced first.\n\n" });
+    // Should succeed (first match) but warn about duplicates
+    expect(out).toContain("Replaced");
+    expect(out).toMatch(/2 matches|disambiguate/);
+    const after = disk(p);
+    expect(after).toContain("Replaced first");
+    expect(after).toContain("Second setup"); // second one untouched
+  });
+
+  test("duplicate headings: #N targets the Nth match", async () => {
+    const p = seed("target-dup2.md", "## Setup\n\nFirst.\n\n## Usage\n\nUse it.\n\n## Setup\n\nSecond.\n");
+    await post("read", { file_path: p });
+    const out = await post("do_noncode", { file_path: p, target: "## Setup#2", content: "## Setup\n\nReplaced second.\n" });
+    expect(out).toContain("Replaced");
+    const after = disk(p);
+    expect(after).toContain("First."); // first one untouched
+    expect(after).toContain("Replaced second");
+  });
+
+  test("env: exact key match, no partial", async () => {
+    const p = seed("target-env-exact.env", "PORT=3000\nSUPPORT_PORT=4000\nPORT_DEBUG=5000\n");
+    await post("read", { file_path: p });
+    const out = await post("do_noncode", { file_path: p, target: "PORT", content: "PORT=9090\n" });
+    expect(out).toContain("Replaced");
+    const after = disk(p);
+    expect(after).toContain("PORT=9090");
+    expect(after).toContain("SUPPORT_PORT=4000"); // not touched
+    expect(after).toContain("PORT_DEBUG=5000"); // not touched
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
