@@ -1268,7 +1268,7 @@ async function handleTendrilReach(msg: Record<string, unknown>): Promise<void> {
   const tool = msg.tool as string;
   const args = msg.args as Record<string, unknown>;
   const callId = msg.callId as string;
-  trace("tendril.executing", { tool, callId });
+  trace("tendril.executing", { tool, callId, hasSid: !!msg.sid, hasClient: !!sharedClient, argsKeys: Object.keys(args).join(",") });
 
   try {
     if (tool === "task" && sharedClient) {
@@ -1322,8 +1322,9 @@ async function handleTendrilReach(msg: Record<string, unknown>): Promise<void> {
       hum({ chi: "tendril-result", callId, result: `Error: unknown tendril tool '${tool}'` });
     }
   } catch (e) {
-    trace("tendril.failed", { tool, callId, err: String(e) });
-    hum({ chi: "tendril-result", callId, result: `Error: ${e instanceof Error ? e.message : String(e)}` });
+    const errMsg = e instanceof Error ? e.message : String(e);
+    trace("tendril.failed", { tool, callId, err: errMsg, stack: e instanceof Error ? e.stack?.split("\n").slice(0, 3).join(" | ") : undefined });
+    hum({ chi: "tendril-result", callId, result: `Error: ${errMsg}` });
   }
 }
 export function setSharedPluginInput(input: ClwndConfig["pluginInput"]): void { sharedPluginInput = input; }
