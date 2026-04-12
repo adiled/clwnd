@@ -189,6 +189,10 @@ let humEcho = "";
 // delivered to the wrong stream — manifesting as hung turns and scrambled
 // session state. See the compaction hang incident.
 const humHearers = new Map<string, HumListener>();
+// Pending task holds: when the daemon holds a task MCP call (tendril),
+// the first stream stores the hold info here. The next doStream for the
+// same session detects it, resolves the tendril, and streams continuation.
+const sessionTaskHolds = new Map<string, { callId: string; toolUseId?: string }>();
 let humAlive = false;
 let humReady: { resolve: () => void } | null = null;
 let humAwaken: Promise<void> = awakenHum();
@@ -242,6 +246,16 @@ async function awakenHum(): Promise<void> {
           }
           if (msg.chi === "pulse") { trace("hum.pulse", { kind: msg.kind, sid: msg.sid }); continue; }
           if (msg.chi === "tendril-reach") {
+            // Task tendrils route to the active stream — the stream emits
+            // providerExecuted=false + finish so OC handles via handleSubtask.
+            // Non-task tendrils still go to handleTendrilReach for plugin exec.
+            if (msg.tool === "task") {
+              const trSid = typeof msg.sid === "string" ? msg.sid : undefined;
+              if (trSid) {
+                const h = humHearers.get(trSid);
+                if (h) { h(msg); continue; }
+              }
+            }
             handleTendrilReach(msg);
             continue;
           }
@@ -852,7 +866,13 @@ export class ClwndModel implements LanguageModelV3 {
       }
       return false;
     })();
-    if (isBrokeredToolReturn(opts.prompt) && !isPermReturn) {
+    // Task continuation: OC executed the task (handleSubtask), now we
+    // resolve the daemon's tendril hold so Claude CLI gets the real result
+    // and continues generating. Same listen-only pattern as permission.
+    const pendingTask = sessionTaskHolds.get(sid);
+    const isTaskReturn = !!(pendingTask && isBrokeredToolReturn(opts.prompt));
+
+    if (isBrokeredToolReturn(opts.prompt) && !isPermReturn && !isTaskReturn) {
       trace("brokered.return", { sid });
       // Emit a minimal text block before finish so OC creates a new
       // assistant message. Without this, OC's prompt loop sees
@@ -872,8 +892,10 @@ export class ClwndModel implements LanguageModelV3 {
       };
     }
 
-    // Permission return: listen-only — Claude is finishing after MCP unblocked
-    const listenOnly = !!isPermReturn;
+    // Listen-only: permission return or task continuation — Claude CLI is
+    // mid-turn, waiting for a hold to be resolved. We register a listener
+    // and resolve the hold; Claude continues from where it paused.
+    const listenOnly = !!(isPermReturn || isTaskReturn);
 
     // Include prior petals — daemon compares with JSONL state and grafts only what's new
     const priorPetals = opts.prompt.filter(m => m.role === "user" || m.role === "assistant" || m.role === "tool");
@@ -960,8 +982,8 @@ export class ClwndModel implements LanguageModelV3 {
     // Send prompt before creating stream — survives OC plugin reload
     let promptSent = false;
     if (listenOnly && humAlive) {
-      // Permission return: register listener FIRST, then release hold
-      // Order matters — Claude's post-permission events must have a listener
+      // Listen-only: register listener FIRST, then release the hold.
+      // Order matters — Claude's post-hold events must have a listener.
       const pd = flushPenny();
       hum({
         chi: "prompt", sid, cwd,
@@ -974,6 +996,31 @@ export class ClwndModel implements LanguageModelV3 {
       if (permAskId) {
         trace("permission.hold.releasing", { sid, askId: permAskId });
         hum({ chi: "release-permit", askId: permAskId, decision: "allow" });
+      }
+      if (isTaskReturn && pendingTask) {
+        // Extract the task result from OC's prompt (last tool message)
+        let taskResultText = "(task completed)";
+        const lastTool = opts.prompt.findLast(m => m.role === "tool");
+        if (lastTool && Array.isArray(lastTool.content)) {
+          for (const p of lastTool.content) {
+            if (p.type === "tool-result" && p.toolName === "task") {
+              const loose = p as unknown as { output?: unknown; result?: unknown };
+              const rawOut = loose.output ?? loose.result;
+              try {
+                const outer = typeof rawOut === "string" ? JSON.parse(rawOut) : rawOut;
+                taskResultText = typeof outer === "string" ? outer
+                  : (outer?.value ?? outer?.output ?? JSON.stringify(outer ?? ""));
+                if (typeof taskResultText !== "string") taskResultText = JSON.stringify(taskResultText);
+              } catch {
+                taskResultText = typeof rawOut === "string" ? rawOut : JSON.stringify(rawOut ?? "");
+              }
+              break;
+            }
+          }
+        }
+        trace("task.hold.resolving", { sid, callId: pendingTask.callId, resultLen: taskResultText.length });
+        sessionTaskHolds.delete(sid);
+        hum({ chi: "tendril-result", callId: pendingTask.callId, result: taskResultText });
       }
     } else if (!listenOnly && humAlive) {
       const pd = flushPenny();
@@ -1001,9 +1048,20 @@ export class ClwndModel implements LanguageModelV3 {
       async start(controller) {
         let done = false;
         const tendrils = new Set<string>();
-        // Brokered set — only native brokered tools (webfetch etc.), NOT external MCP tools
-        // External tools are executed by daemon's MCP client — Claude gets real results
+        // Task continuation: skip Claude CLI's tool_result replay for the
+        // task we already executed — OC has the result from handleSubtask.
+        // Separate set from tendrils so the finish handler doesn't see
+        // tendrils.size > 0 and force finishReason to "tool-calls" (which
+        // would cause OC to re-loop infinitely).
+        const skipResultIds = new Set<string>();
+        if (isTaskReturn && pendingTask?.toolUseId) {
+          skipResultIds.add(pendingTask.toolUseId);
+        }
+        // Brokered set — tools where OC handles execution, not daemon MCP.
+        // task: held via tendril — provider emits providerExecuted=false so
+        // OC runs handleSubtask with TUI feedback.
         const streamBrokered = new Set(BROKERED_TOOLS);
+        streamBrokered.add("task");
         const buds: LanguageModelV3StreamPart[] = [];
         const metaQueue: Array<{ tool: string; title?: string; metadata?: Record<string, unknown> }> = [];
         let textId = "t0";
@@ -1153,38 +1211,9 @@ export class ClwndModel implements LanguageModelV3 {
             if (ct === "tool_result" && (raw.toolCallId || raw.toolUseId)) {
               const callId = (raw.toolCallId ?? raw.toolUseId) as string;
               if (tendrils.has(callId)) return;
+              if (skipResultIds.has(callId)) { skipResultIds.delete(callId); return; }
               const rawResult = raw.result ?? "";
               const resultText = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
-
-              // Delegation: daemon returned args immediately. Re-emit as
-              // providerExecuted=false so OC handles via handleSubtask.
-              const delegateMatch = resultText.match(/<!--clwnd-delegate:(.*?)-->/s);
-              if (delegateMatch) {
-                try {
-                  const delegateArgs = JSON.parse(delegateMatch[1]);
-                  const rawName = raw.toolName as string ?? "";
-                  const ocToolName = rawName ? mapToolName(rawName) : "task";
-                  const mappedInput = mapToolInput(rawName || "task", JSON.stringify(delegateArgs));
-                  trace("delegate.emit", { tool: ocToolName, callId, input: mappedInput.slice(0, 100) });
-                  // Drop the original buds — they have providerExecuted=true
-                  // from the MCP call. OC's processor preserves the first
-                  // providerExecuted value, so if we shed() them and then
-                  // emit with false, the true wins. Drop instead.
-                  buds.length = 0;
-                  petal({ type: "tool-input-start", id: callId, toolName: ocToolName, providerExecuted: false });
-                  petal({
-                    type: "tool-call",
-                    toolCallId: callId,
-                    toolName: ocToolName,
-                    input: mappedInput,
-                    providerExecuted: false,
-                  });
-                  tendrils.add(callId);
-                } catch (e) {
-                  trace("delegate.failed", { callId, err: String(e) });
-                }
-                return;
-              }
 
               const queued = metaQueue.shift();
               const output = queued ? resultText : parseToolResult(resultText).output;
@@ -1199,6 +1228,35 @@ export class ClwndModel implements LanguageModelV3 {
                 providerExecuted: true,
               } as LanguageModelV3StreamPart);
             }
+          }
+
+          // ── Task tendril hold ──
+          // Daemon held the task MCP call. Shed buds (task events are already
+          // marked providerExecuted=false via streamBrokered), tell OC to
+          // execute the task natively via handleSubtask, then close stream.
+          if (chi === "tendril-reach" && raw.tool === "task") {
+            const taskCallId = raw.callId as string;
+            // Capture the Claude tool_use_id from buds so we can skip
+            // the tool_result replay in the continuation stream.
+            let taskToolUseId: string | undefined;
+            for (const b of buds) {
+              if (b.type === "tool-input-start" && (b as any).toolName === "task") {
+                taskToolUseId = (b as any).id;
+                break;
+              }
+            }
+            trace("task.hold", { callId: taskCallId, toolUseId: taskToolUseId, buds: buds.length });
+            shed();
+            if (textStarted) petal({ type: "text-end", id: textId });
+            if (reasoningStarted) petal({ type: "reasoning-end", id: reasoningId });
+            sessionTaskHolds.set(sid, { callId: taskCallId, toolUseId: taskToolUseId });
+            petal({
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: zeroUsage(),
+            });
+            wilt();
+            return;
           }
 
           // ── Permission ask ──

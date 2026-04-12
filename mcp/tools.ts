@@ -1860,8 +1860,7 @@ export async function executeTool(name: string, args: Record<string, unknown>, _
     case "do_noncode": return execDoNoncode(args as any, sessionId);
     case "bash": return execBash(args as any);
     case "permission_prompt": return execPermissionPrompt(args as any, sessionId);
-    case "task":
-      return { output: `<!--clwnd-delegate:${JSON.stringify(args)}-->`, title: (args.description as string) ?? "task" };
+    case "task": return execTendril("task", args, sessionId);
     // Replaced-and-banned tools. Return a redirect instead of "Unknown tool"
     // so an agent that somehow still sees one of these learns the right
     // substitute without wasting another round-trip.

@@ -621,6 +621,11 @@ interface Session {
   // session climbs past CONTEXT_WARN_THRESHOLD. Context reduction is OC's
   // job — clwnd does not mutate session state on this signal.
   maxContextTokens?: number;
+  // Callable closure: forces cupped petals to be sent immediately.
+  // Set by the onPetal IIFE in the prompt handler. The tendril callback
+  // calls this before sending tendril-reach so the provider has tool
+  // events in its buds when the hold signal arrives.
+  forceUncup?: () => void;
 }
 
 // Advisory threshold. When a session's peak per-turn input context crosses
@@ -1135,6 +1140,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
             }
           }
           uncup = doUncup;
+          if (session) session.forceUncup = doUncup;
 
           function wither() {
             if (!session) return;
@@ -1718,6 +1724,14 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>, s
 // executes via OC's tool pipeline, hums the result back. Same shape as
 // the permission hold but for actual tool execution (task subtasks etc.).
 setTendrilCallback((tool, args, callId, sessionId) => {
+  // Force uncup cupped petals so the provider has tool events in buds
+  // before the tendril-reach signal arrives. Without this, short prompts
+  // (under CUP_THRESHOLD chars) keep tool_use chunks cupped — the provider
+  // sees tendril-reach with empty buds and can't emit providerExecuted=false.
+  if (sessionId) {
+    const session = sessions.get(sessionId);
+    if (session?.forceUncup) session.forceUncup();
+  }
   trace("tendril.reach", { tool, callId, sid: sessionId });
   hum(sessionId ?? "", { chi: "tendril-reach", tool, args, callId });
 });
