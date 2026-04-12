@@ -1860,17 +1860,8 @@ export async function executeTool(name: string, args: Record<string, unknown>, _
     case "do_noncode": return execDoNoncode(args as any, sessionId);
     case "bash": return execBash(args as any);
     case "permission_prompt": return execPermissionPrompt(args as any, sessionId);
-    case "task": {
-      // Tendril pattern: daemon holds, hums to plugin, plugin creates child
-      // session and runs the subtask. Known issue: session.prompt() on the
-      // child may return empty on some OC configurations. If the tendril
-      // times out or returns empty, the error surfaces here.
-      const result = await execTendril("task", args, sessionId);
-      if (result.output.startsWith("Error:") || result.output === "(task completed with no text output)") {
-        return { output: `Task execution failed: ${result.output}\n\nFallback: do the work directly in this conversation instead of delegating to a subtask.`, title: "task failed" };
-      }
-      return result;
-    }
+    case "task":
+      return { output: `<!--clwnd-delegate:${JSON.stringify(args)}-->`, title: (args.description as string) ?? "task" };
     // Replaced-and-banned tools. Return a redirect instead of "Unknown tool"
     // so an agent that somehow still sees one of these learns the right
     // substitute without wasting another round-trip.

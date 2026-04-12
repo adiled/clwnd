@@ -512,6 +512,7 @@ function isBrokeredToolReturn(prompt: LanguageModelV3Prompt): boolean {
     if (part.type === "tool-result" && (
       (part.toolName && BROKERED_TOOLS.has(part.toolName)) ||
       part.toolName === "clwnd_permission" ||
+      part.toolName === "task" ||
       part.toolCallId?.startsWith("perm-")
     )) {
       return true;
@@ -1154,6 +1155,37 @@ export class ClwndModel implements LanguageModelV3 {
               if (tendrils.has(callId)) return;
               const rawResult = raw.result ?? "";
               const resultText = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
+
+              // Delegation: daemon returned args immediately. Re-emit as
+              // providerExecuted=false so OC handles via handleSubtask.
+              const delegateMatch = resultText.match(/<!--clwnd-delegate:(.*?)-->/s);
+              if (delegateMatch) {
+                try {
+                  const delegateArgs = JSON.parse(delegateMatch[1]);
+                  const rawName = raw.toolName as string ?? "";
+                  const ocToolName = rawName ? mapToolName(rawName) : "task";
+                  const mappedInput = mapToolInput(rawName || "task", JSON.stringify(delegateArgs));
+                  trace("delegate.emit", { tool: ocToolName, callId, input: mappedInput.slice(0, 100) });
+                  // Drop the original buds — they have providerExecuted=true
+                  // from the MCP call. OC's processor preserves the first
+                  // providerExecuted value, so if we shed() them and then
+                  // emit with false, the true wins. Drop instead.
+                  buds.length = 0;
+                  petal({ type: "tool-input-start", id: callId, toolName: ocToolName, providerExecuted: false });
+                  petal({
+                    type: "tool-call",
+                    toolCallId: callId,
+                    toolName: ocToolName,
+                    input: mappedInput,
+                    providerExecuted: false,
+                  });
+                  tendrils.add(callId);
+                } catch (e) {
+                  trace("delegate.failed", { callId, err: String(e) });
+                }
+                return;
+              }
+
               const queued = metaQueue.shift();
               const output = queued ? resultText : parseToolResult(resultText).output;
               const title = queued?.title ?? parseToolResult(resultText).title;
