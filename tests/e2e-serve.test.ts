@@ -294,7 +294,7 @@ beforeAll(async () => {
   const dummyJs = `file://${join(dirname(fileURLToPath(import.meta.url)), "fixtures", "dummy-provider.js")}`;
   writeFileSync(join(PROJECT_DIR, "opencode.json"), JSON.stringify({
     "$schema": "https://opencode.ai/config.json",
-    plugin: [dummyJs],
+    plugin: [dummyJs, `file://${join(HOME, ".local", "share", "clwnd", "src", "plugins", "opencode")}`],
     provider: {
       "piano": {
         npm: dummyJs,
