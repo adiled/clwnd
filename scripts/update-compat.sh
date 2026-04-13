@@ -40,18 +40,18 @@ CLWND_COMMIT=$(git -C "$(dirname "$0")/.." rev-parse --short HEAD)
 CLWND_VERSION=$(grep '"version"' package.json | head -1 | sed 's/.*"\([0-9.]*\)".*/\1/')
 CLAUDE_VERSION=$(run_as_clwnd "claude --version 2>/dev/null | head -1" | tr -d '\n')
 OPENCODE_VERSION=$(run_as_clwnd "opencode --version 2>/dev/null | head -1" | tr -d '\n')
-BUN_VERSION=$(run_as_clwnd "bun --version 2>/dev/null" | tr -d '\n')
+NODE_VERSION=$(run_as_clwnd "node --version 2>/dev/null" | tr -d '\n')
 
 echo "clwnd: v${CLWND_VERSION} (${CLWND_COMMIT})"
 echo "claude: ${CLAUDE_VERSION}"
 echo "opencode: ${OPENCODE_VERSION}"
-echo "bun: ${BUN_VERSION}"
+echo "node: ${NODE_VERSION}"
 
 echo "Running e2e-serve tests..."
-E2E_SERVE=$(run_as_clwnd "bun test ./tests/e2e-serve.test.ts")
+E2E_SERVE=$(run_as_clwnd "vitest run ./tests/e2e-serve.test.ts")
 
 echo "Running e2e-human tests..."
-E2E_HUMAN=$(run_as_clwnd "bun test ./tests/e2e-human.test.ts")
+E2E_HUMAN=$(run_as_clwnd "vitest run ./tests/e2e-human.test.ts")
 
 # ─── Build the prompt ────────────────────────────────────────────────────────
 
@@ -124,7 +124,7 @@ Features to include: Agent switching, Plan mode, Permissions (session), Permissi
 
 ### Section 3: "## Test Summary"
 A compact summary table: Suite | Pass | Fail | Skip | Total | Duration
-Extract the duration from each test suite output (bun test prints it at the end, e.g., "[110.66s]").
+Extract the duration from each test suite output (vitest run prints it at the end, e.g., "[110.66s]").
 
 Then a "## Environment" section with a table: Component | Version — using the versions provided in the input.
 
@@ -148,7 +148,7 @@ Here are the test suite results. Generate the compatibility index issue body.
 clwnd: v${CLWND_VERSION} (${CLWND_COMMIT})
 claude: ${CLAUDE_VERSION}
 opencode: ${OPENCODE_VERSION}
-bun: ${BUN_VERSION}
+node: ${NODE_VERSION}
 timestamp: ${TIMESTAMP}
 
 === E2E-SERVE TESTS ===

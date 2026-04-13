@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "vitest";
-import { spawn, type Subprocess } from "bun";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync } from "fs";
 import { join } from "path";
 
@@ -28,11 +28,11 @@ async function createSession(): Promise<string> {
 
 async function deleteSession(sid: string): Promise<void> {
   try { await fetch("http://localhost/", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }), unix: DAEMON_SOCK } as RequestInit); } catch {}
-  try { const p = spawn({ cmd: ["opencode", "session", "delete", sid], cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe" }); await p.exited; } catch {}
+  try { const p = spawn("opencode", ["session", "delete", sid].filter(Boolean), { cwd: PROJECT_DIR, stdio: ["pipe", "pipe", "pipe"] }); await new Promise<void>(r => p.on("exit", () => r())); } catch {}
 }
 
 async function sh(cmd: string): Promise<void> {
-  const p = spawn({ cmd: ["sh", "-c", cmd], stdout: "pipe", stderr: "pipe" }); await p.exited;
+  const p = spawn("sh", ["-c", cmd].filter(Boolean), { stdio: ["pipe", "pipe", "pipe"] }); await new Promise<void>(r => p.on("exit", () => r()));
 }
 
 async function nuke(pid?: number): Promise<void> {
@@ -41,15 +41,15 @@ async function nuke(pid?: number): Promise<void> {
   await sh(`lsof -ti :${PORT} | xargs -r kill -9 2>/dev/null`); await Bun.sleep(500);
 }
 
-let server: Subprocess;
+let server: ChildProcess;
 
 beforeAll(async () => {
   await nuke();
   await sh(`rm -rf ${SUITE_DIR}`);
   mkdirSync(PROJECT_DIR, { recursive: true });
 
-  const gitInit = spawn({ cmd: ["git", "init"], cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe" });
-  await gitInit.exited;
+  const gitInit = spawn("git", ["init"].filter(Boolean), { cwd: PROJECT_DIR, stdio: ["pipe", "pipe", "pipe"] });
+  await new Promise<void>(r => gitInit.on("exit", () => r()));
   await Bun.write(join(PROJECT_DIR, "hello.txt"), "hello world\n");
 
   mkdirSync(join(PROJECT_DIR, ".claude"), { recursive: true });
@@ -64,13 +64,13 @@ beforeAll(async () => {
 
   await Bun.write(join(PROJECT_DIR, "opencode.json"), JSON.stringify({}));
 
-  const gitAdd = spawn({ cmd: ["git", "add", "."], cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe" });
-  await gitAdd.exited;
+  const gitAdd = spawn("git", ["add", "."].filter(Boolean), { cwd: PROJECT_DIR, stdio: ["pipe", "pipe", "pipe"] });
+  await new Promise<void>(r => gitAdd.on("exit", () => r()));
   const gitCommit = spawn({
     cmd: ["git", "commit", "-m", "init"], cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe",
     env: { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "t@t" },
   });
-  await gitCommit.exited;
+  await new Promise<void>(r => gitCommit.on("exit", () => r()));
 
   server = spawn({
     cmd: ["opencode", "serve", "--port", String(PORT), "--hostname", "127.0.0.1"],

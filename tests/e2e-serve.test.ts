@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "vitest";
-import { spawn, type Subprocess } from "bun";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, rmSync, mkdirSync, readFileSync } from "fs";
 import { join } from "path";
 
@@ -72,7 +72,7 @@ async function deleteSession(sid: string): Promise<void> {
       stdout: "pipe",
       stderr: "pipe",
     });
-    await proc.exited;
+    await new Promise<void>(r => proc.on("exit", () => r()));
   } catch {}
 }
 
@@ -218,8 +218,8 @@ async function serverIsAlive(): Promise<boolean> {
 // ─── Process Cleanup ────────────────────────────────────────────────────────
 
 async function sh(cmd: string): Promise<void> {
-  const p = spawn({ cmd: ["sh", "-c", cmd], stdout: "pipe", stderr: "pipe" });
-  await p.exited;
+  const p = spawn("sh", ["-c", cmd].filter(Boolean), { stdio: ["pipe", "pipe", "pipe"] });
+  await new Promise<void>(r => p.on("exit", () => r()));
 }
 
 async function nuke(pid?: number): Promise<void> {
@@ -240,9 +240,9 @@ async function nuke(pid?: number): Promise<void> {
   await Bun.sleep(500);
 
   // 4. Verify port is free
-  const probe = spawn({ cmd: ["sh", "-c", `lsof -ti :${PORT}`], stdout: "pipe", stderr: "pipe" });
+  const probe = spawn("sh", ["-c", `lsof -ti :${PORT}`].filter(Boolean), { stdio: ["pipe", "pipe", "pipe"] });
   const out = await new Response(probe.stdout).text();
-  await probe.exited;
+  await new Promise<void>(r => probe.on("exit", () => r()));
   if (out.trim()) {
     // Something survived everything above — last resort
     await sh(`echo "${out.trim()}" | xargs kill -9 2>/dev/null`);
@@ -252,7 +252,7 @@ async function nuke(pid?: number): Promise<void> {
 
 // ─── Suite Lifecycle ────────────────────────────────────────────────────────
 
-let server: Subprocess;
+let server: ChildProcess;
 
 beforeAll(async () => {
   // Sweep any orphaned daemon sessions from prior runs
@@ -262,9 +262,9 @@ beforeAll(async () => {
   await nuke();
 
   // Verify port is actually free (nuke can't kill processes owned by other users)
-  const portCheck = spawn({ cmd: ["sh", "-c", `lsof -ti :${PORT}`], stdout: "pipe", stderr: "pipe" });
+  const portCheck = spawn("sh", ["-c", `lsof -ti :${PORT}`].filter(Boolean), { stdio: ["pipe", "pipe", "pipe"] });
   const portPids = (await new Response(portCheck.stdout).text()).trim();
-  await portCheck.exited;
+  await new Promise<void>(r => portCheck.on("exit", () => r()));
   if (portPids) {
     throw new Error(`Port ${PORT} still held by PID(s) ${portPids} after cleanup — likely owned by another user. Kill manually: sudo kill -9 ${portPids}`);
   }
@@ -274,8 +274,8 @@ beforeAll(async () => {
   mkdirSync(PROJECT_DIR, { recursive: true });
 
   // Init git repo in project dir
-  const gitInit = spawn({ cmd: ["git", "init"], cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe" });
-  await gitInit.exited;
+  const gitInit = spawn("git", ["init"].filter(Boolean), { cwd: PROJECT_DIR, stdio: ["pipe", "pipe", "pipe"] });
+  await new Promise<void>(r => gitInit.on("exit", () => r()));
   await Bun.write(join(PROJECT_DIR, "hello.txt"), "hello world\n");
 
   // OpenCode project config — small_model for compaction + dummy provider for gap fill tests
@@ -315,14 +315,14 @@ beforeAll(async () => {
   }, null, 2));
 
 
-  const gitAdd = spawn({ cmd: ["git", "add", "."], cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe" });
-  await gitAdd.exited;
+  const gitAdd = spawn("git", ["add", "."].filter(Boolean), { cwd: PROJECT_DIR, stdio: ["pipe", "pipe", "pipe"] });
+  await new Promise<void>(r => gitAdd.on("exit", () => r()));
   const gitCommit = spawn({
     cmd: ["git", "commit", "-m", "init"],
     cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe",
     env: { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "t@t" },
   });
-  await gitCommit.exited;
+  await new Promise<void>(r => gitCommit.on("exit", () => r()));
 
   // Start opencode serve — ONCE for the entire suite
   server = spawn({

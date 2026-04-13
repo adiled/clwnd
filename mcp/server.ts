@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 /**
  * clwnd MCP server — stdio transport (fallback).
  * The daemon normally serves MCP via HTTP. This is used only if

@@ -77,7 +77,8 @@ ensure_min_version() {
 }
 
 check_prereqs() {
-  [ -x "$(command -v bun)" ]    || { echo "error: bun required"; exit 1; }
+  [ -x "$(command -v node)" ]   || { echo "error: node required"; exit 1; }
+  [ -x "$(command -v pnpm)" ]   || { echo "error: pnpm required"; exit 1; }
   [ -x "$(command -v claude)" ] || { echo "error: claude CLI required"; exit 1; }
   [ -x "$(command -v git)" ]    || { echo "error: git required"; exit 1; }
 
@@ -136,12 +137,12 @@ ensure_source() {
 }
 
 do_build() {
-  echo "[build] bun install..."
+  echo "[build] pnpm install..."
   cd "$CLWND_SRC"
-  bun install
+  pnpm install
 
   echo "[build] compiling..."
-  bun run build
+  pnpm run build
 
   # Dev mode no longer copies a single .js file — the plugin ref in
   # opencode.json + tui.json now points at the package directory so OC
@@ -168,7 +169,7 @@ configure_tui() {
   local TUI_CONFIG="$TUI_CONFIG_DIR/tui.json"
   mkdir -p "$TUI_CONFIG_DIR"
 
-  bun -e "
+  node -e "
 const fs = require('fs');
 const configPath = '${TUI_CONFIG}';
 const pluginRef = '${PLUGIN_REF}';
@@ -190,7 +191,7 @@ configure_opencode() {
   local PLUGIN_REF
   PLUGIN_REF=$(plugin_ref)
 
-  bun -e "
+  node -e "
 const fs = require('fs');
 const configPath = '${OPENCODE_CONFIG}';
 const pluginRef = '${PLUGIN_REF}';
@@ -235,8 +236,8 @@ fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
 }
 
 register_service() {
-  local BUN CLAUDE
-  BUN=$(which bun)
+  local NODE CLAUDE
+  NODE=$(which node)
   CLAUDE=$(which claude)
 
   if [ "$OS" = "Darwin" ]; then
@@ -252,7 +253,7 @@ register_service() {
   <string>${PLIST_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${BUN}</string>
+    <string>${NODE}</string>
     <string>${CLWND_SRC}/dist/daemon/index.js</string>
   </array>
   <key>WorkingDirectory</key>
@@ -274,7 +275,7 @@ register_service() {
     <key>XDG_RUNTIME_DIR</key>
     <string>${XDG_RUNTIME_DIR}</string>
     <key>PATH</key>
-    <string>$(dirname $CLAUDE):$(dirname $BUN):/usr/local/bin:/usr/bin:/bin</string>
+    <string>$(dirname $CLAUDE):$(dirname $NODE):/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -318,9 +319,9 @@ Environment=XDG_CONFIG_HOME=$XDG_CONFIG_HOME
 Environment=XDG_DATA_HOME=$XDG_DATA_HOME
 Environment=XDG_STATE_HOME=$XDG_STATE_HOME
 Environment=XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
-Environment=PATH=$(dirname $CLAUDE):$(dirname $BUN):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=$(dirname $CLAUDE):$(dirname $NODE):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 $($IS_ROOT || echo "Environment=CLWND_PERMISSION_MODE=bypassPermissions")
-ExecStart=$BUN $CLWND_SRC/dist/daemon/index.js
+ExecStart=$NODE $CLWND_SRC/dist/daemon/index.js
 Restart=on-failure
 RestartSec=2s
 StandardOutput=journal
@@ -539,7 +540,7 @@ cmd_uninstall() {
 
   # remove plugin entry + provider from opencode.json
   if [ -f "$OPENCODE_CONFIG" ]; then
-    bun -e "
+    node -e "
 const fs = require('fs');
 const p = '${OPENCODE_CONFIG}';
 try {

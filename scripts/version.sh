@@ -9,7 +9,7 @@ MSG="${2:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Read current version from root package.json
-CURRENT=$(bun -e "console.log(require('$ROOT/package.json').version)")
+CURRENT=$(node -e "console.log(require('$ROOT/package.json').version)")
 
 # Compute next version
 IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
@@ -26,7 +26,7 @@ echo "Bumping $CURRENT → $NEXT ($BUMP)"
 # Update all package.json files
 for pkg in "$ROOT/package.json" "$ROOT"/plugins/*/package.json; do
   [ -f "$pkg" ] || continue
-  bun -e "
+  node -e "
 const fs = require('fs');
 const p = '$pkg';
 const j = JSON.parse(fs.readFileSync(p, 'utf8'));

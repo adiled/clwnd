@@ -1,7 +1,7 @@
 import { describe, test } from "vitest";
 
 // These tests CANNOT be automated — they require human eyes on the TUI.
-// Run: bun test tests/e2e-human.test.ts
+// Run: vitest run tests/e2e-human.test.ts
 // Each skipped test is a verification checklist item.
 
 describe("e2e-human: working features (manual verification)", () => {

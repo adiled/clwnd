@@ -8,6 +8,6 @@ export default defineConfig({
   platform: "node",
   target: "node18",
   dts: false,
-  external: ["bun"],
+  external: [],
   noExternal: [/@ai-sdk\/.*/],
 });
