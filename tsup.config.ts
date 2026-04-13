@@ -26,6 +26,9 @@ const TREE_SITTER_GRAMMARS = [
   "tree-sitter-php",
   "tree-sitter-c-sharp",
   "tree-sitter-bash",
+  "tree-sitter-json",  // config-ast.ts — JSON scope resolution
+  "tree-sitter-yaml",  // config-ast.ts — YAML scope resolution
+  "tree-sitter-toml",  // config-ast.ts — TOML scope resolution
   "web-tree-sitter", // WASM runtime for vue/sql (no native npm package)
 ];
 

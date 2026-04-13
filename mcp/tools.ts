@@ -11,6 +11,7 @@ import { trace } from "../log.ts";
 import { penny } from "../lib/penny.ts";
 import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, astGrep, searchSymbols, validateSyntax, symbolByteRange, type Symbol } from "../lib/ast.ts";
 import { resolveWord, resolvePhrase, resolveSentence, resolveParagraph, discoverAnchors, formatAnchors } from "../lib/linguistic.ts";
+import { resolveJsonEntryAst } from "../lib/config-ast.ts";
 
 let CWD = process.env.CLWND_CWD ?? process.cwd();
 
@@ -1422,44 +1423,14 @@ function execDoNoncode(
       }
     }
 
-    // JSON phrase deletion: widen scope to include key + comma + whitespace.
-    // Deleting a JSON property means removing the entire "key": value entry,
-    // not leaving a keyless orphan with dangling commas.
+    // JSON phrase deletion: use AST to find the full entry (key + value + comma).
+    // The AST resolver handles comma cleanup precisely — no regex guessing.
     if (isJson && scopeParam === "phrase" && replaceText === "") {
-      // Scan backward past whitespace and key to line start
-      let wideStart = startIndex;
-      // Back past whitespace between colon and value
-      while (wideStart > 0 && /[\s:]/.test(original[wideStart - 1])) wideStart--;
-      // Back past the key (quoted string)
-      if (wideStart > 0 && original[wideStart - 1] === '"') {
-        wideStart--;
-        while (wideStart > 0 && original[wideStart - 1] !== '"') wideStart--;
-        if (wideStart > 0) wideStart--; // past opening quote
+      const entry = resolveJsonEntryAst(original, scopeValue);
+      if (entry.match) {
+        startIndex = entry.match.startIndex;
+        endIndex = entry.match.endIndex;
       }
-      // Back past leading whitespace on the line
-      while (wideStart > 0 && original[wideStart - 1] === " ") wideStart--;
-      // Handle comma: either trailing from previous entry or leading on this entry
-      let wideEnd = endIndex;
-      // Forward past trailing comma + whitespace
-      let afterVal = wideEnd;
-      while (afterVal < original.length && /\s/.test(original[afterVal])) afterVal++;
-      if (afterVal < original.length && original[afterVal] === ",") {
-        wideEnd = afterVal + 1;
-        // Also consume the newline after comma
-        while (wideEnd < original.length && /[\s]/.test(original[wideEnd]) && original[wideEnd] !== "\n") wideEnd++;
-        if (wideEnd < original.length && original[wideEnd] === "\n") wideEnd++;
-      } else {
-        // No trailing comma — this is the last entry. Remove leading comma instead.
-        let beforeKey = wideStart;
-        while (beforeKey > 0 && /\s/.test(original[beforeKey - 1])) beforeKey--;
-        if (beforeKey > 0 && original[beforeKey - 1] === ",") {
-          wideStart = beforeKey - 1;
-        }
-        // Consume the newline before this entry
-        if (wideStart > 0 && original[wideStart - 1] === "\n") wideStart--;
-      }
-      startIndex = wideStart;
-      endIndex = wideEnd;
     }
 
     // Sentence/paragraph scope: if scope ends with \n and replacement

@@ -27,6 +27,7 @@
  */
 
 import { extname } from "path";
+import { hasConfigGrammar, resolveJsonKeyAst, resolveJsonEntryAst, resolveJsonParagraphAst, resolveJsonSentenceAst } from "./config-ast.ts";
 
 export interface ScopeMatch {
   /** 0-based byte offset of the scope start (inclusive). */
@@ -186,8 +187,10 @@ export function resolveSentence(source: string, quoted: string, filePath: string
   return pickOccurrence(finder(source, anchor), anchor, occurrence);
 }
 
-/** JSON sentence: comma-delimited entry. One key-value pair. */
+/** JSON sentence: one key-value pair. AST first, regex fallback. */
 function findSentenceJson(source: string, anchor: string): ScopeMatch[] {
+  const ast = resolveJsonSentenceAst(source, anchor);
+  if (ast.match) return [ast.match];
   const matches: ScopeMatch[] = [];
   let searchFrom = 0;
   while (true) {
@@ -287,6 +290,10 @@ export function resolveParagraph(source: string, quoted: string, filePath: strin
  *  If the match is directly inside the root object, fall back to blank-line
  *  expansion — grabbing the root is never useful. */
 function findParagraphJson(source: string, anchor: string): ScopeMatch[] {
+  // AST first
+  const ast = resolveJsonParagraphAst(source, anchor);
+  if (ast.match) return [ast.match];
+  // Regex fallback
   const matches: ScopeMatch[] = [];
   let searchFrom = 0;
   while (true) {
@@ -511,6 +518,10 @@ function findAllEnv(source: string, anchor: string): ScopeMatch[] {
 // ─── JSON ──────────────────────────────────────────────────────────────────
 
 function findAllJson(source: string, anchor: string): ScopeMatch[] {
+  // AST first — precise key path resolution via tree-sitter
+  const ast = resolveJsonKeyAst(source, anchor);
+  if (ast.match) return [ast.match];
+  // Regex fallback
   const result = resolveJsonKey(source, anchor);
   return result ? [result] : findAllExactPhrase(source, anchor);
 }
