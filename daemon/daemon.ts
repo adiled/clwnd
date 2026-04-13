@@ -1195,7 +1195,13 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
             // Cup phase — buffer and check
             cupped.push(chunk);
 
-            if (cuppedText.length >= CUP_THRESHOLD) {
+            // tool_use in the stream = structurally valid output. Trigger
+            // the suspicion check early so tool calls aren't hidden behind
+            // the text threshold. If text is clean, uncup immediately —
+            // user sees tool feedback. If suspicious, wither as normal.
+            const isToolStart = type === "tool_input_start";
+
+            if (cuppedText.length >= CUP_THRESHOLD || isToolStart) {
               const level = classifySuspicion(cuppedText);
               if ((level === "critical" || level === "suspicious") && withers < MAX_WITHERS) {
                 withers++;
