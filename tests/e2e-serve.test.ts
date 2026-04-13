@@ -1,7 +1,8 @@
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, rmSync, mkdirSync, readFileSync } from "fs";
-import { join } from "path";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -12,7 +13,7 @@ const HOME = process.env.HOME ?? "/tmp";
 const SUITE_DIR = join(HOME, ".clwnd-e2e-serve");
 const PROJECT_DIR = join(SUITE_DIR, "project");
 const TIMEOUT = 180_000;
-const SEED_FIXTURE = join(import.meta.dir, "fixtures", "seed-session.json");
+const SEED_FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "seed-session.json");
 const DUMMY_MODEL = { providerID: "piano", modelID: "pianoV2" };
 const FREE_MODEL = { providerID: "opencode", modelID: "big-pickle" };
 
@@ -66,12 +67,7 @@ async function deleteSession(sid: string): Promise<void> {
   } catch {}
   // 2. Delete from opencode's side
   try {
-    const proc = spawn({
-      cmd: ["opencode", "session", "delete", sid],
-      cwd: PROJECT_DIR,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const proc = spawn("opencode", ["session", "delete", sid], { cwd: PROJECT_DIR, stdio: ["pipe", "pipe", "pipe"] });
     await new Promise<void>(r => proc.on("exit", () => r()));
   } catch {}
 }
@@ -226,18 +222,18 @@ async function nuke(pid?: number): Promise<void> {
   // 1. Kill children first, then parent (by PID)
   if (pid) {
     await sh(`pkill -TERM -P ${pid} 2>/dev/null; kill -TERM ${pid} 2>/dev/null`);
-    await Bun.sleep(1_000);
+    await new Promise(r => setTimeout(r, 1_000));
     await sh(`pkill -KILL -P ${pid} 2>/dev/null; kill -KILL ${pid} 2>/dev/null`);
-    await Bun.sleep(500);
+    await new Promise(r => setTimeout(r, 500));
   }
 
   // 2. Kill anything matching our port pattern (catches reparented children)
   await sh(`pkill -KILL -f "opencode serve.*--port ${PORT}" 2>/dev/null`);
-  await Bun.sleep(500);
+  await new Promise(r => setTimeout(r, 500));
 
   // 3. Kill anything still holding the port
   await sh(`lsof -ti :${PORT} | xargs -r kill -9 2>/dev/null`);
-  await Bun.sleep(500);
+  await new Promise(r => setTimeout(r, 500));
 
   // 4. Verify port is free
   const probe = spawn("sh", ["-c", `lsof -ti :${PORT}`].filter(Boolean), { stdio: ["pipe", "pipe", "pipe"] });
@@ -246,7 +242,7 @@ async function nuke(pid?: number): Promise<void> {
   if (out.trim()) {
     // Something survived everything above — last resort
     await sh(`echo "${out.trim()}" | xargs kill -9 2>/dev/null`);
-    await Bun.sleep(500);
+    await new Promise(r => setTimeout(r, 500));
   }
 }
 
@@ -276,11 +272,11 @@ beforeAll(async () => {
   // Init git repo in project dir
   const gitInit = spawn("git", ["init"].filter(Boolean), { cwd: PROJECT_DIR, stdio: ["pipe", "pipe", "pipe"] });
   await new Promise<void>(r => gitInit.on("exit", () => r()));
-  await Bun.write(join(PROJECT_DIR, "hello.txt"), "hello world\n");
+  writeFileSync(join(PROJECT_DIR, "hello.txt"), "hello world\n");
 
   // OpenCode project config — small_model for compaction + dummy provider for gap fill tests
-  const dummyJs = `file://${join(import.meta.dir, "fixtures", "dummy-provider.js")}`;
-  await Bun.write(join(PROJECT_DIR, "opencode.json"), JSON.stringify({
+  const dummyJs = `file://${join(dirname(fileURLToPath(import.meta.url)), "fixtures", "dummy-provider.js")}`;
+  writeFileSync(join(PROJECT_DIR, "opencode.json"), JSON.stringify({
     "$schema": "https://opencode.ai/config.json",
     plugin: [dummyJs],
     provider: {
@@ -306,7 +302,7 @@ beforeAll(async () => {
 
   // Claude permissions for MCP tools
   mkdirSync(join(PROJECT_DIR, ".claude"), { recursive: true });
-  await Bun.write(join(PROJECT_DIR, ".claude", "settings.json"), JSON.stringify({
+  writeFileSync(join(PROJECT_DIR, ".claude", "settings.json"), JSON.stringify({
     permissions: { allow: [
       "mcp__clwnd__read(*)", "mcp__clwnd__edit(*)", "mcp__clwnd__write(*)",
       "mcp__clwnd__bash(*)", "mcp__clwnd__glob(*)", "mcp__clwnd__grep(*)",
@@ -317,42 +313,26 @@ beforeAll(async () => {
 
   const gitAdd = spawn("git", ["add", "."].filter(Boolean), { cwd: PROJECT_DIR, stdio: ["pipe", "pipe", "pipe"] });
   await new Promise<void>(r => gitAdd.on("exit", () => r()));
-  const gitCommit = spawn({
-    cmd: ["git", "commit", "-m", "init"],
-    cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe",
-    env: { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "t@t" },
-  });
+  const gitCommit = spawn("git", ["commit", "-m", "init"], { cwd: PROJECT_DIR, env: { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "t@t" }, stdio: ["pipe", "pipe", "pipe"] });
   await new Promise<void>(r => gitCommit.on("exit", () => r()));
 
   // Start opencode serve — ONCE for the entire suite
-  server = spawn({
-    cmd: ["opencode", "serve", "--port", String(PORT), "--hostname", "127.0.0.1"],
-    cwd: PROJECT_DIR,
-    stdout: "pipe",
-    stderr: "inherit",
-    env: { ...process.env },
-  });
+  server = spawn("opencode", ["serve", "--port", String(PORT), "--hostname", "127.0.0.1"], { cwd: PROJECT_DIR, env: { ...process.env }, stdio: ["pipe", "pipe", "pipe"] });
 
   // Wait for server readiness
   const deadline = Date.now() + 20_000;
   let ready = false;
   while (Date.now() < deadline) {
     if (await serverIsAlive()) { ready = true; break; }
-    await Bun.sleep(500);
+    await new Promise(r => setTimeout(r, 500));
   }
   if (!ready) throw new Error("opencode serve failed to start within 20s");
 
   // Import seed session fixture (6-turn clwnd conversation with free model)
   if (existsSync(SEED_FIXTURE)) {
-    const importProc = spawn({
-      cmd: ["opencode", "import", SEED_FIXTURE],
-      cwd: PROJECT_DIR,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env },
-    });
+    const importProc = spawn("opencode", ["import", SEED_FIXTURE], { cwd: PROJECT_DIR, env: { ...process.env }, stdio: ["pipe", "pipe", "pipe"] });
     const importOut = await new Response(importProc.stdout).text();
-    await importProc.exited;
+    await new Promise<void>(r => importProc.on("exit", () => r()));
     const match = importOut.match(/ses_\w+/);
     if (match) {
       seedSessionId = match[0];
@@ -370,8 +350,8 @@ afterAll(async () => {
   const pid = server?.pid;
   // Nuke by PID (children + parent), by name pattern, and by port
   await nuke(pid);
-  // Wait for Bun's handle on the process to settle
-  try { await server?.exited; } catch {}
+  // Wait for process to settle
+  try { if (server) await new Promise<void>(r => server.on("exit", () => r())); } catch {}
   // Cleanup suite directory
   await sh(`rm -rf ${SUITE_DIR}`);
 }, 15_000);
@@ -400,7 +380,7 @@ afterEach(async () => {
 
   // Reset hello.txt for tests that modify it
   if (existsSync(PROJECT_DIR)) {
-    await Bun.write(join(PROJECT_DIR, "hello.txt"), "hello world\n");
+    writeFileSync(join(PROJECT_DIR, "hello.txt"), "hello world\n");
   }
 });
 
@@ -708,12 +688,12 @@ describe("e2e-serve: abort recovery", () => {
     }).catch(() => null);
 
     // Wait for the request to be in flight, then abort
-    await Bun.sleep(3_000);
+    await new Promise(r => setTimeout(r, 3_000));
     ctrl.abort();
     await abortedReq;
 
     // Wait for graceful shutdown + process respawn
-    await Bun.sleep(5_000);
+    await new Promise(r => setTimeout(r, 5_000));
 
     // Session should recover — next message should work
     const resp = await sendMessage(sid, "What is 2+2? Just the number.");
@@ -738,11 +718,11 @@ describe("e2e-serve: abort recovery", () => {
     }).catch(() => null);
 
     // Let the tool start executing, then interrupt
-    await Bun.sleep(4_000);
+    await new Promise(r => setTimeout(r, 4_000));
     ctrl.abort();
     await abortedReq;
 
-    await Bun.sleep(5_000);
+    await new Promise(r => setTimeout(r, 5_000));
 
     // Session must recover — respond coherently with sane token count
     const resp = await sendMessage(sid, "Say hello.");
@@ -1080,7 +1060,7 @@ describe("e2e-serve: compaction", () => {
         }
       }).catch(() => {});
     });
-    await Bun.sleep(300);
+    await new Promise(r => setTimeout(r, 300));
 
     // Kill Claude CLI process first to free memory for compaction
     try {
@@ -1091,7 +1071,7 @@ describe("e2e-serve: compaction", () => {
         unix: DAEMON_SOCK,
       } as RequestInit);
     } catch {}
-    await Bun.sleep(1_000);
+    await new Promise(r => setTimeout(r, 1_000));
 
     // Trigger compaction via summarize endpoint (uses free model)
     const summarizeReq = fetch(`${BASE}/session/${sid}/summarize`, {
@@ -1131,7 +1111,7 @@ describe("e2e-serve: snapshots and revert", () => {
 
     // File should exist on disk
     expect(existsSync(filePath)).toBe(true);
-    const content = await Bun.file(filePath).text();
+    const content = readFileSync(filePath, "utf-8");
     expect(content).toContain("SNAPSHOT_CONTENT");
   }, TIMEOUT);
 
@@ -1141,14 +1121,14 @@ describe("e2e-serve: snapshots and revert", () => {
     const filePath = join(PROJECT_DIR, "hello.txt");
 
     // Verify original content
-    const before = await Bun.file(filePath).text();
+    const before = readFileSync(filePath, "utf-8");
     expect(before).toContain("hello world");
 
     // Claude edits the file through clwnd MCP
     const editResp = await sendMessage(sid, `Change the contents of ${filePath} to exactly "EDITED BY CLAUDE"`);
 
     // File should be changed on disk
-    const afterEdit = await Bun.file(filePath).text();
+    const afterEdit = readFileSync(filePath, "utf-8");
     expect(afterEdit).toContain("EDITED BY CLAUDE");
 
     // Find the assistant message that did the edit
@@ -1173,10 +1153,10 @@ describe("e2e-serve: snapshots and revert", () => {
     }
 
     // Wait for revert to take effect (OC restores from snapshot)
-    await Bun.sleep(2_000);
+    await new Promise(r => setTimeout(r, 2_000));
 
     // File should be restored to original content
-    const afterRevert = await Bun.file(filePath).text();
+    const afterRevert = readFileSync(filePath, "utf-8");
     expect(afterRevert).toContain("hello world");
   }, TIMEOUT);
 });
@@ -1226,7 +1206,7 @@ describe("e2e-serve: title generation", () => {
     // Title gen is async — wait for it
     let title = before.title;
     for (let i = 0; i < 10; i++) {
-      await Bun.sleep(2_000);
+      await new Promise(r => setTimeout(r, 2_000));
       const after = await getSession(sid);
       if (after.title !== before.title) { title = after.title; break; }
     }
@@ -1240,7 +1220,7 @@ describe("e2e-serve: vision", () => {
     const sid = await createSession();
 
     // Read 48x48 red PNG fixture as data URL
-    const pngPath = join(import.meta.dir, "fixtures", "red-48x48.png");
+    const pngPath = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "red-48x48.png");
     const pngData = readFileSync(pngPath);
     const dataUrl = `data:image/png;base64,${pngData.toString("base64")}`;
 
@@ -1299,12 +1279,12 @@ describe("e2e-serve: cancel kills turn", () => {
     }).catch(() => null);
 
     // Let streaming start, then cancel
-    await Bun.sleep(3_000);
+    await new Promise(r => setTimeout(r, 3_000));
     ctrl.abort();
     await req;
 
     // Verify daemon killed the process
-    await Bun.sleep(2_000);
+    await new Promise(r => setTimeout(r, 2_000));
 
     // Session should recover with a new process
     const resp = await sendMessage(sid, "What is 3+3? Just the number.");
@@ -1327,7 +1307,7 @@ describe("e2e-serve: resource governance", () => {
     expect(hasProcBefore).toBe(true);
 
     // Wait for idle timeout (default 30s) + buffer
-    await Bun.sleep(35_000);
+    await new Promise(r => setTimeout(r, 35_000));
 
     // Process should be gone — killed by idle timer
     const statusAfter = await (await fetch("http://localhost/status", { unix: DAEMON_SOCK } as RequestInit)).json() as any;
@@ -1368,7 +1348,7 @@ describe("e2e-serve: drone swallow + retrofit", () => {
         unix: DAEMON_SOCK,
       } as RequestInit);
     } catch {}
-    await Bun.sleep(2_000);
+    await new Promise(r => setTimeout(r, 2_000));
 
     // Send a DIFFERENT message — tests context retention after JSONL loss.
     // Must differ from the first message to avoid false duplicate in assertCleanHistory.

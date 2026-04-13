@@ -116,9 +116,9 @@ const EXT_TO_LANG: Record<string, LanguageEntry> = {
 // Locate vendored query files at runtime. We try a few candidate paths
 // because the source layout (lib/queries/) doesn't match the bundled
 // layout (dist/daemon/queries/) and we want both dev mode (running .ts
-// directly via Bun) and production (the tsup-bundled daemon) to work.
+// directly via tsx) and via rsync-deployed source.
 //
-// tsup's onSuccess hook (tsup.config.ts) copies lib/queries/*.scm into
+// The dev script rsyncs these to the target.
 // dist/daemon/queries/, so the first candidate hits in production. The
 // second candidate covers running .ts source directly. The third is a
 // safety net in case the daemon was bundled but onSuccess didn't run.
@@ -126,7 +126,7 @@ import { existsSync } from "fs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 function findVendoredQueryDir(): string {
   const candidates = [
-    join(HERE, "queries"),               // dist/daemon/queries (post-tsup) OR lib/queries (dev)
+    join(HERE, "queries"),               // lib/queries (dev)
     join(HERE, "..", "lib", "queries"),  // dist/daemon → ../lib/queries (fallback)
     join(HERE, "..", "..", "lib", "queries"),
   ];
@@ -141,7 +141,7 @@ const VENDORED_QUERY_DIR = findVendoredQueryDir();
 
 function findVendoredWasmDir(): string {
   const candidates = [
-    join(HERE, "wasm"),                  // dist/daemon/wasm (post-tsup) OR lib/wasm (dev)
+    join(HERE, "wasm"),                  // lib/wasm (dev)
     join(HERE, "..", "lib", "wasm"),     // dist/daemon → ../lib/wasm (fallback)
     join(HERE, "..", "..", "lib", "wasm"),
   ];

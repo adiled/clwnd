@@ -22,7 +22,7 @@ clwnd sessions
 clwnd uninstall
 ```
 
-Needs git, bun, opencode, claude.
+Needs git, node (v20+), pnpm, opencode, claude.
 
 Core workflow is operational (more coming). See [compatibility](https://github.com/adiled/clwnd/issues/8).
 

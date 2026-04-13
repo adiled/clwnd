@@ -16,9 +16,9 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
         with:
-          bun-version: latest
+          node-version: 20
 
       - uses: actions/setup-node@v4
         with:
@@ -26,10 +26,10 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
-        run: bun install
+        run: npm install -g pnpm && pnpm install
 
       - name: Build all
-        run: bun run build
+        # no build step — Node runs TypeScript directly via tsx
 
       - name: Publish @clwnd/opencode
         working-directory: plugins/opencode

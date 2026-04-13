@@ -485,7 +485,7 @@ function walkDirectory(dir: string, max = MAX_RESOLVED_TARGETS): string[] {
     let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
     try {
       // Force the utf-8 string variant of Dirent — without an explicit
-      // encoding, Bun/Node's types widen to NonSharedBuffer.
+      // encoding, Node types widen to NonSharedBuffer.
       entries = readdirSync(d, { withFileTypes: true, encoding: "utf-8" }) as unknown as Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
     } catch { continue; }
     for (const e of entries) {
@@ -1869,7 +1869,7 @@ async function getMcpClient(config: McpServerConfig): Promise<McpClient> {
 function mcpRpc(client: McpClient, method: string, params?: unknown, notification = false): Promise<unknown> {
   const id = notification ? undefined : client.nextId++;
   const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
-  // We always spawn with stdin: "pipe" so the sink is a FileSink. Bun's
+  // We always spawn with stdin: "pipe" so stdin is writable. Node's
   if (!client.proc.stdin) {
     throw new Error(`mcp client stdin is not available (server=${client.config.name})`);
   }

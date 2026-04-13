@@ -36,9 +36,9 @@ async function sh(cmd: string): Promise<void> {
 }
 
 async function nuke(pid?: number): Promise<void> {
-  if (pid) { await sh(`pkill -TERM -P ${pid} 2>/dev/null; kill -TERM ${pid} 2>/dev/null`); await Bun.sleep(1_000); await sh(`pkill -KILL -P ${pid} 2>/dev/null; kill -KILL ${pid} 2>/dev/null`); await Bun.sleep(500); }
-  await sh(`pkill -KILL -f "opencode serve.*--port ${PORT}" 2>/dev/null`); await Bun.sleep(500);
-  await sh(`lsof -ti :${PORT} | xargs -r kill -9 2>/dev/null`); await Bun.sleep(500);
+  if (pid) { await sh(`pkill -TERM -P ${pid} 2>/dev/null; kill -TERM ${pid} 2>/dev/null`); await new Promise(r => setTimeout(r, 1_000)); await sh(`pkill -KILL -P ${pid} 2>/dev/null; kill -KILL ${pid} 2>/dev/null`); await new Promise(r => setTimeout(r, 500)); }
+  await sh(`pkill -KILL -f "opencode serve.*--port ${PORT}" 2>/dev/null`); await new Promise(r => setTimeout(r, 500));
+  await sh(`lsof -ti :${PORT} | xargs -r kill -9 2>/dev/null`); await new Promise(r => setTimeout(r, 500));
 }
 
 let server: ChildProcess;
@@ -50,43 +50,37 @@ beforeAll(async () => {
 
   const gitInit = spawn("git", ["init"].filter(Boolean), { cwd: PROJECT_DIR, stdio: ["pipe", "pipe", "pipe"] });
   await new Promise<void>(r => gitInit.on("exit", () => r()));
-  await Bun.write(join(PROJECT_DIR, "hello.txt"), "hello world\n");
+  writeFileSync(join(PROJECT_DIR, "hello.txt"), "hello world\n");
 
   mkdirSync(join(PROJECT_DIR, ".claude"), { recursive: true });
   // do_code and do_noncode NOT in allow list — forces Claude CLI to ask
   // via permission_prompt. read + bash are allowed.
-  await Bun.write(join(PROJECT_DIR, ".claude", "settings.json"), JSON.stringify({
+  writeFileSync(join(PROJECT_DIR, ".claude", "settings.json"), JSON.stringify({
     permissions: { allow: [
       "mcp__clwnd__read(*)",
       "mcp__clwnd__bash(*)",
     ] },
   }, null, 2));
 
-  await Bun.write(join(PROJECT_DIR, "opencode.json"), JSON.stringify({}));
+  writeFileSync(join(PROJECT_DIR, "opencode.json"), JSON.stringify({}));
 
   const gitAdd = spawn("git", ["add", "."].filter(Boolean), { cwd: PROJECT_DIR, stdio: ["pipe", "pipe", "pipe"] });
   await new Promise<void>(r => gitAdd.on("exit", () => r()));
-  const gitCommit = spawn({
-    cmd: ["git", "commit", "-m", "init"], cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe",
-    env: { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "t@t" },
-  });
+  const gitCommit = spawn("git", ["commit", "-m", "init"], { cwd: PROJECT_DIR, env: { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "t@t" }, stdio: ["pipe", "pipe", "pipe"] });
   await new Promise<void>(r => gitCommit.on("exit", () => r()));
 
-  server = spawn({
-    cmd: ["opencode", "serve", "--port", String(PORT), "--hostname", "127.0.0.1"],
-    cwd: PROJECT_DIR, stdout: "pipe", stderr: "pipe", env: { ...process.env },
-  });
+  server = spawn("opencode", ["serve", "--port", String(PORT), "--hostname", "127.0.0.1"], { cwd: PROJECT_DIR, env: { ...process.env }, stdio: ["pipe", "pipe", "pipe"] });
 
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
     try { const r = await fetch(`${BASE}/session/status`); if (r.ok) break; } catch {}
-    await Bun.sleep(500);
+    await new Promise(r => setTimeout(r, 500));
   }
 }, 30_000);
 
 afterAll(async () => {
   await nuke(server?.pid);
-  try { await server?.exited; } catch {}
+  try { if (server) await new Promise<void>(r => server.on("exit", () => r())); } catch {}
   await sh(`rm -rf ${SUITE_DIR}`);
 }, 15_000);
 
@@ -119,9 +113,9 @@ describe("e2e-serve-asks: permission pipeline", () => {
       signal: AbortSignal.timeout(90_000),
     }).then(r => r.json()).catch(() => null);
 
-    await Bun.sleep(2_000);
+    await new Promise(r => setTimeout(r, 2_000));
     expect(existsSync(targetPath)).toBe(true);
-    const content = await Bun.file(targetPath).text();
+    const content = readFileSync(targetPath, "utf-8");
     expect(content).toContain("PERM");
 
     const msgs = await api(`/session/${sid}/message`);
