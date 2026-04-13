@@ -80,12 +80,12 @@ function SidebarView(props: { api: any; session_id: string }) {
 
   const savingsLine = createMemo(() => {
     const d = data()
-    if (d.dollarsSaved === 0 && d.compactionsSaved === 0 && d.corruptionsCaught === 0 && d.editsBlocked === 0) return ""
+    if (d.status === "disconnected") return ""
     const parts: string[] = []
-    if (d.dollarsSaved > 0) parts.push(`$${String(d.dollarsSaved)} saved`)
-    if (d.compactionsSaved > 0) parts.push(`${String(d.compactionsSaved)} compaction${d.compactionsSaved > 1 ? "s" : ""} skipped`)
-    if (d.corruptionsCaught > 0) parts.push(`${String(d.corruptionsCaught)} corruption${d.corruptionsCaught > 1 ? "s" : ""} caught`)
-    if (d.editsBlocked > 0) parts.push(`${String(d.editsBlocked)} bad edit${d.editsBlocked > 1 ? "s" : ""} blocked`)
+    parts.push(`$${String(d.dollarsSaved)} saved`)
+    if (d.compactionsSaved > 0) parts.push(`${String(d.compactionsSaved)} curated`)
+    if (d.corruptionsCaught > 0) parts.push(`${String(d.corruptionsCaught)} caught`)
+    if (d.editsBlocked > 0) parts.push(`${String(d.editsBlocked)} blocked`)
     return parts.join(" · ")
   })
 
