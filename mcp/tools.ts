@@ -181,24 +181,28 @@ WORKFLOW: read(file) first → see symbol outline → do_code(file, symbol, new_
 
 Text has four units: word, phrase, sentence, paragraph. Each parameter names a scope level. Pass exactly ONE scope parameter to tell clwnd what you're editing and how to find it.
 
-WORD — address by structural name. The word stays; its governed scope is replaced.
-  Headings, keys, env vars, section headers — anything with a NAME.
-  do_noncode(file, word: '## Setup', replace: 'New instructions.\\n')
-  do_noncode(file, word: 'DATABASE_URL', replace: 'postgres://new/db')
-  do_noncode(file, word: 'provider.ollama', replace: '{ "npm": "new-pkg" }')
-  do_noncode(file, word: 'server.port', replace: '9090')
-  do_noncode(file, word: '[database]', replace: 'host = new\\nport = 5432\\n')
+WORD — find a token and swap it. Format-agnostic. Any single token bounded by spaces/punctuation.
+  do_noncode(file, word: 'localhost', replace: '0.0.0.0')
+  do_noncode(file, word: 'true', replace: 'false')
+  do_noncode(file, word: 'docker', replace: 'podman')
 
-PHRASE — address by quoting the exact text. The quoted span is replaced.
-  Short, precise edits. Quote what's there, provide the replacement.
+PHRASE — address by structural name OR quote exact text. Format-aware.
+  For structural names (keys, headings, env vars): the name stays, its governed scope is replaced.
+  For exact text: the quoted span is replaced directly.
+  do_noncode(file, phrase: 'DATABASE_URL', replace: 'postgres://new/db')
+  do_noncode(file, phrase: 'provider.ollama', replace: '{ "npm": "new-pkg" }')
+  do_noncode(file, phrase: 'server.port', replace: '9090')
+  do_noncode(file, phrase: '## Setup', replace: 'New instructions.\\n')
+  do_noncode(file, phrase: '[database]', replace: 'host = new\\nport = 5432\\n')
   do_noncode(file, phrase: '"tool_call": true', replace: '"tool_call": false')
-  do_noncode(file, phrase: 'very restrictive', replace: 'linguistically aware')
 
-SENTENCE — address by quoting text within a sentence. Scope expands to sentence boundaries (blank lines or structural delimiters).
-  do_noncode(file, sentence: 'The tool only supports', replace: 'The tool supports all four linguistic units.')
+SENTENCE — quote text within a sentence. Scope expands to the smallest independent unit.
+  JSON: comma-delimited entry. YAML: sibling key + children. Env/TOML/Markdown: single line.
+  do_noncode(file, sentence: 'port = 3000', replace: 'port = 9090')
 
-PARAGRAPH — address by quoting text within a paragraph. Scope expands to the full paragraph (between blank lines).
-  do_noncode(file, paragraph: 'Every text file has', replace: 'Text is linguistic hierarchy.\\nWords, phrases, sentences, paragraphs.')
+PARAGRAPH — quote text within a paragraph. Scope expands to the full block.
+  JSON: enclosing { } or [ ]. YAML: indentation block. TOML: [section]. Env/Markdown: blank lines.
+  do_noncode(file, paragraph: 'enabled = true', replace: '[new-section]\\nkey = value\\n')
 
 Omit 'replace' to DELETE the scope. No scope parameter = create/overwrite the whole file.
 
@@ -210,10 +214,10 @@ WORKFLOW: read(file) first → see structure → do_noncode with the right scope
       type: "object" as const,
       properties: {
         file_path: { type: "string", description: "Absolute path to a non-code file." },
-        word: { type: "string", description: "Structural anchor: a heading ('## Setup'), key path ('provider.ollama'), env var ('DATABASE_URL'), section ('[database]'). The word stays; its governed scope is replaced by 'replace'." },
-        phrase: { type: "string", description: "Exact text to find and replace. The quoted span is the scope." },
-        sentence: { type: "string", description: "Text within a sentence. Scope expands to sentence boundaries." },
-        paragraph: { type: "string", description: "Text within a paragraph. Scope expands to paragraph boundaries." },
+        word: { type: "string", description: "A single token to find and swap. Format-agnostic — works on any file. Bounded by spaces/punctuation." },
+        phrase: { type: "string", description: "Structural name OR exact text. For keys/headings/env vars: the name stays, governed scope is replaced. For quoted text: the span is replaced. Use dot notation for nested keys (provider.ollama.models)." },
+        sentence: { type: "string", description: "Text within a sentence. Scope expands to the smallest independent unit — comma entry (JSON), sibling key (YAML), single line (env/TOML/markdown)." },
+        paragraph: { type: "string", description: "Text within a paragraph. Scope expands to the full block — enclosing {} (JSON), indentation block (YAML), [section] (TOML), blank lines (env/markdown)." },
         replace: { type: "string", description: "Replacement content. Omit to delete the scope. No scope parameter = create/overwrite the whole file." },
       },
       required: ["file_path"],
