@@ -630,20 +630,17 @@ const lastAllowedToolsHash = new Map<string, string>();
 // `pennyDelta` piggyback on every prompt hum. Daemon merges into its global
 // counters. Keeps the wire traffic to one field per turn instead of a separate
 // hum tone per event.
-const pendingPenny = {
+const pendingPenny: Record<string, number> = {
   humDedup: 0,
   reminderStripped: 0,
   priorPetalsElided: 0,
+  titleSkipped: 0,
 };
 function flushPenny(): Record<string, number> | undefined {
-  if (pendingPenny.humDedup === 0 && pendingPenny.reminderStripped === 0
-      && pendingPenny.priorPetalsElided === 0) {
-    return undefined;
-  }
+  const hasValue = Object.values(pendingPenny).some(v => v > 0);
+  if (!hasValue) return undefined;
   const snap = { ...pendingPenny };
-  pendingPenny.humDedup = 0;
-  pendingPenny.reminderStripped = 0;
-  pendingPenny.priorPetalsElided = 0;
+  for (const k of Object.keys(pendingPenny)) pendingPenny[k] = 0;
   return snap;
 }
 
@@ -806,6 +803,7 @@ export class ClwndModel implements LanguageModelV3 {
     // Skip title generation entirely - return empty, don't pass to Claude
     if (isTitleGen) {
       trace("title.skip", { method: "doStream", sid });
+      pendingPenny.titleSkipped++;
       return {
         stream: new ReadableStream<LanguageModelV3StreamPart>({
           start(controller) {

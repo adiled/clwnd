@@ -1129,6 +1129,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
             cupped = [];
             cuppedText = "";
             trace("drone.wither", { sid });
+            penny.droneWithers++;
             // Kill process, graft, respawn, re-murmur — all internal
             nest.fell(sid, poolKey);
             session.needsRespawn = true;
@@ -1228,12 +1229,21 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           // Track peak per-turn input context for observability — surfaced
           // by `clwnd savings` and used by the next-prompt warning trace.
           // No destructive action attached: clwnd does not rotate sessions.
+          penny.turns++;
           if (harvest.usage) {
             const u = harvest.usage;
             const turnCtx = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
             if (turnCtx > (session.maxContextTokens ?? 0)) {
               session.maxContextTokens = turnCtx;
             }
+            penny.totalInputTokens += (u.input_tokens ?? 0);
+            penny.totalOutputTokens += (u.output_tokens ?? 0);
+            penny.totalCacheReadTokens += (u.cache_read_input_tokens ?? 0);
+            penny.totalCacheWriteTokens += (u.cache_creation_input_tokens ?? 0);
+          }
+          if (harvest.providerMetadata) {
+            const cost = (harvest.providerMetadata as any).cost;
+            if (typeof cost === "number") penny.totalCost += cost;
           }
           trace("nest.wilt", { sid, finishReason: harvest.finishReason, maxCtx: session.maxContextTokens });
           if (uncup) uncup(); // uncup any remaining petals before finish
@@ -1323,6 +1333,9 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         if (session.claudeSessionPath) {
           try {
             const result = pruneJsonl(session.claudeSessionPath);
+            penny.curateEvents++;
+            penny.curateBytesSaved += result.bytes.before - result.bytes.after;
+            penny.curateThinkingStripped += result.stripped;
             trace("curate.pruned", {
               sid,
               trimmed: result.trimmed,

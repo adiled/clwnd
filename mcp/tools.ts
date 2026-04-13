@@ -1447,6 +1447,7 @@ function execDoNoncode(
     // Don't write corruption to disk — reject and let the agent fix the replacement.
     const validationError = validateStructure(ext, original, next, p);
     if (validationError) {
+      penny.validationRejected++;
       return {
         output: `Error: edit would corrupt ${p}. ${validationError}\nThe file was NOT modified. Fix your replacement and try again.`,
         title: relPath,
@@ -1662,6 +1663,7 @@ async function execBash(args: { command: string; description?: string; timeout?:
   const writeBlock = checkBashWrite(args.command);
   if (writeBlock) {
     trace("bash.write.blocked", { cmd: args.command.slice(0, 100) });
+    penny.bashWriteBlocked++;
     return writeBlock;
   }
   checkPermission("bash", args.command);
@@ -1956,6 +1958,7 @@ export function resolveTendril(callId: string, result: string): boolean {
 async function execTendril(name: string, args: Record<string, unknown>, sessionId?: string): Promise<ToolResult> {
   const callId = `proxy-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   trace("tendril.reach.hold", { tool: name, callId, sid: sessionId });
+  if (name === "task") penny.taskExecutions++;
 
   if (tendrilCallback) tendrilCallback(name, args, callId, sessionId);
 
@@ -1975,6 +1978,7 @@ async function execTendril(name: string, args: Record<string, unknown>, sessionI
 
 export async function executeTool(name: string, args: Record<string, unknown>, _callId?: string, sessionId?: string): Promise<ToolResult> {
   if (name !== "permission_prompt") trace("mcp.tool.executed", { tool: name });
+  penny.toolCalls++;
   switch (name) {
     case "read": return execRead(args as any, sessionId);
     case "do_code": return execDoCode(args as any, sessionId);
