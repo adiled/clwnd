@@ -892,11 +892,13 @@ describe("do_noncode: target", () => {
     expect(after).toContain("SECRET=abc");
   });
 
-  test("delete: phrase in json", async () => {
+  test("delete: phrase in json — key path deletion", async () => {
     const p = seed("delete-json.json", '{\n  "name": "app",\n  "debug": true,\n  "version": "1.0.0"\n}\n');
     await post("read", { file_path: p });
-    await post("do_noncode", { file_path: p, phrase: '"debug": true,\n  ' });
+    // Use key name — comma cleanup handles the structural deletion
+    await post("do_noncode", { file_path: p, phrase: "debug" });
     const after = disk(p);
+    expect(() => JSON.parse(after)).not.toThrow();
     expect(after).not.toContain("debug");
     expect(after).toContain('"name"');
     expect(after).toContain('"version"');
@@ -1051,6 +1053,78 @@ describe("do_noncode: target", () => {
     expect(() => JSON.parse(disk(p))).not.toThrow();
   });
 
+  // ── bug fixes: JSON structural editing ─────────────────────────────
+
+  test("json deletion: removes entry with comma cleanup", async () => {
+    const json = '{\n  "name": "app",\n  "debug": true,\n  "version": "1.0.0"\n}\n';
+    const p = seed("delete-entry.json", json);
+    await post("read", { file_path: p });
+    // Delete middle entry — commas must be cleaned up
+    await post("do_noncode", { file_path: p, phrase: "debug" });
+    const after = disk(p);
+    expect(() => JSON.parse(after)).not.toThrow();
+    expect(after).not.toContain("debug");
+    expect(JSON.parse(after).name).toBe("app");
+    expect(JSON.parse(after).version).toBe("1.0.0");
+  });
+
+  test("json deletion: removes last entry without trailing comma", async () => {
+    const json = '{\n  "name": "app",\n  "version": "1.0.0"\n}\n';
+    const p = seed("delete-last.json", json);
+    await post("read", { file_path: p });
+    await post("do_noncode", { file_path: p, phrase: "version" });
+    const after = disk(p);
+    expect(() => JSON.parse(after)).not.toThrow();
+    expect(after).not.toContain("version");
+    expect(JSON.parse(after).name).toBe("app");
+  });
+
+  test("sentence scope: doesn't merge lines", async () => {
+    const yaml = "server:\n  port: 3000\n  host: localhost\n  debug: true\n";
+    const p = seed("no-merge.yaml", yaml);
+    await post("read", { file_path: p });
+    await post("do_noncode", { file_path: p, sentence: "port: 3000", replace: "  port: 9090" });
+    const after = disk(p);
+    expect(after).toContain("port: 9090\n");
+    expect(after).toContain("  host: localhost\n");
+    // Lines must not be on the same line
+    const lines = after.split("\n");
+    const portLine = lines.find(l => l.includes("9090"));
+    const hostLine = lines.find(l => l.includes("host"));
+    expect(portLine).not.toBe(hostLine);
+  });
+
+  test("json dot-path: nested key doesn't match sibling", async () => {
+    // meta.version should NOT match the top-level "version" key
+    const json = JSON.stringify({
+      version: "1.0.0",
+      meta: { version: "2.0.0", author: "test" }
+    }, null, 2) + "\n";
+    const p = seed("dotpath.json", json);
+    await post("read", { file_path: p });
+    await post("do_noncode", { file_path: p, phrase: "meta.version", replace: '"3.0.0"' });
+    const after = disk(p);
+    expect(() => JSON.parse(after)).not.toThrow();
+    const parsed = JSON.parse(after);
+    expect(parsed.version).toBe("1.0.0"); // top-level untouched
+    expect(parsed.meta.version).toBe("3.0.0"); // nested one changed
+  });
+
+  test("json paragraph: doesn't grab root object", async () => {
+    const json = JSON.stringify({
+      server: { host: "old", port: 3000 },
+      database: { url: "pg://old" }
+    }, null, 2) + "\n";
+    const p = seed("para-nonroot.json", json);
+    await post("read", { file_path: p });
+    const out = await post("do_noncode", { file_path: p, paragraph: '"host"', replace: '{\n    "host": "new",\n    "port": 9090\n  }' });
+    expect(out).toContain("Replaced");
+    const after = disk(p);
+    // database must survive — paragraph should scope to the server object, not root
+    expect(after).toContain("database");
+    expect(after).toContain('"host": "new"');
+  });
+
   test("edit at file start preserves content", async () => {
     const p = seed("edge-start.md", "First line.\nSecond line.\n");
     await post("read", { file_path: p });
@@ -1086,12 +1160,14 @@ describe("do_noncode: target", () => {
     expect(after).toContain("More text.");
   });
 
-  test("empty replace on phrase doesn't corrupt neighbors", async () => {
+  test("empty replace on phrase deletes json entry cleanly", async () => {
     const json = '{\n  "keep": true,\n  "remove": "this",\n  "also_keep": true\n}\n';
     const p = seed("corrupt-empty.json", json);
     await post("read", { file_path: p });
-    await post("do_noncode", { file_path: p, phrase: '"remove": "this",\n  ', replace: "" });
+    // Use key name — comma cleanup handles structural deletion
+    await post("do_noncode", { file_path: p, phrase: "remove" });
     const after = disk(p);
+    expect(() => JSON.parse(after)).not.toThrow();
     expect(after).toContain('"keep": true');
     expect(after).toContain('"also_keep": true');
     expect(after).not.toContain("remove");

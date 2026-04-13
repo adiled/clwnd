@@ -283,16 +283,19 @@ export function resolveParagraph(source: string, quoted: string, filePath: strin
   return pickOccurrence(finder(source, anchor), anchor, occurrence);
 }
 
-/** JSON paragraph: find the innermost enclosing { } or [ ]. */
+/** JSON paragraph: find the innermost NON-ROOT enclosing { } or [ ].
+ *  If the match is directly inside the root object, fall back to blank-line
+ *  expansion — grabbing the root is never useful. */
 function findParagraphJson(source: string, anchor: string): ScopeMatch[] {
   const matches: ScopeMatch[] = [];
   let searchFrom = 0;
   while (true) {
     const idx = source.indexOf(anchor, searchFrom);
     if (idx === -1) break;
-    // Scan backward for nearest unmatched { or [
+    // Find all enclosing { or [ from innermost outward
     let depth = 0;
-    let start = idx;
+    let innerStart = -1;
+    let outerCount = 0;
     let inStr = false;
     for (let i = idx - 1; i >= 0; i--) {
       if (source[i] === '\\' && i > 0 && inStr) continue;
@@ -300,14 +303,25 @@ function findParagraphJson(source: string, anchor: string): ScopeMatch[] {
       if (inStr) continue;
       if (source[i] === '}' || source[i] === ']') depth++;
       if (source[i] === '{' || source[i] === '[') {
-        if (depth === 0) { start = i; break; }
-        depth--;
+        if (depth === 0) {
+          outerCount++;
+          if (outerCount === 1) { innerStart = i; }
+          // Keep going to count how many layers
+        } else {
+          depth--;
+        }
       }
     }
-    // Scan forward for the matching close
-    const end = findJsonValueEnd(source, start);
+    // If innerStart is the root (outerCount === 1), fall back to blank lines
+    if (outerCount <= 1 || innerStart === -1) {
+      const fallback = findParagraphBlankLine(source, anchor);
+      if (fallback.length > 0) matches.push(...fallback);
+      searchFrom = idx + anchor.length;
+      continue;
+    }
+    const end = findJsonValueEnd(source, innerStart);
     if (end !== -1) {
-      matches.push({ startIndex: start, endIndex: end, anchor, scope: "paragraph" });
+      matches.push({ startIndex: innerStart, endIndex: end, anchor, scope: "paragraph" });
     }
     searchFrom = idx + anchor.length;
   }
@@ -506,14 +520,23 @@ function resolveJsonKey(source: string, anchor: string): ScopeMatch | null {
   // Walk the JSON textually — find each key in sequence.
   // Track matchEnd (past the regex match including colon) to avoid
   // finding colons INSIDE key names like "gemma3:4b".
+  // searchLimit constrains each step to the parent's value range so
+  // sibling keys at different depths can't steal the match.
   let searchFrom = 0;
+  let searchLimit = source.length;
   let lastMatchEnd = -1;
   for (const part of parts) {
     const keyPattern = new RegExp(`"${escapeRegex(part)}"\\s*:`);
-    const rest = source.slice(searchFrom);
+    const rest = source.slice(searchFrom, searchLimit);
     const match = keyPattern.exec(rest);
     if (!match) return null;
     lastMatchEnd = searchFrom + match.index + match[0].length;
+    // For nested keys, constrain the next search to within this key's value.
+    // Find the value start, then find its end — that's the search boundary.
+    let vs = lastMatchEnd;
+    while (vs < source.length && /\s/.test(source[vs])) vs++;
+    const ve = findJsonValueEnd(source, vs);
+    if (ve !== -1) searchLimit = ve;
     searchFrom = lastMatchEnd;
   }
   if (lastMatchEnd === -1) return null;

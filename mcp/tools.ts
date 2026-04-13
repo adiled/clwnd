@@ -1408,20 +1408,69 @@ function execDoNoncode(
         : `${scopeParam} '${scopeValue}' not found in ${p}. Read the file first to see its content.`;
       return { output: `Error: ${hint}`, title: relPath };
     }
+    let { startIndex, endIndex } = result.match;
     const match = result.match;
-    // Auto-quote: if replacing a JSON value and the replacement isn't
-    // already a valid JSON value, wrap it in quotes. The agent shouldn't
-    // have to think about JSON escaping.
     const ext = extname(p).toLowerCase();
-    if ((ext === ".json" || ext === ".jsonc") && scopeParam === "phrase" && replaceText.length > 0) {
+    const isJson = ext === ".json" || ext === ".jsonc";
+
+    // JSON phrase: auto-quote unquoted string replacements
+    if (isJson && scopeParam === "phrase" && replaceText.length > 0) {
       const trimmed = replaceText.trim();
       const isJsonValue = /^[{\["0-9\-]/.test(trimmed) || trimmed === "true" || trimmed === "false" || trimmed === "null";
       if (!isJsonValue) {
         replaceText = `"${replaceText.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n")}"`;
       }
     }
-    const before = original.slice(match.startIndex, match.endIndex);
-    const next = original.slice(0, match.startIndex) + replaceText + original.slice(match.endIndex);
+
+    // JSON phrase deletion: widen scope to include key + comma + whitespace.
+    // Deleting a JSON property means removing the entire "key": value entry,
+    // not leaving a keyless orphan with dangling commas.
+    if (isJson && scopeParam === "phrase" && replaceText === "") {
+      // Scan backward past whitespace and key to line start
+      let wideStart = startIndex;
+      // Back past whitespace between colon and value
+      while (wideStart > 0 && /[\s:]/.test(original[wideStart - 1])) wideStart--;
+      // Back past the key (quoted string)
+      if (wideStart > 0 && original[wideStart - 1] === '"') {
+        wideStart--;
+        while (wideStart > 0 && original[wideStart - 1] !== '"') wideStart--;
+        if (wideStart > 0) wideStart--; // past opening quote
+      }
+      // Back past leading whitespace on the line
+      while (wideStart > 0 && original[wideStart - 1] === " ") wideStart--;
+      // Handle comma: either trailing from previous entry or leading on this entry
+      let wideEnd = endIndex;
+      // Forward past trailing comma + whitespace
+      let afterVal = wideEnd;
+      while (afterVal < original.length && /\s/.test(original[afterVal])) afterVal++;
+      if (afterVal < original.length && original[afterVal] === ",") {
+        wideEnd = afterVal + 1;
+        // Also consume the newline after comma
+        while (wideEnd < original.length && /[\s]/.test(original[wideEnd]) && original[wideEnd] !== "\n") wideEnd++;
+        if (wideEnd < original.length && original[wideEnd] === "\n") wideEnd++;
+      } else {
+        // No trailing comma — this is the last entry. Remove leading comma instead.
+        let beforeKey = wideStart;
+        while (beforeKey > 0 && /\s/.test(original[beforeKey - 1])) beforeKey--;
+        if (beforeKey > 0 && original[beforeKey - 1] === ",") {
+          wideStart = beforeKey - 1;
+        }
+        // Consume the newline before this entry
+        if (wideStart > 0 && original[wideStart - 1] === "\n") wideStart--;
+      }
+      startIndex = wideStart;
+      endIndex = wideEnd;
+    }
+
+    // Sentence/paragraph scope: if scope ends with \n and replacement
+    // doesn't, append \n to prevent line merging.
+    const scopeText = original.slice(startIndex, endIndex);
+    if (replaceText.length > 0 && scopeText.endsWith("\n") && !replaceText.endsWith("\n")) {
+      replaceText += "\n";
+    }
+
+    const before = scopeText;
+    const next = original.slice(0, startIndex) + replaceText + original.slice(endIndex);
 
     // Validate: if the file was structurally valid before, it must be valid after.
     // Don't write corruption to disk — reject and let the agent fix the replacement.
