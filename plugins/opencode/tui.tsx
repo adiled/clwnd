@@ -17,10 +17,11 @@ interface DaemonData {
   status: "connected" | "disconnected"
   procs: number
   sessions: number
-  uptimeMin: number
-  readDedup: number
-  bashCapped: number
-  contextWarnings: number
+  dollarsSaved: number
+  compactionsSaved: number
+  corruptionsCaught: number
+  editsBlocked: number
+  jsonlBytesPruned: number
 }
 
 const SOCK_PATH = (() => {
@@ -37,20 +38,22 @@ async function fetchDaemon(): Promise<DaemonData> {
     ])
     const status = (await statusResp.json()) as any
     const savings = (await savingsResp.json()) as any
-    const c = savings.counters ?? {}
+    const est = savings.estimated ?? {}
     return {
       status: "connected",
       procs: (status.procs ?? []).length,
       sessions: status.sessions ?? 0,
-      uptimeMin: Math.round((savings.uptimeMs ?? 0) / 60_000),
-      readDedup: c.readDedupHits ?? 0,
-      bashCapped: c.bashTruncated ?? 0,
-      contextWarnings: c.contextOverThreshold ?? 0,
+      dollarsSaved: est.dollarsSaved ?? 0,
+      compactionsSaved: est.compactionsSaved ?? 0,
+      corruptionsCaught: est.corruptionsCaught ?? 0,
+      editsBlocked: est.editsBlocked ?? 0,
+      jsonlBytesPruned: est.jsonlBytesPruned ?? 0,
     }
   } catch {
     return {
-      status: "disconnected", procs: 0, sessions: 0, uptimeMin: 0,
-      readDedup: 0, bashCapped: 0, contextWarnings: 0,
+      status: "disconnected", procs: 0, sessions: 0,
+      dollarsSaved: 0, compactionsSaved: 0, corruptionsCaught: 0,
+      editsBlocked: 0, jsonlBytesPruned: 0,
     }
   }
 }
@@ -58,8 +61,9 @@ async function fetchDaemon(): Promise<DaemonData> {
 function SidebarView(props: { api: any; session_id: string }) {
   const theme = () => props.api.theme.current
   const [data, setData] = createSignal<DaemonData>({
-    status: "disconnected", procs: 0, sessions: 0, uptimeMin: 0,
-    readDedup: 0, bashCapped: 0, contextWarnings: 0,
+    status: "disconnected", procs: 0, sessions: 0,
+    dollarsSaved: 0, compactionsSaved: 0, corruptionsCaught: 0,
+    editsBlocked: 0, jsonlBytesPruned: 0,
   })
 
   const poll = () => fetchDaemon().then(setData).catch(() => {})
@@ -67,29 +71,22 @@ function SidebarView(props: { api: any; session_id: string }) {
   const timer = setInterval(poll, 10_000)
   onCleanup(() => clearInterval(timer))
 
-  const statusLine = createMemo(() => {
-    const d = data()
-    const dot = d.status === "connected" ? "●" : "○"
-    return `${dot} ${d.status} · ${String(d.uptimeMin)}m`
-  })
-
-  const procsLine = createMemo(() => {
-    const d = data()
-    return `${String(d.procs)} proc${d.procs !== 1 ? "s" : ""} · ${String(d.sessions)} session${d.sessions !== 1 ? "s" : ""}`
-  })
-
-  const savingsLine = createMemo(() => {
-    const d = data()
-    if (d.readDedup === 0 && d.bashCapped === 0) return ""
-    return `saved: ${String(d.readDedup)} dedup · ${String(d.bashCapped)} capped`
-  })
-
-  // green = active procs, secondary = idle (connected, nothing running), muted = disconnected
   const dotColor = createMemo(() => {
     const d = data()
     if (d.status === "disconnected") return theme().textMuted
     if (d.procs > 0) return theme().success
     return theme().secondary
+  })
+
+  const savingsLine = createMemo(() => {
+    const d = data()
+    if (d.dollarsSaved === 0 && d.compactionsSaved === 0 && d.corruptionsCaught === 0 && d.editsBlocked === 0) return ""
+    const parts: string[] = []
+    if (d.dollarsSaved > 0) parts.push(`$${String(d.dollarsSaved)} saved`)
+    if (d.compactionsSaved > 0) parts.push(`${String(d.compactionsSaved)} compaction${d.compactionsSaved > 1 ? "s" : ""} skipped`)
+    if (d.corruptionsCaught > 0) parts.push(`${String(d.corruptionsCaught)} corruption${d.corruptionsCaught > 1 ? "s" : ""} caught`)
+    if (d.editsBlocked > 0) parts.push(`${String(d.editsBlocked)} bad edit${d.editsBlocked > 1 ? "s" : ""} blocked`)
+    return parts.join(" · ")
   })
 
   return (
@@ -101,9 +98,11 @@ function SidebarView(props: { api: any; session_id: string }) {
         {" "}
         <span>{VERSION}</span>
       </text>
-      <text fg={theme().textMuted}>{procsLine()}</text>
+      <text fg={theme().textMuted}>
+        {`${String(data().procs)} proc${data().procs !== 1 ? "s" : ""} · ${String(data().sessions)} session${data().sessions !== 1 ? "s" : ""}`}
+      </text>
       <Show when={savingsLine() !== ""}>
-        <text fg={theme().textMuted}>{savingsLine()}</text>
+        <text fg={theme().success}>{savingsLine()}</text>
       </Show>
     </box>
   )

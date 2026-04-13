@@ -1530,7 +1530,29 @@ const httpServer = createHttpServer(async (req, res) => {
     }
     sessionCtx.sort((a, b) => b.maxContextTokens - a.maxContextTokens);
     pennySave(PENNY_FILE);
-    return jsonResponse(res, { uptimeMs: Date.now() - penny.started, counters: penny, contextWarnThreshold: CONTEXT_WARN_THRESHOLD, topContextSessions: sessionCtx.slice(0, 10) });
+    // Estimate dollars saved — conservative, based on sonnet pricing
+    const INPUT_PRICE = 3 / 1_000_000;   // $3/MTok
+    const OUTPUT_PRICE = 15 / 1_000_000;  // $15/MTok
+    const COMPACTION_OUTPUT_TOKENS = 2000;
+    // Average context at compaction time — use top session as proxy
+    const avgCtx = sessionCtx.length > 0 ? sessionCtx[0].maxContextTokens : 150_000;
+    const compactionSaved = penny.curateEvents * (avgCtx * INPUT_PRICE + COMPACTION_OUTPUT_TOKENS * OUTPUT_PRICE);
+    // JSONL bytes pruned → tokens not cache-read on subsequent turns
+    const pruneSaved = (penny.curateBytesSaved / 4) * 0.3 / 1_000_000 * penny.turns; // cache-read price × turns after prune
+    const estimatedSaved = compactionSaved + pruneSaved;
+    return jsonResponse(res, {
+      uptimeMs: Date.now() - penny.started,
+      counters: penny,
+      estimated: {
+        dollarsSaved: Math.round(estimatedSaved * 100) / 100,
+        compactionsSaved: penny.curateEvents,
+        corruptionsCaught: penny.droneWithers,
+        editsBlocked: penny.validationRejected + penny.bashWriteBlocked,
+        jsonlBytesPruned: penny.curateBytesSaved,
+      },
+      contextWarnThreshold: CONTEXT_WARN_THRESHOLD,
+      topContextSessions: sessionCtx.slice(0, 10),
+    });
   }
 
   if (req.method === "POST" && url.pathname === "/savings/reset") {
