@@ -1085,6 +1085,100 @@ function isCodeFile(filePath: string): boolean {
   return CODE_EXTENSIONS.has(extname(filePath).toLowerCase());
 }
 
+// ─── Post-edit structural validation ─────────────────────────────────────
+// If the file was valid before the edit, it must be valid after.
+// Returns an error message if corrupted, null if OK.
+
+function validateStructure(ext: string, before: string, after: string, filePath: string): string | null {
+  switch (ext) {
+    case ".json": case ".jsonc":
+      return validateJson(before, after);
+    case ".yaml": case ".yml":
+      return validateYaml(before, after);
+    case ".toml":
+      return validateToml(before, after);
+    case ".env":
+      return validateEnv(before, after, filePath);
+    default: {
+      const base = filePath.split("/").pop() ?? "";
+      if (base.startsWith(".env")) return validateEnv(before, after, filePath);
+      return null; // no validation for generic text
+    }
+  }
+}
+
+function validateJson(before: string, after: string): string | null {
+  // Only validate if the original was valid JSON
+  try { JSON.parse(before); } catch { return null; }
+  try { JSON.parse(after); return null; } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return `Result is invalid JSON: ${msg}`;
+  }
+}
+
+function validateYaml(_before: string, after: string): string | null {
+  // Lightweight YAML integrity: check for tab/space mixing, unbalanced quotes, bare colons
+  const lines = after.split("\n");
+  let hasSpaces = false;
+  let hasTabs = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
+    const indent = line.match(/^(\s*)/)?.[1] ?? "";
+    if (indent.includes("\t")) hasTabs = true;
+    if (indent.includes(" ")) hasSpaces = true;
+    // Check for obviously broken structure: line with content but no key pattern
+    // and not indented under a list (- item) or block scalar (| or >)
+    if (indent.length === 0 && !line.includes(":") && !line.startsWith("---") && !line.startsWith("...") && !line.startsWith("-") && !line.startsWith("%")) {
+      return `Line ${i + 1} has no key: pattern and is not a valid YAML construct: "${line.slice(0, 60)}"`;
+    }
+  }
+  if (hasTabs && hasSpaces) {
+    return "Mixed tabs and spaces in indentation — YAML requires consistent whitespace.";
+  }
+  return null;
+}
+
+function validateToml(_before: string, after: string): string | null {
+  const lines = after.split("\n");
+  let inMultilineString = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (inMultilineString) {
+      if (line.includes('"""') || line.includes("'''")) inMultilineString = false;
+      continue;
+    }
+    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
+    // Section header
+    if (line.trimStart().startsWith("[")) {
+      if (!/^\s*\[\[?[^\]]+\]\]?\s*(#.*)?$/.test(line)) {
+        return `Line ${i + 1} has malformed section header: "${line.slice(0, 60)}"`;
+      }
+      continue;
+    }
+    // Key = value
+    if (!line.includes("=") && !line.trimStart().startsWith("]")) {
+      return `Line ${i + 1} is not a valid key = value or section header: "${line.slice(0, 60)}"`;
+    }
+    if (line.includes('"""') || line.includes("'''")) inMultilineString = true;
+  }
+  return null;
+}
+
+function validateEnv(_before: string, after: string, _filePath: string): string | null {
+  const lines = after.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
+    // Strip optional export prefix
+    const stripped = line.replace(/^\s*export\s+/, "");
+    if (!stripped.includes("=")) {
+      return `Line ${i + 1} is not a valid KEY=value assignment: "${line.slice(0, 60)}"`;
+    }
+  }
+  return null;
+}
+
 // Session touch helper — invalidates the read cache for the path and
 // refreshes the session-touched baseline so subsequent edits see the
 // new content as their basis. Used by every successful code/non-code write.
@@ -1328,6 +1422,17 @@ function execDoNoncode(
     }
     const before = original.slice(match.startIndex, match.endIndex);
     const next = original.slice(0, match.startIndex) + replaceText + original.slice(match.endIndex);
+
+    // Validate: if the file was structurally valid before, it must be valid after.
+    // Don't write corruption to disk — reject and let the agent fix the replacement.
+    const validationError = validateStructure(ext, original, next, p);
+    if (validationError) {
+      return {
+        output: `Error: edit would corrupt ${p}. ${validationError}\nThe file was NOT modified. Fix your replacement and try again.`,
+        title: relPath,
+      };
+    }
+
     writeFileSync(p, next);
     recordWrite(p, sessionId, next);
 

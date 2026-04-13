@@ -1002,6 +1002,55 @@ describe("do_noncode: target", () => {
     expect(() => JSON.parse(after)).not.toThrow();
   });
 
+  // ── validation: reject corrupting edits ────────────────────────────
+
+  test("json: rejects edit that would produce invalid json", async () => {
+    const json = '{\n  "name": "app",\n  "version": "1.0.0"\n}\n';
+    const p = seed("reject-json.json", json);
+    await post("read", { file_path: p });
+    // Force a corrupting edit by using exact phrase with broken replacement
+    const out = await post("do_noncode", { file_path: p, phrase: '"name": "app"', replace: '"name": app' });
+    expect(out).toMatch(/corrupt|invalid JSON/i);
+    // File must be unchanged
+    expect(disk(p)).toBe(json);
+  });
+
+  test("yaml: rejects mixed tabs and spaces", async () => {
+    const yaml = "server:\n  port: 3000\n  host: localhost\n";
+    const p = seed("reject-yaml.yaml", yaml);
+    await post("read", { file_path: p });
+    const out = await post("do_noncode", { file_path: p, phrase: "  port: 3000", replace: "\tport: 3000" });
+    expect(out).toMatch(/corrupt|tabs.*spaces/i);
+    expect(disk(p)).toBe(yaml);
+  });
+
+  test("toml: rejects broken section header", async () => {
+    const toml = "[server]\nport = 3000\n";
+    const p = seed("reject-toml.toml", toml);
+    await post("read", { file_path: p });
+    const out = await post("do_noncode", { file_path: p, phrase: "[server]", replace: "[server" });
+    expect(out).toMatch(/corrupt|malformed/i);
+    expect(disk(p)).toBe(toml);
+  });
+
+  test("env: rejects line without =", async () => {
+    const env = "HOST=localhost\nPORT=3000\n";
+    const p = seed("reject-env.env", env);
+    await post("read", { file_path: p });
+    const out = await post("do_noncode", { file_path: p, phrase: "PORT=3000", replace: "PORT 3000" });
+    expect(out).toMatch(/corrupt|KEY=value/i);
+    expect(disk(p)).toBe(env);
+  });
+
+  test("valid edit passes validation and writes", async () => {
+    const json = '{\n  "name": "old"\n}\n';
+    const p = seed("valid-edit.json", json);
+    await post("read", { file_path: p });
+    const out = await post("do_noncode", { file_path: p, phrase: "name", replace: "new name here" });
+    expect(out).toContain("Replaced");
+    expect(() => JSON.parse(disk(p))).not.toThrow();
+  });
+
   test("edit at file start preserves content", async () => {
     const p = seed("edge-start.md", "First line.\nSecond line.\n");
     await post("read", { file_path: p });
