@@ -102,7 +102,7 @@ function SidebarView(props: { api: any; session_id: string }) {
         {`${String(data().procs)} proc${data().procs !== 1 ? "s" : ""} · ${String(data().sessions)} session${data().sessions !== 1 ? "s" : ""}`}
       </text>
       <Show when={savingsLine() !== ""}>
-        <text fg={theme().success}>{savingsLine()}</text>
+        <text fg={data().dollarsSaved > 0 ? theme().success : theme().textMuted}>{savingsLine()}</text>
       </Show>
     </box>
   )
