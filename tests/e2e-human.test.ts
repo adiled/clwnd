@@ -1,4 +1,4 @@
-import { describe, test } from "bun:test";
+import { describe, test } from "vitest";
 
 // These tests CANNOT be automated — they require human eyes on the TUI.
 // Run: bun test tests/e2e-human.test.ts

@@ -38,7 +38,7 @@ export default defineConfig({
   format: "esm",
   platform: "node",
   target: "node18",
-  external: ["bun", "bun:sqlite", ...TREE_SITTER_GRAMMARS],
+  external: ["better-sqlite3", ...TREE_SITTER_GRAMMARS],
   // tsup doesn't copy non-source files. lib/queries/*.scm is loaded by
   // lib/ast.ts at runtime via require/readFileSync — without this hook
   // the daemon would crash on first .cpp/.bash/.java edit because the

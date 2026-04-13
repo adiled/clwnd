@@ -5,7 +5,7 @@
 
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync } from "fs";
 import { randomUUID } from "crypto";
-import { Database as BunDatabase } from "bun:sqlite";
+import Database from "better-sqlite3";
 import { trace } from "../log.ts";
 import { join } from "path";
 
@@ -133,19 +133,19 @@ export function readOcMessages(sessionId: string): Array<{ info: OcMessageInfo &
     trace("oc.db.missing", { path: OC_DB_PATH });
     return [];
   }
-  const db = new BunDatabase(OC_DB_PATH, { readonly: true });
+  const db = new Database(OC_DB_PATH, { readonly: true });
   try {
-    const msgs = db.query<OcMessageRow, [string]>(
+    const msgs = db.prepare(
       "SELECT id, session_id, data FROM message WHERE session_id = ? ORDER BY time_created, id"
-    ).all(sessionId);
+    ).all(sessionId) as OcMessageRow[];
 
     const msgIds = msgs.map(m => m.id);
     const partsByMsg = new Map<string, OcPartData[]>();
     if (msgIds.length > 0) {
       const placeholders = msgIds.map(() => "?").join(",");
-      const parts = db.query<OcPartRow, string[]>(
+      const parts = db.prepare(
         `SELECT id, message_id, data FROM part WHERE message_id IN (${placeholders}) ORDER BY message_id, id`
-      ).all(...msgIds);
+      ).all(...msgIds) as OcPartRow[];
       for (const p of parts) {
         const parsed = JSON.parse(p.data) as OcPartData;
         const list = partsByMsg.get(p.message_id);

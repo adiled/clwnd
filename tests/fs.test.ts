@@ -8,7 +8,7 @@
  * Requires: daemon running on port 29147 (./dev deploys + restarts it).
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { readFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 

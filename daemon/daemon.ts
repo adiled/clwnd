@@ -1,4 +1,5 @@
-import { spawn, type FileSink } from "bun";
+import { spawn as nodeSpawn, spawnSync as nodeSpawnSync, type ChildProcess } from "node:child_process";
+import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { existsSync, unlinkSync, mkdirSync, writeFileSync, readFileSync } from "fs";
 import { randomUUID } from "crypto";
 import { dirname, join } from "path";
@@ -49,10 +50,10 @@ function parseLine(line: string): unknown {
 
 interface RoostProc {
   pid: number | undefined;
-  stdin: FileSink;
-  stdout: ReadableStream<Uint8Array>;
-  stderr: ReadableStream<Uint8Array>;
-  kill(signal?: number): void;
+  stdin: { write(data: string): boolean };
+  stdout: import("node:stream").Readable;
+  stderr: import("node:stream").Readable;
+  kill(signal?: number | string): void;
   exited: Promise<number>;
 }
 
@@ -292,8 +293,7 @@ class ClaudeNest {
       cmd.push("--resume", claudeSessionId);
     }
     const spawnCwd = sessionCwd ?? process.env.CLWND_CWD ?? process.env.HOME ?? "/";
-    const proc = spawn({
-      cmd,
+    const proc = nodeSpawn(cmd[0], cmd.slice(1), {
       cwd: spawnCwd,
       env: {
         ...process.env,
@@ -303,18 +303,15 @@ class ClaudeNest {
         CLAUDE_CODE_DISABLE_FAST_MODE: "1",     // fast mode costs 6x — we control the model
         DISABLE_INTERLEAVED_THINKING: "1",      // reduces context overhead from interleaved thinking blocks
       },
-      stdout: "pipe",
-      stdin: "pipe",
-      stderr: "pipe",
+      stdio: ["pipe", "pipe", "pipe"],
     });
-    // Bun spawn with stdin/stdout/stderr: "pipe" — narrow the proc shape
     const roostProc: RoostProc = {
       pid: proc.pid,
-      stdin: proc.stdin as FileSink,
-      stdout: proc.stdout as ReadableStream<Uint8Array>,
-      stderr: proc.stderr as ReadableStream<Uint8Array>,
-      kill: (signal?: number) => proc.kill(signal),
-      exited: proc.exited,
+      stdin: proc.stdin!,
+      stdout: proc.stdout!,
+      stderr: proc.stderr!,
+      kill: (signal?) => proc.kill(signal as any),
+      exited: new Promise<number>(resolve => proc.on("exit", (code) => resolve(code ?? 1))),
     };
 
     const roost: Roost = { proc: roostProc, listeners: new Map(), activeSid: null };
@@ -346,45 +343,29 @@ class ClaudeNest {
   }
 
   private readStderr(proc: RoostProc, modelId: string): void {
-    const reader = proc.stderr.getReader();
-    const dec = new TextDecoder();
-    (async () => {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const text = dec.decode(value!, { stream: true });
-          if (text.trim()) trace("nest.stderr", { poolKey: modelId, text: text.trim() });
-        }
-      } catch {}
-    })();
+    proc.stderr.on("data", (chunk: Buffer) => {
+      const text = chunk.toString().trim();
+      if (text) trace("nest.stderr", { poolKey: modelId, text });
+    });
   }
 
   private readLoop(proc: RoostProc, poolKey: string, roost: Roost): void {
-    const reader = proc.stdout.getReader();
-    const dec = new TextDecoder();
     let nectar = "";
-
-    (async () => {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          nectar += dec.decode(value!, { stream: true });
-          const lines = nectar.split("\n");
-          nectar = lines.pop() ?? "";
-          for (const line of lines) {
-            if (line.trim()) this.dispatchLine(poolKey, roost, parseLine(line));
-          }
-        }
-      } catch (err) {
-        trace("nest.readloop.failed", { err: String(err) });
-        for (const listener of roost.listeners.values()) {
-          try { listener.onThorn(`readLoop error: ${err}`); } catch {}
-        }
-        roost.listeners.clear();
+    proc.stdout.on("data", (chunk: Buffer) => {
+      nectar += chunk.toString();
+      const lines = nectar.split("\n");
+      nectar = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.trim()) this.dispatchLine(poolKey, roost, parseLine(line));
       }
-    })();
+    });
+    proc.stdout.on("error", (err) => {
+      trace("nest.readloop.failed", { err: String(err) });
+      for (const listener of roost.listeners.values()) {
+        try { listener.onThorn(`readLoop error: ${err}`); } catch {}
+      }
+      roost.listeners.clear();
+    });
   }
 
   // Track whether we've seen streaming content blocks for this turn
@@ -1490,91 +1471,81 @@ humServer.listen(HUM, () => {
   info("hum.listening", { path: HUM });
 });
 
-Bun.serve({
-  unix: HTTP,
-  fetch(req) {
-    const url = new URL(req.url);
+function jsonResponse(res: ServerResponse, data: unknown, status = 200): void {
+  const body = JSON.stringify(data);
+  res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
+  res.end(body);
+}
 
-    if (req.method === "GET" && url.pathname === "/status") {
-      // Drone state — the post-mortem you never need
-      const droneStates: Record<string, unknown> = {};
-      for (const [s, state] of drone.inspect()) {
-        // Only show active drone states
-        if (state.localWane === 0 && state.remoteWane === 0 && state.missedBeats === 0) continue;
-        droneStates[s] = {
-          assessment: state.assessment,
-          rhythm: state.rhythm,
-          localWane: state.localWane,
-          remoteWane: state.remoteWane,
-          missedBeats: state.missedBeats,
-          pendingEchoes: state.pendingEchoes.size,
-          inflightTools: state.inflightTools,
-          pendingPermissions: state.pendingPermissions,
-          suspicious: state.suspicious,
-        };
-      }
-      return Response.json({
-        pid: process.pid,
-        procs: nest.survey(),
-        sessions: sessions.size,
-        drone: droneStates,
-      });
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
+
+const httpServer = createHttpServer(async (req, res) => {
+  const url = new URL(req.url ?? "/", "http://localhost");
+
+  if (req.method === "GET" && url.pathname === "/status") {
+    const droneStates: Record<string, unknown> = {};
+    for (const [s, state] of drone.inspect()) {
+      if (state.localWane === 0 && state.remoteWane === 0 && state.missedBeats === 0) continue;
+      droneStates[s] = {
+        assessment: state.assessment, rhythm: state.rhythm,
+        localWane: state.localWane, remoteWane: state.remoteWane,
+        missedBeats: state.missedBeats, pendingEchoes: state.pendingEchoes.size,
+        inflightTools: state.inflightTools, pendingPermissions: state.pendingPermissions,
+        suspicious: state.suspicious,
+      };
     }
+    return jsonResponse(res, { pid: process.pid, procs: nest.survey(), sessions: sessions.size, drone: droneStates });
+  }
 
-    // /savings — penny-pincher counters (lifetime, persisted across restarts)
-    if (req.method === "GET" && url.pathname === "/savings") {
-      const sessionCtx: Array<{ sid: string; maxContextTokens: number }> = [];
-      for (const [sid, sess] of sessions) {
-        if (sess.maxContextTokens && sess.maxContextTokens > 0) {
-          sessionCtx.push({ sid, maxContextTokens: sess.maxContextTokens });
+  if (req.method === "GET" && url.pathname === "/savings") {
+    const sessionCtx: Array<{ sid: string; maxContextTokens: number }> = [];
+    for (const [sid, sess] of sessions) {
+      if (sess.maxContextTokens && sess.maxContextTokens > 0) sessionCtx.push({ sid, maxContextTokens: sess.maxContextTokens });
+    }
+    sessionCtx.sort((a, b) => b.maxContextTokens - a.maxContextTokens);
+    pennySave(PENNY_FILE);
+    return jsonResponse(res, { uptimeMs: Date.now() - penny.started, counters: penny, contextWarnThreshold: CONTEXT_WARN_THRESHOLD, topContextSessions: sessionCtx.slice(0, 10) });
+  }
+
+  if (req.method === "POST" && url.pathname === "/savings/reset") {
+    pennyReset(); pennySave(PENNY_FILE);
+    return jsonResponse(res, { ok: true, resetAt: penny.started });
+  }
+
+  if (req.method === "GET" && url.pathname === "/sessions") {
+    const out: Record<string, unknown> = {};
+    for (const [sid, s] of sessions) out[sid] = s;
+    return jsonResponse(res, out);
+  }
+
+  if (req.method === "POST" && url.pathname === "/") {
+    try {
+      const body = JSON.parse(await readBody(req)) as { action: string; opencodeSessionId: string };
+      if (body.action === "cleanup") {
+        const session = sessions.get(body.opencodeSessionId);
+        if (session) {
+          nest.fell(body.opencodeSessionId, body.opencodeSessionId);
+          releaseDroneSession(sigil(body.opencodeSessionId));
+          sessions.delete(body.opencodeSessionId);
+          saveSessions(body.opencodeSessionId);
+          trace("session.cleaned", { sid: body.opencodeSessionId });
         }
       }
-      sessionCtx.sort((a, b) => b.maxContextTokens - a.maxContextTokens);
-      // Snapshot disk on every query so `clwnd savings` always reflects the
-      // freshest counters even between the 60s periodic writes.
-      pennySave(PENNY_FILE);
-      return Response.json({
-        uptimeMs: Date.now() - penny.started,
-        counters: penny,
-        contextWarnThreshold: CONTEXT_WARN_THRESHOLD,
-        topContextSessions: sessionCtx.slice(0, 10),
-      });
-    }
+      res.writeHead(200); res.end("ok");
+    } catch { res.writeHead(400); res.end("error"); }
+    return;
+  }
 
-    // /savings/reset — zero the counters (and persist)
-    if (req.method === "POST" && url.pathname === "/savings/reset") {
-      pennyReset();
-      pennySave(PENNY_FILE);
-      return Response.json({ ok: true, resetAt: penny.started });
-    }
-
-    if (req.method === "GET" && url.pathname === "/sessions") {
-      const out: Record<string, unknown> = {};
-      for (const [sid, s] of sessions) out[sid] = s;
-      return Response.json(out);
-    }
-
-    // Cleanup — tests use this to tear down sessions
-    if (req.method === "POST" && url.pathname === "/") {
-      return req.json().then((raw: unknown) => {
-        const body = raw as { action: string; opencodeSessionId: string };
-        if (body.action === "cleanup") {
-          const session = sessions.get(body.opencodeSessionId);
-          if (session) {
-            nest.fell(body.opencodeSessionId, body.opencodeSessionId);
-            releaseDroneSession(sigil(body.opencodeSessionId));
-            sessions.delete(body.opencodeSessionId);
-            saveSessions(body.opencodeSessionId);
-            trace("session.cleaned", { sid: body.opencodeSessionId });
-          }
-        }
-        return new Response("ok");
-      }).catch(() => new Response("error", { status: 400 }));
-    }
-
-    return new Response("clwnd", { status: 200 });
-  },
+  res.writeHead(200); res.end("clwnd");
 });
+httpServer.listen(HTTP, () => { info("http.listening", { path: HTTP }); });
 
 // ─── MCP HTTP Server (persistent, no cold start) ────────────────────────────
 
@@ -1590,19 +1561,15 @@ const MCP_PORT = parseInt(process.env.CLWND_MCP_PORT ?? "29147");
 
 const MCP_HOST = process.env.CLWND_HOST ?? "127.0.0.1";
 
-const mcpServer = Bun.serve({
-  port: MCP_PORT,
-  hostname: MCP_HOST,
-  async fetch(req) {
-    const url = new URL(req.url);
+const mcpServer = createHttpServer(async (req, res) => {
+  const url = new URL(req.url ?? "/", `http://${MCP_HOST}:${MCP_PORT}`);
 
-    // PreToolUse hook calls this to check permissions
-    if (req.method === "POST" && url.pathname === "/permission-check") {
-      try {
-        const body = await req.json() as { tool_name?: string; tool_input?: Record<string, unknown>; session_id?: string };
-        const toolName = ((body.tool_name ?? "") as string).replace("mcp__clwnd__", "");
-        const path = (body.tool_input?.file_path ?? body.tool_input?.path) as string | undefined;
-        const sessionId = body.session_id as string;
+  if (req.method === "POST" && url.pathname === "/permission-check") {
+    try {
+      const body = JSON.parse(await readBody(req)) as { tool_name?: string; tool_input?: Record<string, unknown>; session_id?: string };
+      const toolName = ((body.tool_name ?? "") as string).replace("mcp__clwnd__", "");
+      const path = (body.tool_input?.file_path ?? body.tool_input?.path) as string | undefined;
+      const sessionId = body.session_id as string;
 
         // Find OC session for this Claude session
         let ocSessionId: string | undefined;
@@ -1616,31 +1583,21 @@ const mcpServer = Bun.serve({
         const action = getPermissionAction(toolName, path);
         trace("permission.hook.checked", { tool: toolName, path, action, ocSid: ocSessionId });
 
-        // Claude CLI hook response format
-        const hookAllow = () => Response.json({
+        const hookAllow = () => jsonResponse(res, {
           hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
         });
-        const hookDeny = (reason: string) => Response.json({
+        const hookDeny = (reason: string) => jsonResponse(res, {
           hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
         });
 
         if (action === "allow") return hookAllow();
         if (action === "deny") return hookDeny("Denied by session permission rules");
-
-        // "ask" — treated as allow until a viable UX solution is found.
-        // Infrastructure exists (CLWND_PERMIT_HOLD, /release-permit-hold)
-        // but OC's session lock prevents in-band user interaction during a turn.
-        // See PERMISSION_ASK_PROPOSAL.md for investigation history.
         if (action === "ask") return hookAllow();
 
-        // TODO: hold this response, expose via /permission-pending,
-        // wait for /permission-respond to resolve it
         const askId = randomUUID();
         trace("permission.hold.created", { id: askId, tool: toolName, path });
-
         hum(ocSessionId ?? sessionId, { chi: "permission-ask", askId, tool: toolName, path, input: body.tool_input ?? {}, dusk: Date.now() + cfg.permissionDusk });
 
-        // Hold until /permission-respond resolves this, or timeout
         const decision = await new Promise<"allow" | "deny">((resolve) => {
           CLWND_PERMIT_HOLD.set(askId, { resolve, tool: toolName, path, sessionId: ocSessionId ?? sessionId });
           setTimeout(() => {
@@ -1656,57 +1613,53 @@ const mcpServer = Bun.serve({
         return decision === "allow" ? hookAllow() : hookDeny("Denied by user");
       } catch (e) {
         trace("permission.hook.failed", { err: String(e) });
-        return Response.json({
+        return jsonResponse(res, {
           hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Permission check failed" },
         });
       }
     }
 
-    // GET /permission-pending — list active permit holds
     if (req.method === "GET" && url.pathname === "/permission-pending") {
       const pending = Array.from(CLWND_PERMIT_HOLD.entries()).map(([id, p]) => ({
         id, tool: p.tool, path: p.path, sessionId: p.sessionId,
       }));
-      return Response.json(pending);
+      return jsonResponse(res, pending);
     }
 
-    // POST /permission-respond — release a permit hold
     if (req.method === "POST" && url.pathname === "/permission-respond") {
       try {
-        const body = await req.json() as { id?: string; decision: "allow" | "deny" };
-        // If no id, resolve the first pending
+        const body = JSON.parse(await readBody(req)) as { id?: string; decision: "allow" | "deny" };
         const id = body.id ?? CLWND_PERMIT_HOLD.keys().next().value;
         if (!id || !CLWND_PERMIT_HOLD.has(id as string)) {
-          return Response.json({ error: "no active permit hold" }, { status: 404 });
+          return jsonResponse(res, { error: "no active permit hold" }, 404);
         }
         const hold = CLWND_PERMIT_HOLD.get(id as string)!;
         CLWND_PERMIT_HOLD.delete(id as string);
         hold.resolve(body.decision);
         trace("permission.responded", { id, decision: body.decision });
-        return Response.json({ ok: true });
+        return jsonResponse(res, { ok: true });
       } catch {
-        return Response.json({ error: "bad request" }, { status: 400 });
+        return jsonResponse(res, { error: "bad request" }, 400);
       }
     }
 
-    // MCP JSON-RPC — extract session ID from /s/{poolKey} path
-    if (req.method !== "POST") return new Response("clwnd-mcp", { status: 200 });
+    if (req.method !== "POST") { res.writeHead(200); res.end("clwnd-mcp"); return; }
     const mcpSessionId = url.pathname.match(/^\/s\/([^/]+)/)?.[1] ?? undefined;
     try {
-      const body = await req.json() as { jsonrpc: string; id?: number | string; method: string; params?: unknown };
+      const body = JSON.parse(await readBody(req)) as { jsonrpc: string; id?: number | string; method: string; params?: unknown };
       trace("mcp.request.received", { method: body.method, sid: mcpSessionId });
       const result = await handleMcpRequest(body, mcpSessionId);
-      if (!result) return new Response("", { status: 204 });
-      return Response.json(result);
+      if (!result) { res.writeHead(204); res.end(); return; }
+      return jsonResponse(res, result);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       trace("mcp.request.failed", { err: msg });
-      return Response.json({ jsonrpc: "2.0", error: { code: -32700, message: msg } });
+      return jsonResponse(res, { jsonrpc: "2.0", error: { code: -32700, message: msg } });
     }
-  },
-});
+  });
+  mcpServer.listen(MCP_PORT, MCP_HOST, () => { info("mcp.listening", { port: MCP_PORT, host: MCP_HOST }); });
 
-const MCP_URL = `http://${MCP_HOST}:${mcpServer.port}`;
+const MCP_URL = `http://${MCP_HOST}:${MCP_PORT}`;
 mcpSetCwd(process.env.CLWND_CWD ?? process.env.HOME ?? "/");
 
 // Wire permission prompt MCP tool to daemon's permission logic
@@ -1795,29 +1748,22 @@ const CURRENT_VERSION = (() => {
 async function checkForUpdate(): Promise<void> {
   try {
     // Check if gh is available
-    const which = Bun.spawnSync({ cmd: ["which", "gh"], stdout: "pipe", stderr: "pipe" });
-    if (which.exitCode !== 0) return;
+    const which = nodeSpawnSync("which", ["gh"], { stdio: ["pipe", "pipe", "pipe"] });
+    if (which.status !== 0) return;
 
-    const result = Bun.spawnSync({
-      cmd: ["gh", "release", "view", "--repo", "adiled/clwnd", "--json", "tagName", "-q", ".tagName"],
-      stdout: "pipe",
-      stderr: "pipe",
+    const result = nodeSpawnSync("gh", ["release", "view", "--repo", "adiled/clwnd", "--json", "tagName", "-q", ".tagName"], {
+      stdio: ["pipe", "pipe", "pipe"],
     });
-    if (result.exitCode !== 0) return;
+    if (result.status !== 0) return;
 
     const latest = result.stdout.toString().trim().replace(/^v/, "");
     if (!latest || latest === CURRENT_VERSION) return;
 
     info("update-available", { current: CURRENT_VERSION, latest });
 
-    // Invoke clwnd update
     const clwndBin = join(process.env.HOME ?? "/", ".local", "bin", "clwnd");
-    const update = Bun.spawn({
-      cmd: [clwndBin, "update"],
-      stdout: "inherit",
-      stderr: "inherit",
-    });
-    await update.exited;
+    const update = nodeSpawn(clwndBin, ["update"], { stdio: "inherit" });
+    await new Promise<void>(resolve => update.on("exit", () => resolve()));
   } catch {}
 }
 

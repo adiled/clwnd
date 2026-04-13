@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll, afterEach } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { spawn, type Subprocess } from "bun";
 import { existsSync, rmSync, mkdirSync, readFileSync } from "fs";
 import { join } from "path";

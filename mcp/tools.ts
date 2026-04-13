@@ -1672,42 +1672,23 @@ async function execBash(args: { command: string; description?: string; timeout?:
   let exitCode: number | null = 0;
 
   try {
-    // Bun spawn for streamed stdout/stderr. Two ReadableStream drains pump
-    // into per-stream ring buffers concurrently, so a command that emits
-    // 100MB over 5 minutes keeps only the last 1MB per stream in memory —
-    // no 10MB maxBuffer cliff, no middle-of-output loss, no OOM.
-    const proc = spawnProc({
-      cmd: ["/bin/bash", "-lc", args.command],
+    const proc = spawnProc("/bin/bash", ["-lc", args.command], {
       cwd: CWD,
       env: { ...process.env, TERM: "dumb" },
-      stdout: "pipe",
-      stderr: "pipe",
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
-    const drain = async (stream: ReadableStream<Uint8Array> | undefined, onChunk: (s: string) => void) => {
-      if (!stream) return;
-      const reader = stream.getReader();
-      const decoder = new TextDecoder();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) onChunk(decoder.decode(value, { stream: true }));
-      }
-    };
+    proc.stdout?.on("data", (chunk: Buffer) => { stdout = appendRing(stdout, chunk.toString()); });
+    proc.stderr?.on("data", (chunk: Buffer) => { stderr = appendRing(stderr, chunk.toString()); });
 
     const timer = setTimeout(() => {
       interrupted = true;
       try { proc.kill("SIGTERM"); } catch {}
-      // Backstop hard-kill if SIGTERM isn't honored within 2s
       setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 2000);
     }, timeout);
 
     try {
-      await Promise.all([
-        drain(proc.stdout as ReadableStream<Uint8Array>, c => { stdout = appendRing(stdout, c); }),
-        drain(proc.stderr as ReadableStream<Uint8Array>, c => { stderr = appendRing(stderr, c); }),
-        proc.exited,
-      ]);
+      await new Promise<void>(resolve => proc.on("exit", () => resolve()));
     } finally {
       clearTimeout(timer);
     }
@@ -1821,7 +1802,7 @@ function getVisibleExternalSet(sessionId: string | undefined): Set<string> | nul
 
 // ─── External MCP client — daemon executes tools directly ──────────────────
 
-import { spawn as spawnProc, type Subprocess } from "bun";
+import { spawn as spawnProc, type ChildProcess } from "node:child_process";
 
 interface McpServerConfig {
   name: string;
@@ -1832,7 +1813,7 @@ interface McpServerConfig {
 
 interface McpClient {
   config: McpServerConfig;
-  proc: Subprocess;
+  proc: ChildProcess;
   pending: Map<number, { resolve: (v: unknown) => void; timer: ReturnType<typeof setTimeout> }>;
   nextId: number;
   buffer: string;
@@ -1845,46 +1826,34 @@ async function getMcpClient(config: McpServerConfig): Promise<McpClient> {
   if (existing && !existing.proc.killed) return existing;
 
   trace("mcp.client.spawning", { server: config.name, cmd: config.command.join(" ") });
-  const proc = spawnProc({
-    cmd: config.command,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
+  const proc = spawnProc(config.command[0], config.command.slice(1), {
+    stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, ...config.environment },
   });
 
   const client: McpClient = { config, proc, pending: new Map(), nextId: 1, buffer: "" };
   mcpClients.set(config.name, client);
 
-  // Read stdout line by line — MCP stdio uses JSONRPC over newline-delimited JSON
-  (async () => {
-    const reader = proc.stdout.getReader();
-    const decoder = new TextDecoder();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        client.buffer += decoder.decode(value, { stream: true });
-        let nl: number;
-        while ((nl = client.buffer.indexOf("\n")) !== -1) {
-          const line = client.buffer.slice(0, nl).trim();
-          client.buffer = client.buffer.slice(nl + 1);
-          if (!line) continue;
-          try {
-            const msg = JSON.parse(line);
-            if (msg.id !== undefined) {
-              const p = client.pending.get(msg.id);
-              if (p) {
-                clearTimeout(p.timer);
-                client.pending.delete(msg.id);
-                p.resolve(msg);
-              }
-            }
-          } catch {}
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    client.buffer += chunk.toString();
+    let nl: number;
+    while ((nl = client.buffer.indexOf("\n")) !== -1) {
+      const line = client.buffer.slice(0, nl).trim();
+      client.buffer = client.buffer.slice(nl + 1);
+      if (!line) continue;
+      try {
+        const msg = JSON.parse(line);
+        if (msg.id !== undefined) {
+          const p = client.pending.get(msg.id);
+          if (p) {
+            clearTimeout(p.timer);
+            client.pending.delete(msg.id);
+            p.resolve(msg);
+          }
         }
-      }
-    } catch {}
-  })();
+      } catch {}
+    }
+  });
 
   // Initialize
   await mcpRpc(client, "initialize", {
@@ -1901,14 +1870,10 @@ function mcpRpc(client: McpClient, method: string, params?: unknown, notificatio
   const id = notification ? undefined : client.nextId++;
   const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
   // We always spawn with stdin: "pipe" so the sink is a FileSink. Bun's
-  // generic type widens to `number | FileSink | undefined` when the generics
-  // aren't inferred at the call site; narrow defensively so any future spawn
-  // config change that drops the pipe fails loudly instead of silently.
-  const sink = client.proc.stdin;
-  if (!sink || typeof sink === "number") {
-    throw new Error(`mcp client stdin is not a writable sink (server=${client.config.name})`);
+  if (!client.proc.stdin) {
+    throw new Error(`mcp client stdin is not available (server=${client.config.name})`);
   }
-  sink.write(msg);
+  client.proc.stdin.write(msg);
   if (notification) return Promise.resolve(null);
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
