@@ -254,7 +254,8 @@ register_service() {
   <key>ProgramArguments</key>
   <array>
     <string>${NODE}</string>
-    <string>${CLWND_SRC}/dist/daemon/index.js</string>
+    <string>${CLWND_SRC}/node_modules/.bin/tsx</string>
+    <string>${CLWND_SRC}/daemon/daemon.ts</string>
   </array>
   <key>WorkingDirectory</key>
   <string>${CLWND_SRC}</string>
@@ -321,7 +322,7 @@ Environment=XDG_STATE_HOME=$XDG_STATE_HOME
 Environment=XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
 Environment=PATH=$(dirname $CLAUDE):$(dirname $NODE):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 $($IS_ROOT || echo "Environment=CLWND_PERMISSION_MODE=bypassPermissions")
-ExecStart=$NODE $CLWND_SRC/dist/daemon/index.js
+ExecStart=$NODE $CLWND_SRC/node_modules/.bin/tsx $CLWND_SRC/daemon/daemon.ts
 Restart=on-failure
 RestartSec=2s
 StandardOutput=journal

@@ -7,20 +7,10 @@
   "workspaces": [
     "plugins/*"
   ],
-  "main": "dist/daemon/index.js",
-  "exports": {
-    ".": {
-      "import": "./dist/daemon/index.js",
-      "types": "./dist/daemon/index.d.ts"
-    }
-  },
+  "main": "daemon/daemon.ts",
   "scripts": {
-    "build": "tsup && pnpm -r run build",
-    "build:daemon": "tsup",
-    "build:plugins": "pnpm -r run build",
     "test": "vitest run",
     "test:e2e-serve": "vitest run tests/e2e-serve.test.ts",
-    "dev": "tsup --watch",
     "tc": "tsc --noEmit",
     "version:patch": "./scripts/version.sh patch",
     "version:minor": "./scripts/version.sh minor",
@@ -41,7 +31,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
-    "tsup": "^8.0.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.4"
   },
@@ -64,5 +54,25 @@
     "tree-sitter-rust": "0.24.0",
     "tree-sitter-typescript": "0.23.2",
     "web-tree-sitter": "0.25.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "better-sqlite3",
+      "tree-sitter",
+      "tree-sitter-json",
+      "tree-sitter-typescript",
+      "tree-sitter-javascript",
+      "tree-sitter-python",
+      "tree-sitter-go",
+      "tree-sitter-rust",
+      "tree-sitter-java",
+      "tree-sitter-c",
+      "tree-sitter-cpp",
+      "tree-sitter-ruby",
+      "tree-sitter-php",
+      "tree-sitter-c-sharp",
+      "tree-sitter-bash"
+    ]
   }
 }

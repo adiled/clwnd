@@ -3,22 +3,14 @@
   "version": "0.21.6",
   "description": "clwnd for opencode",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "index.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js"
+      "import": "./index.ts"
     },
     "./tui": {
       "import": "./tui.tsx"
     }
-  },
-  "files": [
-    "dist/",
-    "tui.tsx"
-  ],
-  "scripts": {
-    "build": "tsup",
-    "prepublishOnly": "pnpm run build"
   },
   "keywords": [
     "opencode",
@@ -32,9 +24,6 @@
     "type": "git",
     "url": "git+https://github.com/adiled/clwnd.git",
     "directory": "plugins/opencode"
-  },
-  "publishConfig": {
-    "access": "public"
   },
   "dependencies": {
     "@ai-sdk/provider": "^3.0.8",
@@ -57,27 +46,6 @@
   "devDependencies": {
     "@opencode-ai/plugin": "^1.3.5",
     "@opencode-ai/sdk": "^1.3.5",
-    "tsup": "^8.0.0",
     "typescript": "^5.7.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild",
-      "better-sqlite3",
-      "tree-sitter",
-      "tree-sitter-json",
-      "tree-sitter-typescript",
-      "tree-sitter-javascript",
-      "tree-sitter-python",
-      "tree-sitter-go",
-      "tree-sitter-rust",
-      "tree-sitter-java",
-      "tree-sitter-c",
-      "tree-sitter-cpp",
-      "tree-sitter-ruby",
-      "tree-sitter-php",
-      "tree-sitter-c-sharp",
-      "tree-sitter-bash"
-    ]
   }
 }

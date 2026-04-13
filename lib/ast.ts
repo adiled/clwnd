@@ -29,30 +29,41 @@
 import { readFileSync, statSync } from "fs";
 import { extname, join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { createRequire } from "module";
 
-// ─── Lazy-loaded parser, languages, and queries ────────────────────────────
-//
-// IMPORTANT: do NOT add `import "tree-sitter-X"` at the top of this file
-// for any grammar. Grammars are loaded ON DEMAND inside getLanguage() via
-// require(grammar) — a daemon process that only ever sees TypeScript
-// will never pull tree-sitter-python / -java / -cpp / etc. into memory.
-// The tsup config (tsup.config.ts) lists every grammar in its `external`
-// array so the bundler won't ever inline them either.
-let Parser: any = null;
+// Native addon packages (tree-sitter-*) are CJS with .node bindings.
+// ESM `import` can't resolve their subpath exports. One createRequire
+// to load them all — no gymnastics, just the standard Node interop.
+const _require = createRequire(join(process.cwd(), "package.json"));
+
+const Parser = _require("tree-sitter");
+const TSTypescript = _require("tree-sitter-typescript/typescript");
+const TSTsx = _require("tree-sitter-typescript/tsx");
+const TSJavaScript = _require("tree-sitter-javascript");
+const TSPython = _require("tree-sitter-python");
+const TSGo = _require("tree-sitter-go");
+const TSRust = _require("tree-sitter-rust");
+const TSJava = _require("tree-sitter-java");
+const TSC = _require("tree-sitter-c");
+const TSCpp = _require("tree-sitter-cpp");
+const TSRuby = _require("tree-sitter-ruby");
+const TSPhp = _require("tree-sitter-php/php");
+const TSCSharp = _require("tree-sitter-c-sharp");
+const TSBash = _require("tree-sitter-bash");
+const TSJson = _require("tree-sitter-json");
+
 const languages = new Map<string, any>();
 const queries = new Map<string, any>();
 
 interface LanguageEntry {
   /**
-   * Runtime: "native" uses node-tree-sitter (C++ bindings via require()),
-   * "wasm" uses web-tree-sitter (WASM via Language.load()). Default: native.
+   * Runtime: "native" uses node-tree-sitter, "wasm" uses web-tree-sitter.
    * WASM is the fallback for grammars that have no working native npm
-   * package (vue, and eventually sql). The public API is identical — the
-   * runtime difference is hidden behind getLanguage/getQuery.
+   * package (vue). Default: native.
    */
   runtime?: "native" | "wasm";
-  /** What `require()` resolves to for native grammars. Ignored for WASM. */
-  requirePath?: string;
+  /** Pre-imported language object for native grammars. */
+  language?: any;
   /** Path to the .wasm file for WASM grammars. Resolved relative to VENDORED_WASM_DIR. */
   wasmFile?: string;
   /**
@@ -75,34 +86,30 @@ interface LanguageEntry {
 }
 
 const EXT_TO_LANG: Record<string, LanguageEntry> = {
-  ".ts":   { requirePath: "tree-sitter-typescript/typescript", queryPaths: ["tree-sitter-javascript/queries/tags.scm", "tree-sitter-typescript/queries/tags.scm"], expandWrappers: ["export_statement"] },
-  ".tsx":  { requirePath: "tree-sitter-typescript/tsx",        queryPaths: ["tree-sitter-javascript/queries/tags.scm", "tree-sitter-typescript/queries/tags.scm"], expandWrappers: ["export_statement"] },
-  ".js":   { requirePath: "tree-sitter-javascript",            queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
-  ".jsx":  { requirePath: "tree-sitter-javascript",            queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
-  ".mjs":  { requirePath: "tree-sitter-javascript",            queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
-  ".cjs":  { requirePath: "tree-sitter-javascript",            queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
-  ".py":   { requirePath: "tree-sitter-python",                queryPaths: ["tree-sitter-python/queries/tags.scm"],     expandWrappers: ["decorated_definition"] },
-  ".pyi":  { requirePath: "tree-sitter-python",                queryPaths: ["tree-sitter-python/queries/tags.scm"],     expandWrappers: ["decorated_definition"] },
-  ".go":   { requirePath: "tree-sitter-go",                    queryPaths: ["tree-sitter-go/queries/tags.scm"] },
-  ".rs":   { requirePath: "tree-sitter-rust",                  queryPaths: ["tree-sitter-rust/queries/tags.scm"] },
-  ".java": { requirePath: "tree-sitter-java",                  queryPaths: ["tree-sitter-java/queries/tags.scm"], vendoredExtra: "java.scm" },
-  ".c":    { requirePath: "tree-sitter-c",                     queryPaths: ["tree-sitter-c/queries/tags.scm"] },
-  ".h":    { requirePath: "tree-sitter-c",                     queryPaths: ["tree-sitter-c/queries/tags.scm"] },
-  ".cc":   { requirePath: "tree-sitter-cpp",                   queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
-  ".cpp":  { requirePath: "tree-sitter-cpp",                   queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
-  ".cxx":  { requirePath: "tree-sitter-cpp",                   queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
-  ".hpp":  { requirePath: "tree-sitter-cpp",                   queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
-  ".hxx":  { requirePath: "tree-sitter-cpp",                   queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
-  ".rb":   { requirePath: "tree-sitter-ruby",                  queryPaths: ["tree-sitter-ruby/queries/tags.scm"] },
-  ".php":  { requirePath: "tree-sitter-php/php",               queryPaths: ["tree-sitter-php/queries/tags.scm"] },
-  ".cs":   { requirePath: "tree-sitter-c-sharp",               queryPaths: ["tree-sitter-c-sharp/queries/tags.scm"] },
-  // Bash ships no tags.scm — we vendor a minimal one.
-  ".sh":   { requirePath: "tree-sitter-bash",                  queryPaths: [], vendoredExtra: "bash.scm" },
-  ".bash": { requirePath: "tree-sitter-bash",                  queryPaths: [], vendoredExtra: "bash.scm" },
-  // ── WASM grammars — no native npm package available ──────────────────
-  // Vue SFC. tree-sitter-vue@0.2.1 (only npm version) has dead V8 bindings.
-  // We compiled the WASM from tree-sitter-grammars/tree-sitter-vue via
-  // tree-sitter-cli@0.24.3 + emscripten and vendor it at lib/wasm/.
+  ".ts":   { language: TSTypescript, queryPaths: ["tree-sitter-javascript/queries/tags.scm", "tree-sitter-typescript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".tsx":  { language: TSTsx,        queryPaths: ["tree-sitter-javascript/queries/tags.scm", "tree-sitter-typescript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".js":   { language: TSJavaScript, queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".jsx":  { language: TSJavaScript, queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".mjs":  { language: TSJavaScript, queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".cjs":  { language: TSJavaScript, queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".py":   { language: TSPython,     queryPaths: ["tree-sitter-python/queries/tags.scm"],     expandWrappers: ["decorated_definition"] },
+  ".pyi":  { language: TSPython,     queryPaths: ["tree-sitter-python/queries/tags.scm"],     expandWrappers: ["decorated_definition"] },
+  ".go":   { language: TSGo,         queryPaths: ["tree-sitter-go/queries/tags.scm"] },
+  ".rs":   { language: TSRust,       queryPaths: ["tree-sitter-rust/queries/tags.scm"] },
+  ".java": { language: TSJava,       queryPaths: ["tree-sitter-java/queries/tags.scm"], vendoredExtra: "java.scm" },
+  ".c":    { language: TSC,          queryPaths: ["tree-sitter-c/queries/tags.scm"] },
+  ".h":    { language: TSC,          queryPaths: ["tree-sitter-c/queries/tags.scm"] },
+  ".cc":   { language: TSCpp,        queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
+  ".cpp":  { language: TSCpp,        queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
+  ".cxx":  { language: TSCpp,        queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
+  ".hpp":  { language: TSCpp,        queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
+  ".hxx":  { language: TSCpp,        queryPaths: ["tree-sitter-cpp/queries/tags.scm"], vendoredExtra: "cpp.scm" },
+  ".rb":   { language: TSRuby,       queryPaths: ["tree-sitter-ruby/queries/tags.scm"] },
+  ".php":  { language: TSPhp,        queryPaths: ["tree-sitter-php/queries/tags.scm"] },
+  ".cs":   { language: TSCSharp,     queryPaths: ["tree-sitter-c-sharp/queries/tags.scm"] },
+  ".sh":   { language: TSBash,       queryPaths: [], vendoredExtra: "bash.scm" },
+  ".bash": { language: TSBash,       queryPaths: [], vendoredExtra: "bash.scm" },
+  // JSON handled by config-ast.ts for do_noncode, not code symbols
   ".vue":  { runtime: "wasm", wasmFile: "tree-sitter-vue.wasm", queryPaths: [], vendoredExtra: "vue.scm" },
 };
 
@@ -155,8 +162,8 @@ let wasmInitialized = false;
 
 async function getWasmParser(): Promise<any> {
   if (!WasmParser) {
-    const mod = require("web-tree-sitter");
-    WasmParser = mod.Parser ?? mod.default?.Parser ?? mod;
+    const mod = await import("web-tree-sitter");
+    WasmParser = mod.default?.Parser ?? mod.Parser ?? mod.default ?? mod;
   }
   if (!wasmInitialized && typeof WasmParser.init === "function") {
     await WasmParser.init();
@@ -171,7 +178,7 @@ async function getWasmLanguage(ext: string): Promise<any | null> {
   if (!entry?.wasmFile) return null;
   try {
     const WP = await getWasmParser();
-    const WLanguage = WP.Language ?? (require("web-tree-sitter").Language);
+    const WLanguage = WP.Language;
     const wasmPath = join(VENDORED_WASM_DIR, entry.wasmFile);
     const lang = await WLanguage.load(wasmPath);
     languages.set(ext, lang);
@@ -185,22 +192,16 @@ async function getWasmLanguage(ext: string): Promise<any | null> {
 // ─── Native runtime (node-tree-sitter) ────────────────────────────────────
 
 function getParser(): any {
-  if (!Parser) Parser = require("tree-sitter");
   return Parser;
 }
 
 function getLanguage(ext: string): any | null {
   if (languages.has(ext)) return languages.get(ext)!;
   const entry = EXT_TO_LANG[ext];
-  if (!entry || entry.runtime === "wasm") return null; // WASM handled via async path
-  try {
-    const mod = require(entry.requirePath!);
-    const lang = mod.language ?? mod.default?.language ?? mod.default ?? mod;
-    languages.set(ext, lang);
-    return lang;
-  } catch {
-    return null;
-  }
+  if (!entry || entry.runtime === "wasm") return null;
+  if (!entry.language) return null;
+  languages.set(ext, entry.language);
+  return entry.language;
 }
 
 // Strip directive predicates (`#xxx!`) from a .scm source. node-tree-sitter
@@ -218,7 +219,7 @@ function stripDirectives(scm: string): string {
 function loadQueryScm(entry: LanguageEntry): string {
   const parts: string[] = [];
   for (const rel of entry.queryPaths) {
-    const p = require.resolve(rel, { paths: [process.cwd(), HERE, join(HERE, "..")] });
+    const p = _require.resolve(rel);
     parts.push(stripDirectives(readFileSync(p, "utf-8")));
   }
   if (entry.vendoredExtra) {
@@ -256,7 +257,8 @@ async function getWasmQuery(ext: string): Promise<any | null> {
   try {
     const scm = loadQueryScm(entry);
     // web-tree-sitter@0.25: new Query(language, source)
-    const { Query: WQuery } = require("web-tree-sitter");
+    const wmod = await import("web-tree-sitter");
+    const WQuery = (wmod.default ?? wmod).Query;
     const q = new WQuery(lang, scm);
     queries.set(ext, q);
     return q;

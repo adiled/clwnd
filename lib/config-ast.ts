@@ -9,55 +9,30 @@
  * file is first encountered. Code files never touch this module.
  */
 
+import { join } from "path";
+import { createRequire } from "module";
 import type { ScopeMatch, ScopeResult } from "./linguistic.ts";
 
-// ─── Lazy parser + language loading ──────────────────────────────────────
+const _require = createRequire(join(process.cwd(), "package.json"));
+const Parser = _require("tree-sitter");
+const TSJson = _require("tree-sitter-json");
 
-let Parser: any = null;
-const languages = new Map<string, any>();
-
-function getParser(): any {
-  if (!Parser) {
-    const mod = require("tree-sitter");
-    Parser = mod.Parser ?? mod.default?.Parser ?? mod;
-  }
-  return Parser;
-}
-
-function getLanguage(ext: string): any | null {
-  if (languages.has(ext)) return languages.get(ext);
-  const grammarMap: Record<string, string> = {
-    ".json": "tree-sitter-json",
-    ".jsonc": "tree-sitter-json",
-    ".yaml": "tree-sitter-yaml",
-    ".yml": "tree-sitter-yaml",
-    ".toml": "tree-sitter-toml",
-  };
-  const pkg = grammarMap[ext];
-  if (!pkg) return null;
-  try {
-    const mod = require(pkg);
-    const lang = mod.language ?? mod.default?.language ?? mod.default ?? mod;
-    languages.set(ext, lang);
-    return lang;
-  } catch {
-    languages.set(ext, null);
-    return null;
-  }
-}
+const GRAMMAR_MAP: Record<string, any> = {
+  ".json": TSJson,
+  ".jsonc": TSJson,
+};
 
 function parse(source: string, ext: string): any | null {
-  const lang = getLanguage(ext);
+  const lang = GRAMMAR_MAP[ext];
   if (!lang) return null;
-  const P = getParser();
-  const parser = new P();
+  const parser = new Parser();
   parser.setLanguage(lang);
   return parser.parse(source);
 }
 
 /** Check if we have a tree-sitter grammar for this extension. */
 export function hasConfigGrammar(ext: string): boolean {
-  return [".json", ".jsonc", ".yaml", ".yml", ".toml"].includes(ext);
+  return ext in GRAMMAR_MAP;
 }
 
 // ─── JSON AST resolution ─────────────────────────────────────────────────
