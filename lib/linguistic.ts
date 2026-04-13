@@ -89,7 +89,35 @@ function pickOccurrence(matches: ScopeMatch[], anchor: string, occurrence: numbe
  * heading. Bare "## Setup" targets the first (with a warning if there
  * are duplicates).
  */
-export function resolveScope(source: string, target: string, filePath: string): ScopeResult {
+/**
+ * Word: space-delimited token. Format-agnostic. Find the exact token
+ * bounded by word boundaries, replace it. The atomic linguistic unit.
+ */
+export function resolveWord(source: string, token: string): ScopeResult {
+  const { anchor, occurrence } = parseTarget(token);
+  const matches: ScopeMatch[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const idx = source.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
+    // Verify word boundaries — char before/after must not be part of the same token
+    const before = idx > 0 ? source[idx - 1] : "\0";
+    const after = idx + anchor.length < source.length ? source[idx + anchor.length] : "\0";
+    const isTokenChar = (ch: string) => /[a-zA-Z0-9_]/.test(ch);
+    if (!isTokenChar(before) && !isTokenChar(after)) {
+      matches.push({ startIndex: idx, endIndex: idx + anchor.length, anchor, scope: "word" });
+    }
+    searchFrom = idx + anchor.length;
+  }
+  return pickOccurrence(matches, anchor, occurrence);
+}
+
+/**
+ * Phrase: format-dispatched structural scope. Headings, key paths, env
+ * vars, section headers — the format's natural phrase unit. Falls back
+ * to exact substring match for unknown formats.
+ */
+export function resolvePhrase(source: string, target: string, filePath: string): ScopeResult {
   const { anchor, occurrence } = parseTarget(target);
   const ext = extname(filePath).toLowerCase();
 
@@ -113,7 +141,7 @@ export function resolveScope(source: string, target: string, filePath: string): 
       if (basename.startsWith(".env")) {
         finder = findAllEnv;
       } else {
-        finder = findAllGeneric;
+        finder = findAllExactPhrase;
       }
     }
   }
@@ -122,26 +150,329 @@ export function resolveScope(source: string, target: string, filePath: string): 
   return pickOccurrence(matches, anchor, occurrence);
 }
 
+/** Exact substring match — fallback phrase for unknown formats. */
+function findAllExactPhrase(source: string, anchor: string): ScopeMatch[] {
+  const matches: ScopeMatch[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const idx = source.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
+    matches.push({ startIndex: idx, endIndex: idx + anchor.length, anchor, scope: "phrase" });
+    searchFrom = idx + anchor.length;
+  }
+  return matches;
+}
+
+// ─── Sentence: format-dispatched ──────────────────────────────────────────
+// The smallest complete independent statement in each format.
+
+export function resolveSentence(source: string, quoted: string, filePath: string): ScopeResult {
+  const { anchor, occurrence } = parseTarget(quoted);
+  const ext = extname(filePath).toLowerCase();
+  const basename = filePath.split("/").pop() ?? "";
+
+  let finder: (s: string, a: string) => ScopeMatch[];
+  switch (ext) {
+    case ".json": case ".jsonc": finder = findSentenceJson; break;
+    case ".yaml": case ".yml":   finder = findSentenceYaml; break;
+    case ".env": case ".toml": case ".ini": case ".cfg": case ".conf":
+      finder = findSentenceLine; break;
+    case ".md": case ".mdx": case ".markdown":
+      finder = findSentenceLine; break;
+    default:
+      finder = basename.startsWith(".env") ? findSentenceLine : findSentenceBlankLine;
+      break;
+  }
+  return pickOccurrence(finder(source, anchor), anchor, occurrence);
+}
+
+/** JSON sentence: comma-delimited entry. One key-value pair. */
+function findSentenceJson(source: string, anchor: string): ScopeMatch[] {
+  const matches: ScopeMatch[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const idx = source.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
+    // Expand backward to start of this entry (previous comma+newline, or opening brace)
+    let start = idx;
+    while (start > 0 && source[start - 1] !== "\n") start--;
+    // Expand forward to end of entry (next comma+newline, or closing brace line)
+    let end = idx + anchor.length;
+    while (end < source.length && source[end] !== "\n") end++;
+    if (end < source.length) end++; // include the newline
+    matches.push({ startIndex: start, endIndex: end, anchor, scope: "sentence" });
+    searchFrom = idx + anchor.length;
+  }
+  return matches;
+}
+
+/** YAML sentence: one sibling key-value at the same indent, plus any deeper children. */
+function findSentenceYaml(source: string, anchor: string): ScopeMatch[] {
+  const matches: ScopeMatch[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const idx = source.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
+    // Find the line containing the match
+    let start = idx;
+    while (start > 0 && source[start - 1] !== "\n") start--;
+    const lineIndent = idx - start - (source.slice(start, idx).length - source.slice(start, idx).trimStart().length);
+    const actualIndent = source.slice(start, idx).length - source.slice(start, idx).trimStart().length;
+    // Expand forward: include lines indented deeper than this one
+    let end = idx + anchor.length;
+    while (end < source.length && source[end] !== "\n") end++;
+    if (end < source.length) end++; // past the newline
+    while (end < source.length) {
+      const nextNewline = source.indexOf("\n", end);
+      const line = nextNewline === -1 ? source.slice(end) : source.slice(end, nextNewline);
+      if (line.trim() === "") break;
+      const indent = line.length - line.trimStart().length;
+      if (indent <= actualIndent) break;
+      end = nextNewline === -1 ? source.length : nextNewline + 1;
+    }
+    matches.push({ startIndex: start, endIndex: end, anchor, scope: "sentence" });
+    searchFrom = idx + anchor.length;
+  }
+  return matches;
+}
+
+/** Single-line sentence: env, toml keys, markdown lines within paragraphs. */
+function findSentenceLine(source: string, anchor: string): ScopeMatch[] {
+  const matches: ScopeMatch[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const idx = source.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
+    let start = idx;
+    while (start > 0 && source[start - 1] !== "\n") start--;
+    let end = idx + anchor.length;
+    while (end < source.length && source[end] !== "\n") end++;
+    if (end < source.length) end++; // include newline
+    matches.push({ startIndex: start, endIndex: end, anchor, scope: "sentence" });
+    searchFrom = idx + anchor.length;
+  }
+  return matches;
+}
+
+/** Generic sentence: collapses to blank-line expansion (= paragraph). */
+function findSentenceBlankLine(source: string, anchor: string): ScopeMatch[] {
+  return findParagraphBlankLine(source, anchor).map(m => ({ ...m, scope: "sentence" as const }));
+}
+
+// ─── Paragraph: format-dispatched ────────────────────────────────────────
+// A group of related sentences. The largest sub-file unit.
+
+export function resolveParagraph(source: string, quoted: string, filePath: string): ScopeResult {
+  const { anchor, occurrence } = parseTarget(quoted);
+  const ext = extname(filePath).toLowerCase();
+  const basename = filePath.split("/").pop() ?? "";
+
+  let finder: (s: string, a: string) => ScopeMatch[];
+  switch (ext) {
+    case ".json": case ".jsonc": finder = findParagraphJson; break;
+    case ".yaml": case ".yml":   finder = findParagraphYaml; break;
+    case ".toml": case ".ini": case ".cfg": case ".conf":
+      finder = findParagraphToml; break;
+    case ".env": finder = findParagraphEnv; break;
+    case ".md": case ".mdx": case ".markdown":
+      finder = findParagraphBlankLine; break;
+    default:
+      finder = basename.startsWith(".env") ? findParagraphEnv : findParagraphBlankLine;
+      break;
+  }
+  return pickOccurrence(finder(source, anchor), anchor, occurrence);
+}
+
+/** JSON paragraph: find the innermost enclosing { } or [ ]. */
+function findParagraphJson(source: string, anchor: string): ScopeMatch[] {
+  const matches: ScopeMatch[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const idx = source.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
+    // Scan backward for nearest unmatched { or [
+    let depth = 0;
+    let start = idx;
+    let inStr = false;
+    for (let i = idx - 1; i >= 0; i--) {
+      if (source[i] === '\\' && i > 0 && inStr) continue;
+      if (source[i] === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (source[i] === '}' || source[i] === ']') depth++;
+      if (source[i] === '{' || source[i] === '[') {
+        if (depth === 0) { start = i; break; }
+        depth--;
+      }
+    }
+    // Scan forward for the matching close
+    const end = findJsonValueEnd(source, start);
+    if (end !== -1) {
+      matches.push({ startIndex: start, endIndex: end, anchor, scope: "paragraph" });
+    }
+    searchFrom = idx + anchor.length;
+  }
+  return matches;
+}
+
+/** YAML paragraph: expand to parent indentation boundary. */
+function findParagraphYaml(source: string, anchor: string): ScopeMatch[] {
+  const matches: ScopeMatch[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const idx = source.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
+    // Find the line containing the match and its indentation
+    let lineStart = idx;
+    while (lineStart > 0 && source[lineStart - 1] !== "\n") lineStart--;
+    const matchIndent = source.slice(lineStart, idx).length - source.slice(lineStart, idx).trimStart().length;
+    // Find the parent: scan backward for a line with LESS indentation
+    let start = lineStart;
+    while (start > 0) {
+      const prevNl = source.lastIndexOf("\n", start - 2);
+      const prevLine = prevNl === -1 ? source.slice(0, start) : source.slice(prevNl + 1, start);
+      if (prevLine.trim() === "") { start = prevNl === -1 ? 0 : prevNl + 1; continue; }
+      const prevIndent = prevLine.length - prevLine.trimStart().length;
+      if (prevIndent < matchIndent) { start = prevNl === -1 ? 0 : prevNl + 1; break; }
+      start = prevNl === -1 ? 0 : prevNl + 1;
+    }
+    // Expand forward: include everything at greater indent than parent
+    const parentIndent = matchIndent > 0 ? matchIndent - 2 : 0; // assume 2-space indent
+    let end = idx + anchor.length;
+    while (end < source.length && source[end] !== "\n") end++;
+    if (end < source.length) end++;
+    while (end < source.length) {
+      const nextNl = source.indexOf("\n", end);
+      const line = nextNl === -1 ? source.slice(end) : source.slice(end, nextNl);
+      if (line.trim() === "") { end = nextNl === -1 ? source.length : nextNl + 1; continue; }
+      const indent = line.length - line.trimStart().length;
+      if (indent <= parentIndent) break;
+      end = nextNl === -1 ? source.length : nextNl + 1;
+    }
+    matches.push({ startIndex: start, endIndex: end, anchor, scope: "paragraph" });
+    searchFrom = idx + anchor.length;
+  }
+  return matches;
+}
+
+/** TOML paragraph: expand to [section] boundaries. */
+function findParagraphToml(source: string, anchor: string): ScopeMatch[] {
+  const matches: ScopeMatch[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const idx = source.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
+    // Scan backward for [section] header or BOF
+    let start = idx;
+    while (start > 0 && source[start - 1] !== "\n") start--;
+    while (start > 0) {
+      const prevNl = source.lastIndexOf("\n", start - 2);
+      const prevLine = prevNl === -1 ? source.slice(0, start) : source.slice(prevNl + 1, start);
+      if (prevLine.trimStart().startsWith("[")) { start = prevNl === -1 ? 0 : prevNl + 1; break; }
+      start = prevNl === -1 ? 0 : prevNl + 1;
+    }
+    // Scan forward for next [section] header or EOF
+    let end = idx + anchor.length;
+    while (end < source.length && source[end] !== "\n") end++;
+    if (end < source.length) end++;
+    while (end < source.length) {
+      const nextNl = source.indexOf("\n", end);
+      const line = nextNl === -1 ? source.slice(end) : source.slice(end, nextNl);
+      if (line.trimStart().startsWith("[")) break;
+      end = nextNl === -1 ? source.length : nextNl + 1;
+    }
+    matches.push({ startIndex: start, endIndex: end, anchor, scope: "paragraph" });
+    searchFrom = idx + anchor.length;
+  }
+  return matches;
+}
+
+/** Env paragraph: expand to blank line or # comment boundary. */
+function findParagraphEnv(source: string, anchor: string): ScopeMatch[] {
+  const matches: ScopeMatch[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const idx = source.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
+    let start = idx;
+    while (start > 0 && source[start - 1] !== "\n") start--;
+    while (start > 0) {
+      const prevNl = source.lastIndexOf("\n", start - 2);
+      const prevLine = prevNl === -1 ? source.slice(0, start) : source.slice(prevNl + 1, start);
+      if (prevLine.trim() === "") break;
+      start = prevNl === -1 ? 0 : prevNl + 1;
+    }
+    let end = idx + anchor.length;
+    while (end < source.length && source[end] !== "\n") end++;
+    if (end < source.length) end++;
+    while (end < source.length) {
+      const nextNl = source.indexOf("\n", end);
+      const line = nextNl === -1 ? source.slice(end) : source.slice(end, nextNl);
+      if (line.trim() === "") break;
+      end = nextNl === -1 ? source.length : nextNl + 1;
+    }
+    matches.push({ startIndex: start, endIndex: end, anchor, scope: "paragraph" });
+    searchFrom = idx + anchor.length;
+  }
+  return matches;
+}
+
+/** Blank-line paragraph: markdown, generic prose, unknown formats. */
+function findParagraphBlankLine(source: string, anchor: string): ScopeMatch[] {
+  const matches: ScopeMatch[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const idx = source.indexOf(anchor, searchFrom);
+    if (idx === -1) break;
+    let start = idx;
+    while (start > 0 && source[start - 1] !== "\n") start--;
+    while (start > 0) {
+      const prevNl = source.lastIndexOf("\n", start - 2);
+      const prevLine = prevNl === -1 ? source.slice(0, start) : source.slice(prevNl + 1, start);
+      if (prevLine.trim() === "") break;
+      start = prevNl === -1 ? 0 : prevNl + 1;
+    }
+    let end = idx + anchor.length;
+    while (end < source.length) {
+      const nextNl = source.indexOf("\n", end);
+      if (nextNl === -1) { end = source.length; break; }
+      const lineAfter = nextNl + 1;
+      if (lineAfter >= source.length) { end = source.length; break; }
+      const peekEnd = source.indexOf("\n", lineAfter);
+      const peekLine = peekEnd === -1 ? source.slice(lineAfter) : source.slice(lineAfter, peekEnd);
+      if (peekLine.trim() === "") { end = lineAfter; break; }
+      end = lineAfter;
+    }
+    matches.push({ startIndex: start, endIndex: end, anchor, scope: "paragraph" });
+    searchFrom = idx + anchor.length;
+  }
+  return matches;
+}
+
 // ─── Markdown ──────────────────────────────────────────────────────────────
 
 function findAllMarkdown(source: string, anchor: string): ScopeMatch[] {
   const headingMatch = anchor.match(/^(#{1,6})\s+/);
-  if (!headingMatch) return findAllGeneric(source, anchor);
+  if (!headingMatch) return findAllExactPhrase(source, anchor);
   const level = headingMatch[1].length;
   const matches: ScopeMatch[] = [];
   let searchFrom = 0;
   while (true) {
     const idx = source.indexOf(anchor, searchFrom);
     if (idx === -1) break;
-    // Scope: from this heading to the next heading of same-or-higher level, or EOF
-    const after = source.slice(idx + anchor.length);
+    // Scope: the BODY governed by this heading — everything AFTER the
+    // heading line until the next peer-or-higher heading. The heading
+    // itself (the word) stays; only its governed scope (the paragraph) moves.
+    const headingLineEnd = source.indexOf("\n", idx);
+    const bodyStart = headingLineEnd === -1 ? source.length : headingLineEnd + 1;
+    const after = source.slice(bodyStart);
     const peerPattern = new RegExp(`^#{1,${level}}\\s`, "m");
     const peerMatch = peerPattern.exec(after);
-    let endIndex = peerMatch ? idx + anchor.length + peerMatch.index : source.length;
-    while (endIndex > idx && (source[endIndex - 1] === "\n" || source[endIndex - 1] === "\r")) endIndex--;
+    let endIndex = peerMatch ? bodyStart + peerMatch.index : source.length;
+    // Trim trailing blank lines from the scope but keep one newline
+    while (endIndex > bodyStart && (source[endIndex - 1] === "\n" || source[endIndex - 1] === "\r")) endIndex--;
     if (endIndex < source.length && source[endIndex] === "\n") endIndex++;
-    matches.push({ startIndex: idx, endIndex, anchor, scope: "paragraph" });
-    searchFrom = idx + anchor.length;
+    matches.push({ startIndex: bodyStart, endIndex, anchor, scope: "paragraph" });
+    searchFrom = bodyStart;
   }
   return matches;
 }
@@ -149,64 +480,54 @@ function findAllMarkdown(source: string, anchor: string): ScopeMatch[] {
 // ─── Env files ─────────────────────────────────────────────────────────────
 
 function findAllEnv(source: string, anchor: string): ScopeMatch[] {
-  // Match KEY= at start of line — exact key match (word boundary after key name)
+  // Match KEY= at start of line — scope is the VALUE only (after =).
+  // The word (KEY=) stays; the governed phrase (the value) gets replaced.
   const pattern = new RegExp(`^(export\\s+)?${escapeRegex(anchor)}\\s*=`, "gm");
   const matches: ScopeMatch[] = [];
   let m: RegExpExecArray | null;
   while ((m = pattern.exec(source)) !== null) {
-    const startIndex = m.index;
-    const lineEnd = source.indexOf("\n", startIndex);
-    const endIndex = lineEnd === -1 ? source.length : lineEnd + 1;
-    matches.push({ startIndex, endIndex, anchor, scope: "phrase" });
+    const valStart = m.index + m[0].length;
+    const lineEnd = source.indexOf("\n", valStart);
+    const endIndex = lineEnd === -1 ? source.length : lineEnd;
+    matches.push({ startIndex: valStart, endIndex, anchor, scope: "phrase" });
   }
-  return matches;
+  return matches.length > 0 ? matches : findAllExactPhrase(source, anchor);
 }
 
 // ─── JSON ──────────────────────────────────────────────────────────────────
 
 function findAllJson(source: string, anchor: string): ScopeMatch[] {
   const result = resolveJsonKey(source, anchor);
-  return result ? [result] : [];
+  return result ? [result] : findAllExactPhrase(source, anchor);
 }
 
 function resolveJsonKey(source: string, anchor: string): ScopeMatch | null {
   const parts = anchor.split(".");
-  // Walk the JSON textually — find each key in sequence
+  // Walk the JSON textually — find each key in sequence.
+  // Track matchEnd (past the regex match including colon) to avoid
+  // finding colons INSIDE key names like "gemma3:4b".
   let searchFrom = 0;
-  let lastKeyStart = -1;
+  let lastMatchEnd = -1;
   for (const part of parts) {
-    // Find "key": pattern after searchFrom
     const keyPattern = new RegExp(`"${escapeRegex(part)}"\\s*:`);
     const rest = source.slice(searchFrom);
     const match = keyPattern.exec(rest);
     if (!match) return null;
-    lastKeyStart = searchFrom + match.index;
-    // Move past this key's colon to search for nested keys
-    searchFrom = lastKeyStart + match[0].length;
+    lastMatchEnd = searchFrom + match.index + match[0].length;
+    searchFrom = lastMatchEnd;
   }
-  if (lastKeyStart === -1) return null;
-  // Now determine the value extent: from the key to the end of its value
-  // Find the colon after the key
-  const colonIdx = source.indexOf(":", lastKeyStart);
-  if (colonIdx === -1) return null;
-  // Skip whitespace after colon to find value start
-  let valStart = colonIdx + 1;
+  if (lastMatchEnd === -1) return null;
+  // Skip whitespace after the colon to find value start.
+  // lastMatchEnd is right after "key": — the colon is already consumed
+  // by the regex, so we won't hit an internal colon in the key name.
+  let valStart = lastMatchEnd;
   while (valStart < source.length && /\s/.test(source[valStart])) valStart++;
   // Determine value end based on its opening character
   const endIdx = findJsonValueEnd(source, valStart);
   if (endIdx === -1) return null;
-  // Include trailing comma + whitespace
-  let scopeEnd = endIdx;
-  while (scopeEnd < source.length && /[\s,]/.test(source[scopeEnd])) {
-    if (source[scopeEnd] === ",") { scopeEnd++; break; }
-    scopeEnd++;
-  }
-  // Extend startIndex backward to include leading whitespace on the line
-  let startIndex = lastKeyStart;
-  while (startIndex > 0 && source[startIndex - 1] !== "\n") startIndex--;
-  // Include the trailing newline if present
-  if (scopeEnd < source.length && source[scopeEnd] === "\n") scopeEnd++;
-  return { startIndex, endIndex: scopeEnd, anchor, scope: "phrase" };
+  // Scope is the VALUE only — the key is the address, not the content.
+  // The user provides the replacement value; the key stays intact.
+  return { startIndex: valStart, endIndex: endIdx, anchor, scope: "phrase" };
 }
 
 function findJsonValueEnd(source: string, start: number): number {
@@ -249,7 +570,7 @@ function findJsonValueEnd(source: string, start: number): number {
 
 function findAllYaml(source: string, anchor: string): ScopeMatch[] {
   const result = resolveYamlKey(source, anchor);
-  return result ? [result] : [];
+  return result ? [result] : findAllExactPhrase(source, anchor);
 }
 
 function resolveYamlKey(source: string, anchor: string): ScopeMatch | null {
@@ -257,6 +578,7 @@ function resolveYamlKey(source: string, anchor: string): ScopeMatch | null {
   let searchFrom = 0;
   let lastKeyStart = -1;
   let lastKeyIndent = 0;
+  let lastMatchEnd = -1;
 
   for (const part of parts) {
     const pattern = new RegExp(`^(\\s*)${escapeRegex(part)}\\s*:`, "m");
@@ -265,60 +587,73 @@ function resolveYamlKey(source: string, anchor: string): ScopeMatch | null {
     if (!match) return null;
     lastKeyStart = searchFrom + match.index;
     lastKeyIndent = match[1].length;
-    searchFrom = lastKeyStart + match[0].length;
+    lastMatchEnd = lastKeyStart + match[0].length;
+    searchFrom = lastMatchEnd;
   }
   if (lastKeyStart === -1) return null;
 
-  // Scope: from this key's line to just before the next line at the same
-  // or lesser indentation (the YAML "block" this key owns).
+  // Scope is the VALUE only — the word (key:) stays.
+  // Two shapes: scalar (key: value) or block (key:\n  children).
   const lineEnd = source.indexOf("\n", lastKeyStart);
-  if (lineEnd === -1) return { startIndex: lastKeyStart, endIndex: source.length, anchor, scope: "paragraph" };
+  const restOfLine = lineEnd === -1
+    ? source.slice(lastMatchEnd)
+    : source.slice(lastMatchEnd, lineEnd);
+
+  if (restOfLine.trim().length > 0) {
+    // Scalar value on the same line: "key: value" → scope is " value"
+    // Include the space after colon so replacement is clean
+    const valStart = lastMatchEnd;
+    const valEnd = lineEnd === -1 ? source.length : lineEnd;
+    return { startIndex: valStart, endIndex: valEnd, anchor, scope: "phrase" };
+  }
+
+  // Block value: "key:\n  child: ..." → scope is the indented children
+  if (lineEnd === -1) return { startIndex: source.length, endIndex: source.length, anchor, scope: "paragraph" };
   let pos = lineEnd + 1;
   while (pos < source.length) {
     const nextNewline = source.indexOf("\n", pos);
     const line = nextNewline === -1 ? source.slice(pos) : source.slice(pos, nextNewline);
-    // Blank lines or comment-only lines belong to the current block
     if (line.trim() === "" || line.trimStart().startsWith("#")) {
       pos = nextNewline === -1 ? source.length : nextNewline + 1;
       continue;
     }
-    // Check indentation of this non-blank line
     const indent = line.length - line.trimStart().length;
-    if (indent <= lastKeyIndent) break; // peer or parent — stop
+    if (indent <= lastKeyIndent) break;
     pos = nextNewline === -1 ? source.length : nextNewline + 1;
   }
-  return { startIndex: lastKeyStart, endIndex: pos, anchor, scope: "paragraph" };
+  return { startIndex: lineEnd + 1, endIndex: pos, anchor, scope: "paragraph" };
 }
 
 // ─── TOML ──────────────────────────────────────────────────────────────────
 
 function findAllToml(source: string, anchor: string): ScopeMatch[] {
   const result = resolveTomlSection(source, anchor);
-  return result ? [result] : [];
+  return result ? [result] : findAllExactPhrase(source, anchor);
 }
 
 function resolveTomlSection(source: string, anchor: string): ScopeMatch | null {
   // Try as a section header first: [anchor] or [[anchor]]
-  const sectionPattern = new RegExp(`^\\[\\[?${escapeRegex(anchor)}\\]\\]?`, "m");
+  // Strip surrounding brackets if the user passed them (e.g. "[server]" → "server")
+  const bare = anchor.replace(/^\[+/, "").replace(/\]+$/, "");
+  const sectionPattern = new RegExp(`^\\[\\[?${escapeRegex(bare)}\\]\\]?`, "m");
   const sectionMatch = sectionPattern.exec(source);
   if (sectionMatch) {
-    const startIndex = sectionMatch.index;
-    // Scope until next section header or EOF
-    const after = source.slice(startIndex + sectionMatch[0].length);
+    // Scope is the BODY after the section header — the header (word) stays.
+    const headerEnd = source.indexOf("\n", sectionMatch.index);
+    const bodyStart = headerEnd === -1 ? source.length : headerEnd + 1;
+    const after = source.slice(bodyStart);
     const nextSection = /^\[/m.exec(after);
-    const endIndex = nextSection
-      ? startIndex + sectionMatch[0].length + nextSection.index
-      : source.length;
-    return { startIndex, endIndex, anchor, scope: "paragraph" };
+    const endIndex = nextSection ? bodyStart + nextSection.index : source.length;
+    return { startIndex: bodyStart, endIndex, anchor, scope: "paragraph" };
   }
-  // Try as a key: anchor = ...
-  const keyPattern = new RegExp(`^\\s*${escapeRegex(anchor)}\\s*=`, "m");
+  // Try as a key: anchor = value → scope is the value only
+  const keyPattern = new RegExp(`^\\s*${escapeRegex(anchor)}\\s*=\\s*`, "m");
   const keyMatch = keyPattern.exec(source);
   if (!keyMatch) return null;
-  const startIndex = keyMatch.index;
-  const lineEnd = source.indexOf("\n", startIndex);
-  const endIndex = lineEnd === -1 ? source.length : lineEnd + 1;
-  return { startIndex, endIndex, anchor, scope: "phrase" };
+  const valStart = keyMatch.index + keyMatch[0].length;
+  const lineEnd = source.indexOf("\n", valStart);
+  const endIndex = lineEnd === -1 ? source.length : lineEnd;
+  return { startIndex: valStart, endIndex, anchor, scope: "phrase" };
 }
 
 // ─── INI / conf ────────────────────────────────────────────────────────────

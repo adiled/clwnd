@@ -10,7 +10,7 @@ import { resolve, dirname, relative, extname, join as pathJoin } from "path";
 import { trace } from "../log.ts";
 import { penny } from "../lib/penny.ts";
 import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, astGrep, searchSymbols, validateSyntax, symbolByteRange, type Symbol } from "../lib/ast.ts";
-import { resolveScope, discoverAnchors, formatAnchors } from "../lib/linguistic.ts";
+import { resolveWord, resolvePhrase, resolveSentence, resolveParagraph, discoverAnchors, formatAnchors } from "../lib/linguistic.ts";
 
 let CWD = process.env.CLWND_CWD ?? process.cwd();
 
@@ -177,47 +177,46 @@ WORKFLOW: read(file) first → see symbol outline → do_code(file, symbol, new_
   },
   {
     name: "do_noncode",
-    description: `Write or modify a non-code file. This is the ONLY way to author non-code in clwnd.
+    description: `Edit non-code files using linguistic scope. The ONLY way to author non-code in clwnd.
 
-COMMON SENSE — apply these every time:
-  - FORMAT: you're editing a structured document. Respect its format. If the YAML uses 2-space indent, don't switch to 4. If the JSON has trailing newlines, keep them. If the env file has no quotes around values, don't add them.
-  - MARKDOWN: headings have hierarchy. Don't put an ### under a # with no ## in between. Keep heading levels consistent with the rest of the document. Preserve blank lines between sections — they're the paragraph boundaries.
-  - JSON: it must be valid JSON after your edit. Watch for trailing commas (illegal in JSON), missing quotes on keys, unescaped special characters. If the file uses 2-space indent, use 2-space indent.
-  - YAML: indentation IS the structure. A wrong indent changes the meaning, not just the formatting. If you're editing a nested key, match the exact indentation of its siblings.
-  - ENV: one KEY=value per line. No spaces around = unless the file already has them. Don't quote values unless the existing file quotes them. Preserve comments.
-  - TOML: sections are [name]. Keys are name = value. Don't mix styles. Don't put keys above the first section if the file doesn't already do that.
-  - PROSE: when editing documentation, write clearly. Don't leave placeholder text. Don't add marketing fluff. If you're updating a section, make sure cross-references in other sections still make sense.
-  - SCOPE: change what was asked. Don't reformat the whole file, don't "fix" neighboring sections, don't reorganize structure that wasn't requested.
+Text has four units: word, phrase, sentence, paragraph. Each parameter names a scope level. Pass exactly ONE scope parameter to tell clwnd what you're editing and how to find it.
 
-ACCEPTS: anything NOT a code file — configs, docs, markup, stylesheets, data, plain text.
-REFUSES: code files → use do_code.
+WORD — address by structural name. The word stays; its governed scope is replaced.
+  Headings, keys, env vars, section headers — anything with a NAME.
+  do_noncode(file, word: '## Setup', replace: 'New instructions.\\n')
+  do_noncode(file, word: 'DATABASE_URL', replace: 'postgres://new/db')
+  do_noncode(file, word: 'provider.ollama', replace: '{ "npm": "new-pkg" }')
+  do_noncode(file, word: 'server.port', replace: '9090')
+  do_noncode(file, word: '[database]', replace: 'host = new\\nport = 5432\\n')
 
-TWO APPROACHES:
+PHRASE — address by quoting the exact text. The quoted span is replaced.
+  Short, precise edits. Quote what's there, provide the replacement.
+  do_noncode(file, phrase: '"tool_call": true', replace: '"tool_call": false')
+  do_noncode(file, phrase: 'very restrictive', replace: 'linguistically aware')
 
-  1. TARGET MODE (preferred for existing files)
-     Pass 'target' with the text you want to edit. clwnd finds it by content,
-     resolves its linguistic scope, replaces just that scope.
-       do_noncode(file, target: '## Setup', content: '## Setup\\nNew instructions.\\n')
-       do_noncode(file, target: 'DATABASE_URL', content: 'DATABASE_URL=postgres://new/db\\n')
-       do_noncode(file, target: 'server', content: 'server:\\n  port: 9090\\n')
-       do_noncode(file, target: '[database]', content: '[database]\\nhost = new\\n')
+SENTENCE — address by quoting text within a sentence. Scope expands to sentence boundaries (blank lines or structural delimiters).
+  do_noncode(file, sentence: 'The tool only supports', replace: 'The tool supports all four linguistic units.')
 
-     Scope is inferred: markdown headings → paragraph, env vars → line,
-     JSON/YAML keys → value block, TOML sections → until next section.
+PARAGRAPH — address by quoting text within a paragraph. Scope expands to the full paragraph (between blank lines).
+  do_noncode(file, paragraph: 'Every text file has', replace: 'Text is linguistic hierarchy.\\nWords, phrases, sentences, paragraphs.')
 
-  2. CLASSIC MODES — whole-file operations
-     mode: 'write' (default), 'append', 'prepend'
+Omit 'replace' to DELETE the scope. No scope parameter = create/overwrite the whole file.
 
-WORKFLOW: read(file) first → see anchor outline → do_noncode(file, target, content).`,
+FORMAT SENSE: respect existing formatting. JSON must stay valid. YAML indentation IS structure. Change what was asked — don't reformat neighbors.
+
+ACCEPTS: configs, docs, markup, stylesheets, data, plain text. REFUSES: code files → use do_code.
+WORKFLOW: read(file) first → see structure → do_noncode with the right scope.`,
     inputSchema: {
       type: "object" as const,
       properties: {
-        file_path: { type: "string", description: "Absolute path to a non-code file. Code extensions (ts, py, go, rs, java, etc.) are rejected — use do_code for those." },
-        content: { type: "string", description: "The new content. In target mode: replaces the targeted scope. In classic modes: written/appended/prepended as-is." },
-        target: { type: "string", description: "Content anchor to target for editing. The exact text that identifies what you want to change — a markdown heading ('## Setup'), an env var name ('DATABASE_URL'), a JSON key path ('dependencies.lodash'), a YAML key ('server.port'), a TOML section ('[database]'). clwnd finds it by content and replaces its scope. Mutually exclusive with mode." },
-        mode: { type: "string", description: "Classic whole-file mode: write (default), append, prepend. Ignored if target is set." },
+        file_path: { type: "string", description: "Absolute path to a non-code file." },
+        word: { type: "string", description: "Structural anchor: a heading ('## Setup'), key path ('provider.ollama'), env var ('DATABASE_URL'), section ('[database]'). The word stays; its governed scope is replaced by 'replace'." },
+        phrase: { type: "string", description: "Exact text to find and replace. The quoted span is the scope." },
+        sentence: { type: "string", description: "Text within a sentence. Scope expands to sentence boundaries." },
+        paragraph: { type: "string", description: "Text within a paragraph. Scope expands to paragraph boundaries." },
+        replace: { type: "string", description: "Replacement content. Omit to delete the scope. No scope parameter = create/overwrite the whole file." },
       },
-      required: ["file_path", "content"],
+      required: ["file_path"],
     },
   },
   {
@@ -1267,7 +1266,7 @@ function execDoCode(
 // whose extension is in CODE_EXTENSIONS so it cannot be used as an
 // end-run around do_code's AST validation.
 function execDoNoncode(
-  args: { file_path: string; content: string; mode?: "write" | "append" | "prepend"; target?: string },
+  args: { file_path: string; word?: string; phrase?: string; sentence?: string; paragraph?: string; replace?: string },
   sessionId?: string,
 ): ToolResult {
   const p = assertPath(args.file_path);
@@ -1278,73 +1277,90 @@ function execDoNoncode(
       title: relative(CWD, p) || p,
     };
   }
-  const mode = args.mode ?? "write";
   const relPath = relative(CWD, p) || p;
   const dir = dirname(p);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
   const existed = existsSync(p);
+  const replaceText = args.replace ?? "";
 
-  // ── target mode: linguistic scope splice ──────────────────────────
-  // When `target` is provided, find the anchor in the file by content,
-  // resolve its scope (how much text it "owns"), and replace just that
-  // scope with the new content. No line numbers, no old/new strings —
-  // the anchor IS the address.
-  if (args.target) {
+  // ── scope: word / phrase / sentence / paragraph ───────────────────
+  const scopeParam = args.word ? "word" : args.phrase ? "phrase" : args.sentence ? "sentence" : args.paragraph ? "paragraph" : null;
+  const scopeValue = args.word ?? args.phrase ?? args.sentence ?? args.paragraph;
+
+  if (scopeParam && scopeValue) {
     if (!existed) {
-      return { output: `Error: target '${args.target}' requires the file to exist. Use mode 'write' to create a new file.`, title: relPath };
+      return { output: `Error: ${scopeParam} '${scopeValue}' requires the file to exist.`, title: relPath };
     }
     const stale = checkStaleness(p, sessionId);
     if (stale) return stale;
     const original = readFileSync(p, "utf-8");
-    const result = resolveScope(original, args.target, p);
+
+    let result;
+    switch (scopeParam) {
+      case "word":      result = resolveWord(original, scopeValue); break;
+      case "phrase":    result = resolvePhrase(original, scopeValue, p); break;
+      case "sentence":  result = resolveSentence(original, scopeValue, p); break;
+      case "paragraph": result = resolveParagraph(original, scopeValue, p); break;
+    }
+
     if (!result.match) {
       const hint = result.error
         ? result.error
-        : `target '${args.target}' not found in ${p}. Read the file first to see its content, then pass the exact anchor text you want to target.`;
+        : `${scopeParam} '${scopeValue}' not found in ${p}. Read the file first to see its content.`;
       return { output: `Error: ${hint}`, title: relPath };
     }
     const match = result.match;
-    const next = original.slice(0, match.startIndex) + args.content + original.slice(match.endIndex);
+    const before = original.slice(match.startIndex, match.endIndex);
+    const next = original.slice(0, match.startIndex) + replaceText + original.slice(match.endIndex);
     writeFileSync(p, next);
     recordWrite(p, sessionId, next);
+
+    // Context window around the edit site — enough to confirm it landed
+    const CTX = 3; // lines of context before/after
+    const editStart = match.startIndex;
+    const editEnd = match.startIndex + replaceText.length;
+    let ctxStart = editStart;
+    for (let i = 0; i < CTX && ctxStart > 0; i++) {
+      ctxStart = next.lastIndexOf("\n", ctxStart - 1);
+      if (ctxStart === -1) { ctxStart = 0; break; }
+    }
+    if (ctxStart > 0) ctxStart++; // past the newline
+    let ctxEnd = editEnd;
+    for (let i = 0; i < CTX && ctxEnd < next.length; i++) {
+      const nl = next.indexOf("\n", ctxEnd);
+      if (nl === -1) { ctxEnd = next.length; break; }
+      ctxEnd = nl + 1;
+    }
+    const context = next.slice(ctxStart, ctxEnd);
+
     const disambigNote = result.totalMatches > 1
-      ? ` (${result.totalMatches} matches — use ${args.target}#N to target a specific one)`
+      ? `\n(${result.totalMatches} matches — use ${scopeValue}#N to target a specific one)`
       : "";
+    const lines: string[] = [
+      `Replaced ${match.scope} '${match.anchor}' in ${p}.`,
+    ];
+    if (before.trim().length > 0 && before.length <= 200) {
+      lines.push(`  − ${before.split("\n").join("\n  − ")}`);
+    }
+    if (replaceText.trim().length > 0 && replaceText.length <= 200) {
+      lines.push(`  + ${replaceText.split("\n").join("\n  + ")}`);
+    }
+    lines.push("", context, disambigNote);
     return {
-      output: `Replaced ${match.scope} '${match.anchor}' in ${p} (bytes ${match.startIndex}-${match.endIndex} → ${args.content.length} bytes new).${disambigNote}`,
+      output: lines.join("\n").trimEnd(),
       title: relPath,
-      metadata: { mode: "target", target: args.target, scope: match.scope, totalMatches: result.totalMatches, was: { start: match.startIndex, end: match.endIndex }, size: next.length },
+      metadata: { scope: match.scope, totalMatches: result.totalMatches, size: next.length },
     };
   }
 
-  // ── classic modes: write / append / prepend ───────────────────────
-  // Staleness only matters for append/prepend to an existing file. "write"
-  // is a wholesale overwrite; the prior state is by definition obsolete.
-  if (existed && mode !== "write") {
-    const stale = checkStaleness(p, sessionId);
-    if (stale) return stale;
-  }
-
-  let next: string;
-  if (mode === "write") {
-    next = args.content;
-  } else if (mode === "append") {
-    const existing = existed ? readFileSync(p, "utf-8") : "";
-    next = existing + args.content;
-  } else if (mode === "prepend") {
-    const existing = existed ? readFileSync(p, "utf-8") : "";
-    next = args.content + existing;
-  } else {
-    return { output: `Error: unknown mode '${mode}'. Valid: write, append, prepend.`, title: relPath };
-  }
-
-  writeFileSync(p, next);
-  recordWrite(p, sessionId, next);
+  // No scope parameter = create/overwrite whole file
+  writeFileSync(p, replaceText);
+  recordWrite(p, sessionId, replaceText);
   return {
-    output: `${mode === "write" ? (existed ? "Overwrote" : "Created") : mode === "append" ? "Appended to" : "Prepended to"} ${p} (${next.length} bytes).`,
+    output: `${existed ? "Overwrote" : "Created"} ${p} (${replaceText.length} bytes).`,
     title: relPath,
-    metadata: { mode, existed, size: next.length },
+    metadata: { existed, size: replaceText.length },
   };
 }
 
@@ -1867,7 +1883,7 @@ export async function executeTool(name: string, args: Record<string, unknown>, _
     case "edit":
     case "write":
       return {
-        output: `[clwnd: tool '${name}' no longer exists. Use do_code for code files (AST-grounded symbol replacement, insertion, deletion) or do_noncode for config/docs/text (write/append/prepend).]`,
+        output: `[clwnd: tool '${name}' no longer exists. Use do_code for code files (AST-grounded symbol replacement, insertion, deletion) or do_noncode for config/docs/text (linguistic scope editing).]`,
         title: `replaced: ${name}`,
         metadata: { replaced: name },
       };
