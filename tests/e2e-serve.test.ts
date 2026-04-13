@@ -365,8 +365,8 @@ afterAll(async () => {
   const pid = server?.pid;
   // Nuke by PID (children + parent), by name pattern, and by port
   await nuke(pid);
-  // Wait for process to settle
-  try { if (server) await new Promise<void>(r => server.on("exit", () => r())); } catch {}
+  // Wait briefly for cleanup to settle
+  await new Promise(r => setTimeout(r, 1000));
   // Cleanup suite directory
   await sh(`rm -rf ${SUITE_DIR}`);
 }, 15_000);
