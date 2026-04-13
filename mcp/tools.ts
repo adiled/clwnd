@@ -1286,7 +1286,7 @@ function execDoNoncode(
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
   const existed = existsSync(p);
-  const replaceText = args.replace ?? "";
+  let replaceText = args.replace ?? "";
 
   // ── scope: word / phrase / sentence / paragraph ───────────────────
   const scopeParam = args.word ? "word" : args.phrase ? "phrase" : args.sentence ? "sentence" : args.paragraph ? "paragraph" : null;
@@ -1315,6 +1315,17 @@ function execDoNoncode(
       return { output: `Error: ${hint}`, title: relPath };
     }
     const match = result.match;
+    // Auto-quote: if replacing a JSON value and the replacement isn't
+    // already a valid JSON value, wrap it in quotes. The agent shouldn't
+    // have to think about JSON escaping.
+    const ext = extname(p).toLowerCase();
+    if ((ext === ".json" || ext === ".jsonc") && scopeParam === "phrase" && replaceText.length > 0) {
+      const trimmed = replaceText.trim();
+      const isJsonValue = /^[{\["0-9\-]/.test(trimmed) || trimmed === "true" || trimmed === "false" || trimmed === "null";
+      if (!isJsonValue) {
+        replaceText = `"${replaceText.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n")}"`;
+      }
+    }
     const before = original.slice(match.startIndex, match.endIndex);
     const next = original.slice(0, match.startIndex) + replaceText + original.slice(match.endIndex);
     writeFileSync(p, next);

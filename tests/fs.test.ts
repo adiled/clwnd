@@ -943,6 +943,47 @@ describe("do_noncode: target", () => {
     expect(() => JSON.parse(disk(p))).not.toThrow();
   });
 
+  test("json auto-quotes unquoted string replacement", async () => {
+    const json = '{\n  "motto": "old motto",\n  "version": "1.0.0"\n}\n';
+    const p = seed("autoquote.json", json);
+    await post("read", { file_path: p });
+    // Agent provides unquoted text — tool should auto-quote it
+    await post("do_noncode", { file_path: p, phrase: "motto", replace: "If it doesn't kill you, it makes you flinch forever." });
+    const after = disk(p);
+    expect(() => JSON.parse(after)).not.toThrow();
+    const parsed = JSON.parse(after);
+    expect(parsed.motto).toBe("If it doesn't kill you, it makes you flinch forever.");
+    expect(parsed.version).toBe("1.0.0");
+  });
+
+  test("json auto-quote doesn't double-quote already-quoted values", async () => {
+    const json = '{\n  "name": "old",\n  "count": 1\n}\n';
+    const p = seed("autoquote2.json", json);
+    await post("read", { file_path: p });
+    // Already quoted — should not double-quote
+    await post("do_noncode", { file_path: p, phrase: "name", replace: '"new"' });
+    const after = disk(p);
+    expect(() => JSON.parse(after)).not.toThrow();
+    expect(JSON.parse(after).name).toBe("new");
+  });
+
+  test("json auto-quote doesn't quote objects/arrays/numbers/booleans", async () => {
+    const json = '{\n  "enabled": true,\n  "tags": [],\n  "config": {},\n  "count": 0\n}\n';
+    const p = seed("autoquote3.json", json);
+    await post("read", { file_path: p });
+    await post("do_noncode", { file_path: p, phrase: "enabled", replace: "false" });
+    await post("do_noncode", { file_path: p, phrase: "tags", replace: '["a", "b"]' });
+    await post("do_noncode", { file_path: p, phrase: "config", replace: '{"key": "val"}' });
+    await post("do_noncode", { file_path: p, phrase: "count", replace: "42" });
+    const after = disk(p);
+    expect(() => JSON.parse(after)).not.toThrow();
+    const parsed = JSON.parse(after);
+    expect(parsed.enabled).toBe(false);
+    expect(parsed.tags).toEqual(["a", "b"]);
+    expect(parsed.config).toEqual({ key: "val" });
+    expect(parsed.count).toBe(42);
+  });
+
   test("json stays valid after word edit", async () => {
     const json = '{\n  "host": "localhost",\n  "port": 3000,\n  "debug": false\n}\n';
     const p = seed("corrupt-json2.json", json);
