@@ -1,7 +1,21 @@
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync } from "fs";
+import http from "node:http";
+import { existsSync, mkdirSync, writeFileSync, readFileSync } from "fs";
 import { join } from "path";
+
+function unixFetch(socketPath: string, path: string, opts?: { method?: string; body?: string }): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ socketPath, path, method: opts?.method ?? "GET", headers: opts?.body ? { "Content-Type": "application/json" } : {} }, res => {
+      let data = "";
+      res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+      res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve(data); } });
+    });
+    req.on("error", reject);
+    if (opts?.body) req.write(opts.body);
+    req.end();
+  });
+}
 
 const PORT = 14568;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -27,7 +41,7 @@ async function createSession(): Promise<string> {
 }
 
 async function deleteSession(sid: string): Promise<void> {
-  try { await fetch("http://localhost/", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }), unix: DAEMON_SOCK } as RequestInit); } catch {}
+  try { await unixFetch(DAEMON_SOCK, "/", { method: "POST", body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }) }); } catch {}
   try { const p = spawn("opencode", ["session", "delete", sid].filter(Boolean), { cwd: PROJECT_DIR, stdio: ["pipe", "pipe", "pipe"] }); await new Promise<void>(r => p.on("exit", () => r())); } catch {}
 }
 

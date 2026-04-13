@@ -1,8 +1,31 @@
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, rmSync, mkdirSync, readFileSync } from "fs";
+import { existsSync, rmSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+
+import http from "node:http";
+
+function collectStdout(proc: ChildProcess): Promise<string> {
+  return new Promise(resolve => {
+    let buf = "";
+    proc.stdout?.on("data", (chunk: Buffer) => { buf += chunk.toString(); });
+    proc.on("exit", () => resolve(buf));
+  });
+}
+
+function unixFetch(socketPath: string, path: string, opts?: { method?: string; body?: string }): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ socketPath, path, method: opts?.method ?? "GET", headers: opts?.body ? { "Content-Type": "application/json" } : {} }, res => {
+      let data = "";
+      res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+      res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve(data); } });
+    });
+    req.on("error", reject);
+    if (opts?.body) req.write(opts.body);
+    req.end();
+  });
+}
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -58,12 +81,7 @@ const DAEMON_SOCK = (process.env.CLWND_SOCKET ?? `${process.env.XDG_RUNTIME_DIR 
 async function deleteSession(sid: string): Promise<void> {
   // 1. Tell daemon to kill the claude subprocess and drop session state
   try {
-    await fetch("http://localhost/", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }),
-      unix: DAEMON_SOCK,
-    } as RequestInit);
+    await unixFetch(DAEMON_SOCK, "/", { method: "POST", body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }) });
   } catch {}
   // 2. Delete from opencode's side
   try {
@@ -75,7 +93,7 @@ async function deleteSession(sid: string): Promise<void> {
 async function sweepDaemonSessions(): Promise<number> {
   // Get all daemon sessions, cleanup any that exist
   try {
-    const r = await fetch("http://localhost/status", { unix: DAEMON_SOCK } as RequestInit);
+    const r = await unixFetch(DAEMON_SOCK, "/status");
     const status = await r.json() as { sessions: number; procs: Array<{ sessions: string[] }> };
     // Collect all session IDs from active processes
     const allSids: string[] = [];
@@ -96,7 +114,7 @@ async function sweepDaemonSessions(): Promise<number> {
 
 async function getSessionState(sid: string): Promise<any> {
   try {
-    const r = await fetch("http://localhost/sessions", { unix: DAEMON_SOCK } as RequestInit);
+    const r = await unixFetch(DAEMON_SOCK, "/sessions");
     const all = await r.json() as Record<string, any>;
     return all[sid];
   } catch { return null; }
@@ -237,8 +255,7 @@ async function nuke(pid?: number): Promise<void> {
 
   // 4. Verify port is free
   const probe = spawn("sh", ["-c", `lsof -ti :${PORT}`].filter(Boolean), { stdio: ["pipe", "pipe", "pipe"] });
-  const out = await new Response(probe.stdout).text();
-  await new Promise<void>(r => probe.on("exit", () => r()));
+  const out = await collectStdout(probe);
   if (out.trim()) {
     // Something survived everything above — last resort
     await sh(`echo "${out.trim()}" | xargs kill -9 2>/dev/null`);
@@ -259,8 +276,7 @@ beforeAll(async () => {
 
   // Verify port is actually free (nuke can't kill processes owned by other users)
   const portCheck = spawn("sh", ["-c", `lsof -ti :${PORT}`].filter(Boolean), { stdio: ["pipe", "pipe", "pipe"] });
-  const portPids = (await new Response(portCheck.stdout).text()).trim();
-  await new Promise<void>(r => portCheck.on("exit", () => r()));
+  const portPids = (await collectStdout(portCheck)).trim();
   if (portPids) {
     throw new Error(`Port ${PORT} still held by PID(s) ${portPids} after cleanup — likely owned by another user. Kill manually: sudo kill -9 ${portPids}`);
   }
@@ -331,8 +347,7 @@ beforeAll(async () => {
   // Import seed session fixture (6-turn clwnd conversation with free model)
   if (existsSync(SEED_FIXTURE)) {
     const importProc = spawn("opencode", ["import", SEED_FIXTURE], { cwd: PROJECT_DIR, env: { ...process.env }, stdio: ["pipe", "pipe", "pipe"] });
-    const importOut = await new Response(importProc.stdout).text();
-    await new Promise<void>(r => importProc.on("exit", () => r()));
+    const importOut = await collectStdout(importProc);
     const match = importOut.match(/ses_\w+/);
     if (match) {
       seedSessionId = match[0];
@@ -1064,12 +1079,7 @@ describe("e2e-serve: compaction", () => {
 
     // Kill Claude CLI process first to free memory for compaction
     try {
-      await fetch("http://localhost/", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }),
-        unix: DAEMON_SOCK,
-      } as RequestInit);
+      await unixFetch(DAEMON_SOCK, "/", { method: "POST", body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }) });
     } catch {}
     await new Promise(r => setTimeout(r, 1_000));
 
@@ -1302,7 +1312,7 @@ describe("e2e-serve: resource governance", () => {
     await sendMessage(sid, "Say hello briefly.");
 
     // Verify process exists (poolKey = session ID, shows as "model" in status)
-    const statusBefore = await (await fetch("http://localhost/status", { unix: DAEMON_SOCK } as RequestInit)).json() as any;
+    const statusBefore = await (await unixFetch(DAEMON_SOCK, "/status")).json() as any;
     const hasProcBefore = (statusBefore.procs ?? []).some((p: any) => p.model === sid);
     expect(hasProcBefore).toBe(true);
 
@@ -1310,7 +1320,7 @@ describe("e2e-serve: resource governance", () => {
     await new Promise(r => setTimeout(r, 35_000));
 
     // Process should be gone — killed by idle timer
-    const statusAfter = await (await fetch("http://localhost/status", { unix: DAEMON_SOCK } as RequestInit)).json() as any;
+    const statusAfter = await (await unixFetch(DAEMON_SOCK, "/status")).json() as any;
     const hasProcAfter = (statusAfter.procs ?? []).some((p: any) => p.model === sid);
     expect(hasProcAfter).toBe(false);
 
@@ -1341,12 +1351,7 @@ describe("e2e-serve: drone swallow + retrofit", () => {
 
     // Kill the process — next message will respawn with broken seed
     try {
-      await fetch("http://localhost/", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }),
-        unix: DAEMON_SOCK,
-      } as RequestInit);
+      await unixFetch(DAEMON_SOCK, "/", { method: "POST", body: JSON.stringify({ action: "cleanup", opencodeSessionId: sid }) });
     } catch {}
     await new Promise(r => setTimeout(r, 2_000));
 
