@@ -81,12 +81,7 @@ function SidebarView(props: { api: any; session_id: string }) {
   const savingsLine = createMemo(() => {
     const d = data()
     if (d.status === "disconnected") return ""
-    const parts: string[] = []
-    parts.push(`$${String(d.dollarsSaved)} saved`)
-    if (d.compactionsSaved > 0) parts.push(`${String(d.compactionsSaved)} curated`)
-    if (d.corruptionsCaught > 0) parts.push(`${String(d.corruptionsCaught)} caught`)
-    if (d.editsBlocked > 0) parts.push(`${String(d.editsBlocked)} blocked`)
-    return parts.join(" · ")
+    return `$${String(d.dollarsSaved)} saved · ${String(d.compactionsSaved)} curated · ${String(d.corruptionsCaught)} caught · ${String(d.editsBlocked)} blocked`
   })
 
   return (
@@ -102,7 +97,7 @@ function SidebarView(props: { api: any; session_id: string }) {
         {`${String(data().procs)} proc${data().procs !== 1 ? "s" : ""} · ${String(data().sessions)} session${data().sessions !== 1 ? "s" : ""}`}
       </text>
       <Show when={savingsLine() !== ""}>
-        <text fg={data().dollarsSaved > 0 ? theme().success : theme().textMuted}>{savingsLine()}</text>
+        <text fg={theme().textMuted}>{savingsLine()}</text>
       </Show>
     </box>
   )
