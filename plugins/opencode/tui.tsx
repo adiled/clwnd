@@ -84,20 +84,32 @@ function SidebarView(props: { api: any; session_id: string }) {
     return `$${String(d.dollarsSaved)} saved · ${String(d.compactionsSaved)} curated · ${String(d.corruptionsCaught)} caught · ${String(d.editsBlocked)} blocked`
   })
 
+  const line2 = createMemo(() => {
+    const d = data()
+    if (d.status === "disconnected") return ""
+    return `$${String(d.dollarsSaved)} saved · ${String(d.sessions)} session${d.sessions !== 1 ? "s" : ""}`
+  })
+
+  const line3 = createMemo(() => {
+    const d = data()
+    if (d.status === "disconnected") return ""
+    return `${String(d.compactionsSaved)} curated · ${String(d.corruptionsCaught)} caught · ${String(d.editsBlocked)} blocked`
+  })
+
   return (
     <box>
-      <text fg={theme().textMuted}>
+      <text>
         <span style={{ fg: dotColor() }}>{"•"}</span>
         {" "}
         <b>{"clwnd"}</b>
-        {" "}
-        <span>{VERSION}</span>
+        {` ${VERSION}`}
+        <span style={{ fg: theme().textMuted }}>{` · ${String(data().procs)} proc${data().procs !== 1 ? "s" : ""}`}</span>
       </text>
-      <text fg={theme().textMuted}>
-        {`${String(data().procs)} proc${data().procs !== 1 ? "s" : ""} · ${String(data().sessions)} session${data().sessions !== 1 ? "s" : ""}`}
-      </text>
-      <Show when={savingsLine() !== ""}>
-        <text fg={theme().textMuted}>{savingsLine()}</text>
+      <Show when={line2() !== ""}>
+        <text fg={theme().textMuted}>{line2()}</text>
+      </Show>
+      <Show when={line3() !== ""}>
+        <text fg={theme().textMuted}>{line3()}</text>
       </Show>
     </box>
   )
