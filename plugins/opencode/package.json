@@ -12,6 +12,10 @@
       "import": "./tui.tsx"
     }
   },
+  "files": [
+    "dist/",
+    "tui.tsx"
+  ],
   "scripts": {
     "build": "tsup"
   },
