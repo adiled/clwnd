@@ -24,9 +24,14 @@ jobs:
       - name: Install dependencies
         run: npm install -g pnpm && pnpm install
 
+      - name: Build plugin
+        run: pnpm -r run build
+
       - name: Publish @clwnd/opencode
         working-directory: plugins/opencode
-        run: npm publish --access public
+        run: |
+          test -f dist/index.js || { echo "::error::dist/index.js missing — build did not produce output"; exit 1; }
+          npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
