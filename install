@@ -77,10 +77,36 @@ ensure_min_version() {
 }
 
 check_prereqs() {
-  [ -x "$(command -v node)" ]   || { echo "error: node required"; exit 1; }
-  [ -x "$(command -v pnpm)" ]   || { echo "error: pnpm required"; exit 1; }
+  # Node + pnpm are NOT hard requirements anymore — `ensure_node_version`
+  # and `ensure_pnpm` provision them under $CLWND_DATA/node if missing or
+  # if the system version doesn't match `.node-version`. clwnd ships its
+  # own node toolchain rustup-style so the daemon never breaks when the
+  # user changes their system node.
   [ -x "$(command -v claude)" ] || { echo "error: claude CLI required"; exit 1; }
   [ -x "$(command -v git)" ]    || { echo "error: git required"; exit 1; }
+  [ -x "$(command -v tar)" ]    || { echo "error: tar required (used to extract pinned node)"; exit 1; }
+  if [ ! -x "$(command -v curl)" ] && [ ! -x "$(command -v wget)" ]; then
+    echo "error: curl or wget required (used to download pinned node)"
+    exit 1
+  fi
+
+  # better-sqlite3 + tree-sitter usually have prebuilds on Node 20, but
+  # if the user's arch has no prebuild, pnpm falls back to node-gyp.
+  # Check the toolchain so that fallback path doesn't die mid-install
+  # with a half-built node_modules.
+  if [ ! -x "$(command -v cc)" ] && [ ! -x "$(command -v gcc)" ] && [ ! -x "$(command -v clang)" ]; then
+    echo "error: C compiler required (gcc/clang) for native dep fallback build"
+    exit 1
+  fi
+  if [ ! -x "$(command -v c++)" ] && [ ! -x "$(command -v g++)" ] && [ ! -x "$(command -v clang++)" ]; then
+    echo "error: C++ compiler required (g++/clang++) for native dep fallback build"
+    exit 1
+  fi
+  [ -x "$(command -v make)" ] || { echo "error: make required for native dep fallback build"; exit 1; }
+  if [ ! -x "$(command -v python3)" ] && [ ! -x "$(command -v python)" ]; then
+    echo "error: python3 required for node-gyp fallback build"
+    exit 1
+  fi
 
   ensure_min_version "Claude CLI" "claude" "$MIN_CLAUDE"
 
@@ -89,6 +115,105 @@ check_prereqs() {
   if [ -n "$OC_BIN" ]; then
     ensure_min_version "OpenCode" "$OC_BIN" "$MIN_OPENCODE"
   fi
+}
+
+# clwnd ships its own node + pnpm under $CLWND_DATA/node/v$PINNED so the
+# daemon's ExecStart points at a binary clwnd owns. The user's system
+# node can vanish (version manager GC, distro upgrade) — ours can't.
+
+ensure_node_version() {
+  local PINNED_FILE="$CLWND_SRC/.node-version"
+  [ -f "$PINNED_FILE" ] || { echo "error: $PINNED_FILE missing — clone is incomplete"; exit 1; }
+
+  local PINNED
+  PINNED=$(tr -d 'v\n\r ' < "$PINNED_FILE")
+
+  local OS_NAME ARCH_NAME
+  case "$OS" in
+    Darwin) OS_NAME="darwin" ;;
+    Linux)  OS_NAME="linux" ;;
+    *) echo "error: unsupported OS for node auto-install: $OS"; exit 1 ;;
+  esac
+  case "$(uname -m)" in
+    x86_64|amd64)  ARCH_NAME="x64" ;;
+    arm64|aarch64) ARCH_NAME="arm64" ;;
+    *) echo "error: unsupported arch for node auto-install: $(uname -m)"; exit 1 ;;
+  esac
+
+  local NODE_DIR="$CLWND_DATA/node/v${PINNED}"
+  local NODE_BIN="$NODE_DIR/bin/node"
+
+  if [ -x "$NODE_BIN" ]; then
+    CLWND_NODE_BIN="$NODE_BIN"
+    echo "[node] using cached pinned node at $NODE_BIN ✓"
+    export PATH="$(dirname "$CLWND_NODE_BIN"):$PATH"
+    return 0
+  fi
+
+  local TARBALL="node-v${PINNED}-${OS_NAME}-${ARCH_NAME}.tar.xz"
+  local URL="https://nodejs.org/dist/v${PINNED}/${TARBALL}"
+  local CACHE_DIR="$CLWND_DATA/node-cache"
+  local TARPATH="$CACHE_DIR/$TARBALL"
+  mkdir -p "$CACHE_DIR" "$CLWND_DATA/node"
+
+  if [ ! -f "$TARPATH" ]; then
+    echo "[node] downloading $URL..."
+    if [ -x "$(command -v curl)" ]; then
+      curl -fsSL --retry 3 -o "$TARPATH.part" "$URL" || { echo "error: node download failed"; rm -f "$TARPATH.part"; exit 1; }
+    else
+      wget -q -O "$TARPATH.part" "$URL" || { echo "error: node download failed"; rm -f "$TARPATH.part"; exit 1; }
+    fi
+    mv "$TARPATH.part" "$TARPATH"
+  fi
+
+  echo "[node] extracting to $NODE_DIR..."
+  mkdir -p "$NODE_DIR"
+  tar -xJf "$TARPATH" -C "$NODE_DIR" --strip-components=1 || {
+    echo "error: extraction failed"
+    rm -rf "$NODE_DIR"
+    exit 1
+  }
+
+  [ -x "$NODE_BIN" ] || { echo "error: node binary missing after extract"; exit 1; }
+  CLWND_NODE_BIN="$NODE_BIN"
+  echo "[node] installed pinned ${PINNED} at $NODE_BIN ✓"
+  export PATH="$(dirname "$CLWND_NODE_BIN"):$PATH"
+}
+
+# pnpm version comes from package.json's `packageManager` field, provisioned
+# via the corepack that ships beside our pinned node.
+
+ensure_pnpm() {
+  local NODE_DIR
+  NODE_DIR=$(dirname "$CLWND_NODE_BIN")
+
+  if [ -x "$NODE_DIR/corepack" ]; then
+    echo "[pnpm] enabling corepack..."
+    "$NODE_DIR/corepack" enable --install-directory "$NODE_DIR" 2>/dev/null || true
+
+    local PINNED_PNPM
+    PINNED_PNPM=$("$CLWND_NODE_BIN" -e "
+      try {
+        const pm = require('$CLWND_SRC/package.json').packageManager || '';
+        const m = pm.match(/^pnpm@([0-9.]+)/);
+        process.stdout.write(m ? m[1] : '');
+      } catch { process.stdout.write(''); }
+    ")
+    if [ -n "$PINNED_PNPM" ]; then
+      echo "[pnpm] activating pnpm@${PINNED_PNPM} via corepack..."
+      "$NODE_DIR/corepack" prepare "pnpm@${PINNED_PNPM}" --activate 2>&1 | sed 's/^/  /' || true
+    fi
+  fi
+
+  if [ ! -x "$NODE_DIR/pnpm" ]; then
+    echo "error: corepack did not provision pnpm at $NODE_DIR/pnpm"
+    exit 1
+  fi
+  CLWND_PNPM_BIN="$NODE_DIR/pnpm"
+
+  local PNPM_VER
+  PNPM_VER=$("$CLWND_PNPM_BIN" --version 2>/dev/null || echo "?")
+  echo "[pnpm] using ${CLWND_PNPM_BIN} (${PNPM_VER}) ✓"
 }
 
 ensure_dirs() {
@@ -137,16 +262,31 @@ ensure_source() {
 }
 
 do_build() {
-  echo "[build] pnpm install..."
   cd "$CLWND_SRC"
-  pnpm install
+
+  # Wipe non-pnpm artifacts before pnpm install — flat node_modules and
+  # other lockfiles confuse pnpm's symlink tree.
+  rm -f bun.lock bun.lockb
+  rm -rf dist
+  if [ -d node_modules ] && [ ! -d node_modules/.pnpm ]; then
+    rm -rf node_modules plugins/*/node_modules
+  fi
+
+  echo "[build] pnpm install..."
+  "$CLWND_PNPM_BIN" install
 
   echo "[build] compiling..."
-  pnpm run build
+  "$CLWND_PNPM_BIN" run build
 
-  # Dev mode no longer copies a single .js file — the plugin ref in
-  # opencode.json + tui.json now points at the package directory so OC
-  # can resolve both server and TUI entries from exports.
+  # ExecStart invokes tsx directly; refuse to register a broken unit.
+  [ -x "$CLWND_SRC/node_modules/.bin/tsx" ] || {
+    echo "error: tsx missing at $CLWND_SRC/node_modules/.bin/tsx"
+    exit 1
+  }
+  [ -f "$CLWND_SRC/plugins/opencode/dist/index.js" ] || {
+    echo "error: plugin build missing at plugins/opencode/dist/index.js"
+    exit 1
+  }
 }
 
 plugin_ref() {
@@ -237,7 +377,8 @@ fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
 
 register_service() {
   local NODE CLAUDE
-  NODE=$(which node)
+  # Use the clwnd-owned node so the unit survives system node changes.
+  NODE="$CLWND_NODE_BIN"
   CLAUDE=$(which claude)
 
   if [ "$OS" = "Darwin" ]; then
@@ -383,6 +524,7 @@ print_status() {
   echo "  config: $CLWND_CONFIG/"
   echo "  data:   $CLWND_DATA/"
   echo "  state:  $CLWND_STATE/"
+  [ -n "$CLWND_NODE_BIN" ] && echo "  node:   $CLWND_NODE_BIN"
   if [ "$OS" = "Darwin" ]; then
     echo "  logs:   tail -f $CLWND_STATE/daemon.stderr.log"
     echo "  stop:   launchctl bootout gui/$(id -u)/com.clwnd.daemon"
@@ -430,6 +572,8 @@ cmd_install() {
   check_prereqs
   ensure_dirs
   ensure_source
+  ensure_node_version
+  ensure_pnpm
   do_build
 
   echo "[service] registering..."
@@ -488,6 +632,10 @@ cmd_update() {
   ensure_dirs
   SOURCE_UNCHANGED=0
   ensure_source
+  # Run AFTER ensure_source so .node-version is available; the pinned
+  # version may have moved between releases, so re-check every update.
+  ensure_node_version
+  ensure_pnpm
 
   echo "[daemon] stopping..."
   stop_daemon

@@ -78,22 +78,10 @@ function SidebarView(props: { api: any; session_id: string }) {
     return theme().secondary
   })
 
-  const savingsLine = createMemo(() => {
-    const d = data()
-    if (d.status === "disconnected") return ""
-    return `$${String(d.dollarsSaved)} saved · ${String(d.compactionsSaved)} curated · ${String(d.corruptionsCaught)} caught · ${String(d.editsBlocked)} blocked`
-  })
-
   const line2 = createMemo(() => {
     const d = data()
     if (d.status === "disconnected") return ""
     return `$${String(d.dollarsSaved)} saved · ${String(d.sessions)} session${d.sessions !== 1 ? "s" : ""}`
-  })
-
-  const line3 = createMemo(() => {
-    const d = data()
-    if (d.status === "disconnected") return ""
-    return `${String(d.compactionsSaved)} curated · ${String(d.corruptionsCaught)} caught · ${String(d.editsBlocked)} blocked`
   })
 
   return (
@@ -107,9 +95,6 @@ function SidebarView(props: { api: any; session_id: string }) {
       </text>
       <Show when={line2() !== ""}>
         <text fg={theme().textMuted}>{line2()}</text>
-      </Show>
-      <Show when={line3() !== ""}>
-        <text fg={theme().textMuted}>{line3()}</text>
       </Show>
     </box>
   )

@@ -8,6 +8,10 @@
     "plugins/*"
   ],
   "main": "daemon/daemon.ts",
+  "engines": {
+    "node": ">=20.20.2 <21"
+  },
+  "packageManager": "pnpm@10.33.0",
   "scripts": {
     "test": "vitest run",
     "test:e2e-serve": "vitest run tests/e2e-serve.test.ts",
