@@ -113,6 +113,338 @@ const EXT_TO_LANG: Record<string, LanguageEntry> = {
   ".vue":  { runtime: "wasm", wasmFile: "tree-sitter-vue.wasm", queryPaths: [], vendoredExtra: "vue.scm" },
 };
 
+// Import-ish top-level node types per extension. Used by the synthetic
+// `imports` symbol that do_code exposes so agents can address the
+// top-of-file import block as one unit without knowing the language's
+// exact grammar. The user surface is uniform (symbol: 'imports'); this
+// mapping is the internal cost of AST-grounded detection — there is no
+// universal "import" node in tree-sitter.
+//
+// Omissions: Ruby (`require` is a method call, not a grammar node),
+// shell (`source`/`.` same story), Vue (imports live inside <script>
+// and WASM symbol detection isn't wired for imports yet). On those,
+// `symbol: 'imports'` returns not-found and the agent falls back to a
+// whole-file replace.
+const IMPORT_NODE_TYPES: Record<string, Set<string>> = {
+  ".ts":   new Set(["import_statement"]),
+  ".tsx":  new Set(["import_statement"]),
+  ".js":   new Set(["import_statement"]),
+  ".jsx":  new Set(["import_statement"]),
+  ".mjs":  new Set(["import_statement"]),
+  ".cjs":  new Set(["import_statement"]),
+  ".py":   new Set(["import_statement", "import_from_statement", "future_import_statement"]),
+  ".pyi":  new Set(["import_statement", "import_from_statement", "future_import_statement"]),
+  ".go":   new Set(["import_declaration"]),
+  ".rs":   new Set(["use_declaration", "extern_crate_declaration"]),
+  ".java": new Set(["import_declaration"]),
+  ".c":    new Set(["preproc_include"]),
+  ".h":    new Set(["preproc_include"]),
+  ".cc":   new Set(["preproc_include"]),
+  ".cpp":  new Set(["preproc_include"]),
+  ".cxx":  new Set(["preproc_include"]),
+  ".hpp":  new Set(["preproc_include"]),
+  ".hxx":  new Set(["preproc_include"]),
+  ".cs":   new Set(["using_directive"]),
+  ".php":  new Set(["namespace_use_declaration"]),
+};
+
+// Node types that may appear BETWEEN imports without breaking the
+// contiguous-block invariant. Comments and preprocessor glue are
+// conventional filler; any other top-level statement ends the run.
+// Intentionally excludes `try_statement` — a try-wrapped compat import
+// (common in Python 2/3 shims) is treated as a gap, so the synthetic
+// block spans only real consecutive imports before the try.
+const IMPORT_INTERSTITIAL_TYPES = new Set([
+  "comment",
+  "line_comment",
+  "block_comment",
+  "hash_bang_line",
+  "shebang_line",
+  "preproc_def",
+  "preproc_call",
+  "preproc_function_def",
+  "preproc_undef",
+]);
+
+// Walk top-level children to find the first contiguous run of imports.
+// Leading prelude (package decl, pragma, shebang, comments, guards) is
+// silently skipped. Once inside the run, only interstitials are allowed
+// between imports — any real statement ends the block.
+function detectImportsSymbol(rootNode: any, ext: string): Symbol | null {
+  const types = IMPORT_NODE_TYPES[ext];
+  if (!types) return null;
+  let first: any = null;
+  let last: any = null;
+  for (let i = 0; i < rootNode.childCount; i++) {
+    const c = rootNode.child(i);
+    if (!c) continue;
+    if (types.has(c.type)) {
+      if (!first) first = c;
+      last = c;
+      continue;
+    }
+    if (first && IMPORT_INTERSTITIAL_TYPES.has(c.type)) continue;
+    if (first) break;
+    // before first import: skip any prelude silently
+  }
+  if (!first || !last) return null;
+  return {
+    name: "imports",
+    kind: "imports",
+    startLine: first.startPosition.row + 1,
+    endLine: last.endPosition.row + 1,
+    startIndex: first.startIndex,
+    endIndex: last.endIndex,
+    children: [],
+  };
+}
+
+// ─── Sub-symbol linguistic addressing (experimental) ───────────────────────
+//
+// Gated by config `experimental.subpath` (clwnd.json). When enabled, path
+// segments that don't match a named child are treated as linguistic
+// aliases that walk the AST inside the current symbol:
+//
+//   foo.when.body         → body of the first if inside foo
+//   foo.when.otherwise    → else branch of the first if
+//   foo.try.otherwise     → catch block of the first try
+//   foo.loop#2.body       → body of the second loop
+//   foo.return            → first return statement in foo
+//   foo.call#3            → third call expression in foo
+//
+// Vocabulary (7 words, total): body, otherwise, when, loop, try, return,
+// call. Each alias maps to a set of tree-sitter node types per language
+// (below). `body` and `otherwise` are context-dependent (they resolve
+// against the parent node); the rest do a document-order descendant
+// walk for the given node types with `#N` picking the Nth match.
+
+import { loadConfig } from "./config.ts";
+
+function subPathEnabled(): boolean {
+  return loadConfig().experimental.subpath;
+}
+
+// Node types considered "a block of statements" per language. The
+// `body` alias uses these to locate the primary block child.
+const BLOCK_TYPES: Record<string, string[]> = {
+  ".ts":  ["statement_block", "class_body"],
+  ".tsx": ["statement_block", "class_body"],
+  ".js":  ["statement_block", "class_body"],
+  ".jsx": ["statement_block", "class_body"],
+  ".mjs": ["statement_block", "class_body"],
+  ".cjs": ["statement_block", "class_body"],
+  ".py":  ["block"],
+  ".go":  ["block"],
+  ".rs":  ["block"],
+  ".java":["block", "class_body"],
+  ".c":   ["compound_statement"],
+  ".h":   ["compound_statement"],
+  ".cc":  ["compound_statement", "field_declaration_list"],
+  ".cpp": ["compound_statement", "field_declaration_list"],
+  ".cxx": ["compound_statement", "field_declaration_list"],
+  ".hpp": ["compound_statement", "field_declaration_list"],
+  ".hxx": ["compound_statement", "field_declaration_list"],
+  ".rb":  ["body_statement", "do_block"],
+  ".php": ["compound_statement"],
+  ".cs":  ["block"],
+};
+
+// Per-alias type maps. Empty array = alias unsupported for that ext.
+const ALIAS_TYPES: Record<string, Record<string, string[]>> = {
+  when: {
+    ".ts":["if_statement"],".tsx":["if_statement"],".js":["if_statement"],".jsx":["if_statement"],".mjs":["if_statement"],".cjs":["if_statement"],
+    ".py":["if_statement"],
+    ".go":["if_statement"],
+    ".rs":["if_expression"],
+    ".java":["if_statement"],
+    ".c":["if_statement"],".h":["if_statement"],
+    ".cc":["if_statement"],".cpp":["if_statement"],".cxx":["if_statement"],".hpp":["if_statement"],".hxx":["if_statement"],
+    ".rb":["if","if_modifier","unless","unless_modifier"],
+    ".php":["if_statement"],
+    ".cs":["if_statement"],
+  },
+  loop: {
+    ".ts":["for_statement","for_in_statement","for_of_statement","while_statement","do_statement"],
+    ".tsx":["for_statement","for_in_statement","for_of_statement","while_statement","do_statement"],
+    ".js":["for_statement","for_in_statement","for_of_statement","while_statement","do_statement"],
+    ".jsx":["for_statement","for_in_statement","for_of_statement","while_statement","do_statement"],
+    ".mjs":["for_statement","for_in_statement","for_of_statement","while_statement","do_statement"],
+    ".cjs":["for_statement","for_in_statement","for_of_statement","while_statement","do_statement"],
+    ".py":["for_statement","while_statement"],
+    ".go":["for_statement"],
+    ".rs":["for_expression","while_expression","loop_expression"],
+    ".java":["for_statement","enhanced_for_statement","while_statement","do_statement"],
+    ".c":["for_statement","while_statement","do_statement"],
+    ".h":["for_statement","while_statement","do_statement"],
+    ".cc":["for_statement","for_range_loop","while_statement","do_statement"],
+    ".cpp":["for_statement","for_range_loop","while_statement","do_statement"],
+    ".cxx":["for_statement","for_range_loop","while_statement","do_statement"],
+    ".hpp":["for_statement","for_range_loop","while_statement","do_statement"],
+    ".hxx":["for_statement","for_range_loop","while_statement","do_statement"],
+    ".rb":["while","until","for","while_modifier","until_modifier"],
+    ".php":["for_statement","foreach_statement","while_statement","do_statement"],
+    ".cs":["for_statement","foreach_statement","while_statement","do_statement"],
+  },
+  try: {
+    ".ts":["try_statement"],".tsx":["try_statement"],".js":["try_statement"],".jsx":["try_statement"],".mjs":["try_statement"],".cjs":["try_statement"],
+    ".py":["try_statement"],
+    ".java":["try_statement","try_with_resources_statement"],
+    ".cc":["try_statement"],".cpp":["try_statement"],".cxx":["try_statement"],".hpp":["try_statement"],".hxx":["try_statement"],
+    ".rb":["begin"],
+    ".php":["try_statement"],
+    ".cs":["try_statement"],
+    // Unsupported in language-level grammar — alias returns nothing.
+    ".go":[],".c":[],".h":[],".rs":[],
+  },
+  return: {
+    ".ts":["return_statement"],".tsx":["return_statement"],".js":["return_statement"],".jsx":["return_statement"],".mjs":["return_statement"],".cjs":["return_statement"],
+    ".py":["return_statement"],
+    ".go":["return_statement"],
+    ".rs":["return_expression"],
+    ".java":["return_statement"],
+    ".c":["return_statement"],".h":["return_statement"],
+    ".cc":["return_statement"],".cpp":["return_statement"],".cxx":["return_statement"],".hpp":["return_statement"],".hxx":["return_statement"],
+    ".rb":["return"],
+    ".php":["return_statement"],
+    ".cs":["return_statement"],
+  },
+  call: {
+    ".ts":["call_expression"],".tsx":["call_expression"],".js":["call_expression"],".jsx":["call_expression"],".mjs":["call_expression"],".cjs":["call_expression"],
+    ".py":["call"],
+    ".go":["call_expression"],
+    ".rs":["call_expression","macro_invocation"],
+    ".java":["method_invocation"],
+    ".c":["call_expression"],".h":["call_expression"],
+    ".cc":["call_expression"],".cpp":["call_expression"],".cxx":["call_expression"],".hpp":["call_expression"],".hxx":["call_expression"],
+    ".rb":["call","method_call"],
+    ".php":["function_call_expression","member_call_expression","method_call_expression"],
+    ".cs":["invocation_expression"],
+  },
+};
+
+// Catch-clause types per language — used by `otherwise` on a try.
+const CATCH_TYPES = new Set([
+  "catch_clause", "except_clause", "else_clause", "rescue",
+  "catch_block", "catch", "handler",
+]);
+
+// `body`: field "body" or "consequence" wins; else first direct child
+// whose type is in BLOCK_TYPES for this ext.
+function resolveBody(node: any, ext: string): any {
+  for (const field of ["body", "consequence"]) {
+    const f = node.childForFieldName?.(field);
+    if (f) return f;
+  }
+  const types = new Set(BLOCK_TYPES[ext] ?? []);
+  for (let i = 0; i < node.childCount; i++) {
+    const c = node.child(i);
+    if (c && types.has(c.type)) return c;
+  }
+  return null;
+}
+
+// `otherwise`: if the parent is an if, return its "alternative" branch;
+// if it's a try, return the first catch-like clause.
+function resolveOtherwise(node: any): any {
+  const alt = node.childForFieldName?.("alternative");
+  if (alt) return alt;
+  for (let i = 0; i < node.childCount; i++) {
+    const c = node.child(i);
+    if (c && CATCH_TYPES.has(c.type)) return c;
+  }
+  return null;
+}
+
+// Walk descendants in document order, return the Nth node whose type
+// is in `types`. Once a match is counted, we still keep walking siblings
+// but don't redescend into the matched node (spec: ordinals count
+// distinct siblings, not nested matches inside earlier matches).
+function findNthDescendant(root: any, types: Set<string>, occurrence: number): any {
+  let count = 0;
+  let found: any = null;
+  function walk(n: any): boolean {
+    for (let i = 0; i < n.childCount; i++) {
+      const c = n.child(i);
+      if (!c) continue;
+      if (types.has(c.type)) {
+        count++;
+        if (count === occurrence) { found = c; return true; }
+        // Don't descend into matched nodes — a call inside a call
+        // isn't `call#2` of the enclosing scope; it's `call#1.call`.
+        continue;
+      }
+      if (walk(c)) return true;
+    }
+    return false;
+  }
+  walk(root);
+  return found;
+}
+
+// Resolve a single alias segment inside the given node's scope.
+function resolveAliasSegment(node: any, alias: string, occurrence: number, ext: string): any {
+  if (alias === "body") return occurrence === 1 ? resolveBody(node, ext) : null;
+  if (alias === "otherwise") return occurrence === 1 ? resolveOtherwise(node) : null;
+  const typeMap = ALIAS_TYPES[alias];
+  if (!typeMap) return null;
+  const types = new Set(typeMap[ext] ?? []);
+  if (types.size === 0) return null;
+  return findNthDescendant(node, types, occurrence);
+}
+
+// Find the definition-like AST node corresponding to a Symbol. The
+// Symbol's byte range may include leading comments (expandForLeadingComments),
+// so we descend to the midpoint and walk up to the first definition
+// ancestor — more robust than exact-range matching.
+function nodeForSymbol(root: any, sym: Symbol): any {
+  const mid = Math.floor((sym.startIndex + sym.endIndex) / 2);
+  const inside = root.descendantForIndex?.(mid, mid) ?? root;
+  let cur = inside;
+  while (cur) {
+    const t = cur.type as string;
+    if (/function|method|class|struct|interface|enum|trait|impl|namespace|module|macro|declaration|definition/i.test(t)) {
+      return cur;
+    }
+    if (!cur.parent) break;
+    cur = cur.parent;
+  }
+  return inside;
+}
+
+function resolveAliasPath(filePath: string, rootSym: Symbol, aliasPath: string[]): Symbol | null {
+  const ext = extname(filePath).toLowerCase();
+  const lang = getLanguage(ext);
+  if (!lang) return null;
+  let source: string;
+  try { source = readFileSync(filePath, "utf-8"); } catch { return null; }
+  try {
+    const P = getParser();
+    const parser = new P();
+    parser.setLanguage(lang);
+    const tree = parser.parse(source, null, { bufferSize: 4 * 1024 * 1024 });
+    let node = nodeForSymbol(tree.rootNode, rootSym);
+    if (!node) return null;
+    let lastName = aliasPath[0];
+    for (const seg of aliasPath) {
+      const { name, occurrence } = parseSegment(seg);
+      lastName = name;
+      const next = resolveAliasSegment(node, name, occurrence, ext);
+      if (!next) return null;
+      node = next;
+    }
+    return {
+      name: lastName,
+      kind: node.type,
+      startLine: (node.startPosition.row as number) + 1,
+      endLine: (node.endPosition.row as number) + 1,
+      startIndex: node.startIndex,
+      endIndex: node.endIndex,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // Locate vendored query files at runtime. We try a few candidate paths
 // because the source layout (lib/queries/) doesn't match the bundled
 // layout (dist/daemon/queries/) and we want both dev mode (running .ts
@@ -286,6 +618,20 @@ export interface Symbol {
   startIndex: number;
   endIndex: number;
   children?: Symbol[];
+  /**
+   * Function/method signature — "(params) -> return" with whitespace
+   * collapsed. Populated when the def node exposes a parameters child;
+   * absent for non-callables and for grammars where the parameter node
+   * isn't addressable by field name or type. Rendered in formatSymbols
+   * so the outline answers "what does this take?" without a drill-in.
+   */
+  signature?: string;
+  /**
+   * Decorators / annotations applied to the definition, in source order
+   * (`@staticmethod`, `@cache`, `@Override`). Arguments to the
+   * decorator are stripped — agents only need the name for triage.
+   */
+  decorators?: string[];
 }
 
 // ─── Parsed-file cache ─────────────────────────────────────────────────────
@@ -353,7 +699,9 @@ function cachedParse(filePath: string): AstCacheEntry | null {
     const parser = new P();
     parser.setLanguage(lang);
     const tree = parser.parse(source, null, { bufferSize: 4 * 1024 * 1024 });
-    const symbols = extractSymbolsViaQuery(tree.rootNode, query, entry);
+    const symbols = extractSymbolsViaQuery(tree.rootNode, query, entry, source);
+    const imp = detectImportsSymbol(tree.rootNode, ext);
+    if (imp) symbols.unshift(imp);
     return cacheStore(filePath, stat.mtimeMs, symbols, source);
   } catch {
     return null;
@@ -389,7 +737,9 @@ async function cachedParseAsync(filePath: string): Promise<AstCacheEntry | null>
     const parser = new WP();
     parser.setLanguage(lang);
     const tree = parser.parse(source);
-    const symbols = extractSymbolsViaQuery(tree.rootNode, query, langEntry);
+    const symbols = extractSymbolsViaQuery(tree.rootNode, query, langEntry, source);
+    const imp = detectImportsSymbol(tree.rootNode, ext);
+    if (imp) symbols.unshift(imp);
     return cacheStore(filePath, stat.mtimeMs, symbols, source);
   } catch (e) {
     process.stderr.write?.(`[clwnd] WASM parse failed for ${filePath}: ${(e as Error).message}\n`);
@@ -458,12 +808,93 @@ function expandForLeadingComments(node: any): { startIndex: number; startLine: n
   return { startIndex, startLine };
 }
 
-function extractSymbolsViaQuery(rootNode: any, query: any, langEntry: LanguageEntry): Symbol[] {
+// Grammars disagree on field names for return types — Go uses "result",
+// Java/C# use "type" (the method's return), Python/Rust/TS use
+// "return_type". Probe each in order; the first hit wins.
+const RETURN_TYPE_FIELDS = ["return_type", "result", "type"];
+
+// Extract "(params) -> return" as a compact signature string. Uses
+// tree-sitter's field-name API first (fastest, exact) and falls back to
+// scanning children for `/parameter/`-typed nodes so C/C++'s
+// declarator-wrapped functions still surface something useful. Multiline
+// parameter lists get their whitespace collapsed — we're rendering a
+// one-line outline, not reconstructing source.
+function extractSignature(defNode: any, source: string): string | undefined {
+  let params = defNode.childForFieldName?.("parameters");
+  if (!params) {
+    for (let i = 0; i < defNode.childCount; i++) {
+      const c = defNode.child(i);
+      if (c && /parameter/.test(c.type)) { params = c; break; }
+    }
+  }
+  if (!params) return undefined;
+  let sig = source.slice(params.startIndex, params.endIndex);
+  let retEnd = params.endIndex;
+  for (const field of RETURN_TYPE_FIELDS) {
+    const ret = defNode.childForFieldName?.(field);
+    if (ret && ret.startIndex >= params.endIndex) {
+      sig += source.slice(params.endIndex, ret.endIndex);
+      retEnd = ret.endIndex;
+      break;
+    }
+  }
+  // Collapse internal whitespace so multi-line parameter lists render
+  // as one line. Keep the structure (commas, colons, arrows) intact.
+  // Tighten paren-adjacent space so a multi-line `(\n  x,\n  y,\n)`
+  // doesn't render as `( x, y, )`.
+  sig = sig.replace(/\s+/g, " ").replace(/\s*,\s*/g, ", ").replace(/\(\s+/g, "(").replace(/\s+\)/g, ")").replace(/,\s*\)/g, ")").trim();
+  // Truncate implausibly long signatures — the outline can't absorb them.
+  if (sig.length > 120) sig = sig.slice(0, 117) + "...";
+  return sig;
+}
+
+// Collect decorators / annotations applied to a definition. Walks the
+// expanded root (wrapper) AND the def node itself — wrappers like
+// Python's decorated_definition put decorators as siblings of the def,
+// whereas TS/Java attach them as children of the def. One function
+// covers both layouts so the interface is uniform.
+function extractDecorators(expanded: any, defNode: any, source: string): string[] {
+  const decos: string[] = [];
+  const seen = new Set<string>();
+  // Bounded recursion. Python wraps the def in decorated_definition
+  // (decorators are siblings of the def); TS/C# attach them as direct
+  // children of the def; Java buries them one level deep inside a
+  // `modifiers` wrapper. Depth 2 covers all three without wandering
+  // into the function body.
+  function scan(parent: any, depth: number): void {
+    if (depth > 2) return;
+    for (let i = 0; i < parent.childCount; i++) {
+      const c = parent.child(i);
+      if (!c) continue;
+      if (c.type === "decorator" || c.type === "annotation" || c.type === "marker_annotation") {
+        const raw = source.slice(c.startIndex, c.endIndex);
+        const match = raw.match(/@[A-Za-z_][\w.]*/);
+        if (match && !seen.has(match[0])) {
+          seen.add(match[0]);
+          decos.push(match[0]);
+        }
+        continue;
+      }
+      // Only recurse into modifier-like wrappers — body nodes (block,
+      // class_body, statement_block) are below, and decorators never
+      // live inside them. Also skip parameter/return-type subtrees.
+      if (/modifier|modifiers|attribute_list/.test(c.type)) {
+        scan(c, depth + 1);
+      }
+    }
+  }
+  scan(expanded, 0);
+  if (defNode !== expanded) scan(defNode, 0);
+  return decos;
+}
+
+function extractSymbolsViaQuery(rootNode: any, query: any, langEntry: LanguageEntry, source: string): Symbol[] {
   const matches = query.matches(rootNode);
   // Flat list of {node, kind, name, startIndex, endIndex, startLine, endLine}.
   // We post-process into a tree by byte-range containment.
   type Hit = {
     node: any;
+    defNode: any;
     kind: string;
     name: string;
     startIndex: number;
@@ -495,7 +926,7 @@ function extractSymbolsViaQuery(rootNode: any, query: any, langEntry: LanguageEn
     const dedupKey = `${startIndex}:${endIndex}:${name}:${kind}`;
     if (seen.has(dedupKey)) continue;
     seen.add(dedupKey);
-    hits.push({ node: expandedRoot, kind, name, startIndex, endIndex, startLine, endLine });
+    hits.push({ node: expandedRoot, defNode: defCapture.node, kind, name, startIndex, endIndex, startLine, endLine });
   }
 
   // Sort: outer first (smaller startIndex, then larger endIndex breaks ties).
@@ -515,6 +946,10 @@ function extractSymbolsViaQuery(rootNode: any, query: any, langEntry: LanguageEn
       startIndex: hit.startIndex,
       endIndex: hit.endIndex,
     };
+    const sig = extractSignature(hit.defNode, source);
+    if (sig) sym.signature = sig;
+    const decos = extractDecorators(hit.node, hit.defNode, source);
+    if (decos.length > 0) sym.decorators = decos;
     // Pop ancestors that don't contain this hit.
     while (stack.length > 0 && stack[stack.length - 1].hit.endIndex <= hit.startIndex) {
       stack.pop();
@@ -636,21 +1071,34 @@ function findSymbol(filePath: string, symbolPath: string): Symbol | null {
   const parts = symbolPath.split(".");
   let current: Symbol[] = entry.symbols;
   let found: Symbol | null = null;
-  for (const rawPart of parts) {
+  let aliasStart = -1;
+  for (let i = 0; i < parts.length; i++) {
+    const rawPart = parts[i];
     const { name, occurrence } = parseSegment(rawPart);
     // Find the Nth symbol with this name at the current scope level.
     let count = 0;
-    found = null;
+    let match: Symbol | null = null;
     for (const s of current) {
       if (s.name === name) {
         count++;
-        if (count === occurrence) { found = s; break; }
+        if (count === occurrence) { match = s; break; }
       }
     }
-    if (!found) return null;
-    current = found.children ?? [];
+    if (match) {
+      found = match;
+      current = found.children ?? [];
+      continue;
+    }
+    // Named miss. If the experimental sub-path flag is on and we have
+    // an anchor symbol, treat remaining segments as linguistic aliases
+    // (when, otherwise, body, loop, try, return, call). Otherwise
+    // preserve the old behavior — return null.
+    if (!subPathEnabled() || !found) return null;
+    aliasStart = i;
+    break;
   }
-  return found;
+  if (aliasStart === -1) return found;
+  return resolveAliasPath(filePath, found!, parts.slice(aliasStart));
 }
 
 /**
@@ -691,7 +1139,9 @@ export function formatSymbols(symbols: Symbol[], indent = 0): string {
     // on the normal case.
     const hasDupes = (nameCount.get(s.name) ?? 0) > 1;
     const suffix = hasDupes ? `#${occ}` : "";
-    lines.push(`${pad}${s.kind} ${s.name}${suffix} ${range}`);
+    const decoPrefix = s.decorators && s.decorators.length > 0 ? `${s.decorators.join(" ")} ` : "";
+    const sig = s.signature ?? "";
+    lines.push(`${pad}${decoPrefix}${s.kind} ${s.name}${suffix}${sig} ${range}`);
     if (s.children && s.children.length > 0) {
       lines.push(formatSymbols(s.children, indent + 1));
     }

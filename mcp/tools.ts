@@ -73,7 +73,9 @@ function assertPath(p: string): string {
 export const TOOLS = [
   {
     name: "read",
-    description: `The ONE filesystem analysis tool. It discovers, studies, and searches — replacing any line-based read, any glob, any grep. No offset, no limit, no pagination. Code is analysed via tree-sitter so you reason about symbols, not text pages.
+    description: `The ONE filesystem analysis tool. It discovers, studies, and searches — replacing any line-based read, any glob, any grep. No offset, no limit, no pagination.
+
+Works on ANY file: code (tree-sitter symbol outline), configs/docs (anchor outline), extensionless files (Dockerfile, Makefile, LICENSE, lockfiles), unknown extensions (.lock, .bin, .xyz) — all return content. Never refuses based on extension. Binary is decoded as UTF-8 (replacement chars in gaps).
 
 ═══════════════════════════════════════════════════════════════════
 QUICKSTART — five concrete tasks and the exact call:
@@ -98,6 +100,10 @@ QUICKSTART — five concrete tasks and the exact call:
 5. "What .py tests exist?"
      → read('/abs/path/**/test_*.py')
      glob expands, returns one-line inventory per file
+
+6. "Show me this Dockerfile / Makefile / lockfile"
+     → read('/abs/path/Dockerfile')
+     extensionless and unknown-extension files work identically
 
 ═══════════════════════════════════════════════════════════════════
 path semantics (auto-detected):
@@ -130,7 +136,7 @@ RULES:
     inputSchema: {
       type: "object" as const,
       properties: {
-        file_path: { type: "string", description: "Absolute file path, absolute directory path, or glob pattern (detected by presence of * or ?). Examples: '/home/user/src/auth.ts', '/home/user/src', '/home/user/src/**/*.ts', '/home/user/**/test_*.py'." },
+        file_path: { type: "string", description: "Absolute file path, absolute directory path, or glob pattern (detected by presence of * or ?). Any extension works — code, config, docs, extensionless (Dockerfile, Makefile), unknown (.lock, .xyz). Examples: '/home/user/src/auth.ts', '/home/user/Dockerfile', '/home/user/src', '/home/user/src/**/*.ts'." },
         symbol: { type: "string", description: "Extract a specific symbol by exact name. Dot-separated for nested members (e.g. 'Server.start', 'ClaudeNest.awaken'). Works across whatever the path resolves to — pass a directory or glob to search the symbol in every file." },
         query: { type: "string", description: "Fuzzy case-insensitive substring match on symbol NAMES (not content). Returns each matching symbol's source. Use this for 'find anything whose name looks like X'." },
         pattern: { type: "string", description: "Regex over file CONTENT. For code files, each match is returned with its enclosing function/class symbol so you know which structural unit to read next. For non-code files, plain regex over lines." },
@@ -164,7 +170,9 @@ OPERATIONS:
   insert_after/before — add code adjacent to a symbol anchor.
   delete           — remove a symbol.
 
-WORKFLOW: read(file) first → see symbol outline → do_code(file, symbol, new_source). The read is required (staleness guard). After editing, verify with read(file, symbol: 'name').`,
+IMPORTS: the top-of-file import block is addressable as symbol: 'imports' — a synthetic symbol that spans the first contiguous run of import/use/#include/using directives. Prefer 'replace' with the full new block for add/remove/reorder (clean output, no stray blank lines). insert_after/before also work but leave a blank-line separator. delete nukes the whole block. Covered: TS/JS, Python, Go, Rust, Java, C/C++, C#, PHP. Not covered: Ruby, shell, Vue — on those, symbol 'imports' is not found and you should whole-file replace.
+
+WORKFLOW: read(file) first → see symbol outline (includes 'imports' if present) → do_code(file, symbol, new_source). The read is required (staleness guard). After editing, verify with read(file, symbol: 'name').`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -619,9 +627,11 @@ function studyTextFile(p: string, stat: Stats, sessionId?: string): ToolResult {
   ].join("\n");
 
   let output: string;
-  if (content.length <= MAX_READ_OUTPUT && anchorCount === 0) {
-    // Small file with no structure — show full content (legacy behavior for plain text)
-    output = content;
+  if (content.length <= MAX_READ_OUTPUT - header.length - 20 && anchorCount === 0) {
+    // Small file with no structure — header + full content. The header
+    // removes "did the call succeed?" ambiguity on extensionless /
+    // unknown-extension files that agents otherwise treat as refusals.
+    output = `${header}\n\n${content}`;
   } else {
     // Structured study view — preamble + anchor outline + drill-in hints
     output = `${header}\n\n--- preamble (first ${preambleLines} lines) ---\n${preamble}\n\n--- anchors ---\n${anchorText}\n\n--- edit ---\n${hints}`;

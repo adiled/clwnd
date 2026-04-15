@@ -8,6 +8,19 @@ export interface ClwndConfig {
   permissionDusk: number;
   droned: boolean;
   droneModel: { providerID: string; modelID: string };
+  /**
+   * Experimental feature toggles. Off by default. Promoted into the
+   * main config surface (or removed) once stable. Grouped here so new
+   * experiments don't clutter the top level.
+   */
+  experimental: {
+    /**
+     * Linguistic sub-symbol addressing for do_code / read:
+     * foo.when.body, foo.try.otherwise, foo.loop.body, foo.return, …
+     * See lib/ast.ts — resolveAliasPath.
+     */
+    subpath: boolean;
+  };
 }
 
 const DEFAULTS: ClwndConfig = {
@@ -17,6 +30,9 @@ const DEFAULTS: ClwndConfig = {
   permissionDusk: 60_000,
   droned: false,
   droneModel: { providerID: "opencode-clwnd", modelID: "claude-haiku-4-5" },
+  experimental: {
+    subpath: false,
+  },
 };
 
 const CONFIG_PATHS = [
@@ -38,6 +54,9 @@ export function loadConfig(): ClwndConfig {
         permissionDusk: raw.permissionDusk ?? DEFAULTS.permissionDusk,
         droned: raw.droned ?? DEFAULTS.droned,
         droneModel: raw.droneModel ?? DEFAULTS.droneModel,
+        experimental: {
+          subpath: raw.experimental?.subpath ?? DEFAULTS.experimental.subpath,
+        },
       };
       return cached;
     } catch {}

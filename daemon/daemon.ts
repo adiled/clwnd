@@ -1316,8 +1316,17 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           saveSessions(sid);
           hum(sid, { chi: "drone-retrofit", sid, reason: msg.reason });
         } else {
-          // User interrupt: send control_cancel_request — process stays alive
+          // User interrupt: stop current generation immediately via
+          // control_cancel_request, AND mark the session for respawn on the
+          // next prompt. Claude CLI in -p mode after a cancel does not
+          // reliably reconsume stdin — follow-up user messages got silently
+          // swallowed. Respawning on next prompt guarantees the new message
+          // lands on a fresh process; sanitizeJsonl strips the interrupted
+          // trailing-tool_use on --resume, so context stays coherent.
           nest.interrupt(sid);
+          session.needsRespawn = true;
+          session.lastSyncedPetal = null;
+          saveSessions(sid);
         }
       }
       break;
