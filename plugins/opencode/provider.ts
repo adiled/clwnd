@@ -792,6 +792,7 @@ export class ClwndModel implements LanguageModelV3 {
     try { const p = JSON.parse(rawAgent); if (p?.name) agentName = p.name; } catch {}
     const isTitleGen = agentName === "title";
     const isCompaction = agentName === "compaction";
+    const isPlan = agentName === "plan";
 
     // Skip title generation entirely - return empty, don't pass to Claude
     if (isTitleGen) {
@@ -1040,6 +1041,7 @@ export class ClwndModel implements LanguageModelV3 {
         externalTools: externalTools.length > 0 ? externalTools : undefined,
         mcpServerConfigs: await getMcpServerConfigs(this.config.client),
         visibleTools: visibleExternalNames,
+        planMode: isPlan || undefined,
         ...(pd ? { pennyDelta: pd } : {}),
         dusk: duskIn(30_000),
       });
@@ -1116,6 +1118,7 @@ export class ClwndModel implements LanguageModelV3 {
             skipGraft: skipGraft || undefined,
             ocServerUrl: self.config.pluginInput?.serverUrl?.toString(),
             priorPetals,
+            planMode: isPlan || undefined,
             dusk: duskIn(30_000),
           });
         }

@@ -73,7 +73,7 @@ class ClaudeNest {
 
   constructor(private cliPath = "claude") {}
 
-  awaken(poolKey: string, modelId: string, listener: BloomListener, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[], sessionCwd?: string): void {
+  awaken(poolKey: string, modelId: string, listener: BloomListener, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[], sessionCwd?: string, planMode?: boolean): void {
     let roost = this.roosts.get(poolKey);
 
     // Respawn if session was seeded with new history
@@ -118,7 +118,7 @@ class ClaudeNest {
           trace("nest.rejected", { poolKey, reason: "maxProcs", active: this.roosts.size });
         }
       }
-      roost = this.spawnProc(poolKey, modelId, claudeSessionId ?? session?.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, sessionCwd);
+      roost = this.spawnProc(poolKey, modelId, claudeSessionId ?? session?.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, sessionCwd, planMode);
     } else {
       mcpSetPerms((permissions ?? []) as any);
       mcpSetAllowed(allowedTools);
@@ -218,7 +218,7 @@ class ClaudeNest {
     this.idleTimers.clear();
   }
 
-  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[], sessionCwd?: string): Roost {
+  private spawnProc(poolKey: string, modelId: string, claudeSessionId?: string, permissions?: unknown[], systemPrompt?: string, allowedTools?: string[], sessionCwd?: string, planMode?: boolean): Roost {
     // Update MCP server state for this request
     mcpSetPerms((permissions ?? []) as any);
     mcpSetAllowed(allowedTools);
@@ -304,6 +304,10 @@ class ClaudeNest {
         DISABLE_INTERLEAVED_THINKING: "1",      // reduces context overhead from interleaved thinking blocks
         CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",    // OC already loads AGENTS.md/CLAUDE.md into --system-prompt; block CLI re-read
         CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",   // same reason — suppress CLI-side memory injection
+        // Adaptive thinking: on only for OC's plan-mode agent where
+        // deeper reasoning pays off; disabled otherwise to keep
+        // token spend predictable on routine build turns.
+        ...(planMode ? {} : { CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: "1" }),
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -592,6 +596,7 @@ interface Session {
   ocServerUrl?: string;
   thorns?: number; // consecutive error count — circuit breaker
   externalToolNames?: string[]; // sorted names of external MCP tools — respawn on change
+  planMode?: boolean; // true when current agent is 'plan' — governs CLI adaptive-thinking env, respawn on change
   // Per-session cached hum fields. Plugin dedups these — when a hum
   // message omits them, we fall back to the cached value so a cold-spawn
   // still gets the right system prompt / permissions / allowedTools.
@@ -969,6 +974,15 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
 
       // Skip tool registration on listenOnly (permission return) — avoid spurious respawn
       if (!msg.listenOnly) {
+        // Plan-mode toggle — respawn when it changes so the spawn env
+        // picks up the right CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING value.
+        const nextPlan = !!msg.planMode;
+        if (nextPlan !== !!session.planMode) {
+          session.planMode = nextPlan;
+          session.needsRespawn = true;
+          trace("plan.mode.changed", { sid, planMode: nextPlan });
+        }
+
         // External MCP tools — register for this session, respawn if changed
         const extTools = (msg.externalTools as ExternalToolDef[] | undefined) ?? [];
         const prevNames = (session.externalToolNames ?? []).join(",");
@@ -1154,7 +1168,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
                 (async () => {
                   try {
                     session.needsRespawn = true;
-                    nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd);
+                    nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd, session.planMode);
                     nest.murmur(sid, poolKey, promptContent);
                   } catch (e) {
                     trace("drone.swallow.retry.failed", { sid, err: String(e) });
@@ -1266,7 +1280,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       };
 
       const hadRoost = !!nest.roost(poolKey);
-      nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd);
+      nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd, session.planMode);
 
       if (promptContent) {
         // Guard against empty murmurs — empty text blocks cause API 400 (cache_control on empty text)
