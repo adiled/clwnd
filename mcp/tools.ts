@@ -9,7 +9,7 @@ import { resolve, dirname, relative, extname, join as pathJoin } from "path";
 
 import { trace } from "../log.ts";
 import { penny } from "../lib/penny.ts";
-import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, astGrep, searchSymbols, validateSyntax, symbolByteRange, type Symbol } from "../lib/ast.ts";
+import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, isWasmLanguage, astGrep, searchSymbols, validateSyntax, symbolByteRange, type Symbol } from "../lib/ast.ts";
 import { loadConfig } from "../lib/config.ts";
 import { resolveWord, resolvePhrase, resolveSentence, resolveParagraph, discoverAnchors, formatAnchors } from "../lib/linguistic.ts";
 import { resolveJsonEntryAst } from "../lib/config-ast.ts";
@@ -961,7 +961,11 @@ function readByPattern(targets: string[], pattern: string, sessionId?: string): 
   const matches: PatternMatch[] = [];
   for (const p of targets) {
     const relPath = relative(CWD, p) || p;
-    if (astSupported(p)) {
+    // WASM-runtime grammars (vue) don't go through the sync cachedParse
+    // path that astGrep relies on; calling it returns zero matches even
+    // when the pattern obviously matches the file's text. Fall through
+    // to plain text regex for those.
+    if (astSupported(p) && !isWasmLanguage(p)) {
       try {
         const hits = astGrep(p, pattern);
         for (const m of hits) {
@@ -1256,6 +1260,21 @@ function checkStaleness(p: string, sessionId?: string): ToolResult | null {
   return null;
 }
 
+// Walk back to the start of the line containing `index`. Return the
+// new position if everything between line-start and `index` is
+// whitespace (the symbol sits on its own indented line); otherwise
+// return `index` unchanged (single-line constructs like
+// `def f(): pass; def g(): pass` must keep their original splice point).
+function lineStartIfIndentedAlone(source: string, index: number): number {
+  let i = index;
+  while (i > 0 && source[i - 1] !== "\n") i--;
+  for (let k = i; k < index; k++) {
+    const ch = source[k];
+    if (ch !== " " && ch !== "\t") return index;
+  }
+  return i;
+}
+
 // do_code — the ONLY way to write code in clwnd. AST-grounded where a
 // grammar exists; every edit is re-parsed and the write is rejected if
 // the result has syntax errors. Rejects any file whose extension is NOT
@@ -1349,12 +1368,15 @@ function execDoCode(
     };
   }
 
-  // Byte-range splice. The symbol's [startIndex, endIndex] covers its
-  // full extent INCLUDING leading comments / decorators / `export`
-  // wrappers (the ast.ts query expansion did the heavy lifting). Single-
-  // line constructs (`def f(): pass; def g(): pass`) work because we no
-  // longer round to whole lines.
-  const before = original.slice(0, range.startIndex);
+  // Absorb the line's leading indent into the splice point for nested
+  // symbols. Agents see `    def bar…` in readSymbol output and paste
+  // new_source with that indent preserved; if `before` also ends with
+  // that indent (which it does for any tree-sitter node that starts at
+  // the first non-whitespace char of its line), the concatenation doubles
+  // the indent. Shift startIndex back to the line's col 0 when the gap
+  // between line-start and startIndex is purely whitespace.
+  const spliceStart = lineStartIfIndentedAlone(original, range.startIndex);
+  const before = original.slice(0, spliceStart);
   const after = original.slice(range.endIndex);
   let newContent: string;
 
@@ -1369,7 +1391,7 @@ function execDoCode(
     }
     // Insert at the symbol's start. Include a separator newline so the
     // new code doesn't fuse with the symbol's leading text.
-    newContent = before + args.new_source + "\n\n" + original.slice(range.startIndex);
+    newContent = before + args.new_source + "\n\n" + original.slice(spliceStart);
   } else if (op === "insert_after") {
     if (args.new_source == null) {
       return { output: `Error: operation 'insert_after' requires new_source.`, title: relPath };

@@ -110,7 +110,9 @@ const EXT_TO_LANG: Record<string, LanguageEntry> = {
   ".sh":   { language: TSBash,       queryPaths: [], vendoredExtra: "bash.scm" },
   ".bash": { language: TSBash,       queryPaths: [], vendoredExtra: "bash.scm" },
   // JSON handled by config-ast.ts for do_noncode, not code symbols
-  ".vue":  { runtime: "wasm", wasmFile: "tree-sitter-vue.wasm", queryPaths: [], vendoredExtra: "vue.scm" },
+  // vue: routed through parseVueSfc — splits SFC, parses <script> as ts/js
+  // using the JS/TS grammars above. No tree-sitter-vue grammar needed.
+  ".vue":  { queryPaths: [] },
 };
 
 // Import-ish top-level node types per extension. Used by the synthetic
@@ -679,11 +681,184 @@ function cacheHit(filePath: string): AstCacheEntry | null {
   return null;
 }
 
+// Vue SFC splitter. Uses @vue/compiler-sfc (sync) to find template /
+// script / style block ranges, then re-parses the script block using
+// the standard TS/JS grammar. Agents address blocks as synthetic
+// symbols: `template`, `script`, `style` (or `style#2` etc). Children
+// of `script` are real function/class symbols from the script content
+// with offsets shifted to the enclosing vue file's coordinates.
+function validateVueSfc(source: string): { ok: true } | { ok: false; error: string } {
+  try {
+    const sfcMod = _require("@vue/compiler-sfc");
+    const result = sfcMod.parse(source);
+    const errs = result.errors ?? [];
+    if (errs.length > 0) {
+      const first = errs[0];
+      const msg = first?.message ?? String(first);
+      const loc = first?.loc?.start ? ` at line ${first.loc.start.line} col ${first.loc.start.column}` : "";
+      return { ok: false, error: `vue SFC parse error${loc}: ${msg}` };
+    }
+    // Validate the <script> block's JS/TS syntax too — otherwise an agent
+    // could insert broken script content and the SFC parser would happily
+    // pass it through.
+    const script = result.descriptor.scriptSetup ?? result.descriptor.script;
+    if (script?.content) {
+      const lang = (script.lang || "js").toLowerCase();
+      const scriptExt = lang === "ts" ? ".ts" : lang === "tsx" ? ".tsx" : lang === "jsx" ? ".jsx" : ".js";
+      const gLang = getLanguage(scriptExt);
+      if (gLang) {
+        const P = getParser();
+        const parser = new P();
+        parser.setLanguage(gLang);
+        const tree = parser.parse(script.content, null, { bufferSize: 4 * 1024 * 1024 });
+        if (tree.rootNode.hasError) {
+          const cursor = tree.walk();
+          const visit = (): string | null => {
+            const node = cursor.currentNode;
+            if (node.type === "ERROR" || node.isMissing) {
+              return `script block parse error at line ${node.startPosition.row + 1}: ${node.type === "ERROR" ? "unexpected tokens" : `missing ${node.type}`}`;
+            }
+            if (cursor.gotoFirstChild()) {
+              const r = visit();
+              if (r) return r;
+              cursor.gotoParent();
+            }
+            while (cursor.gotoNextSibling()) {
+              const r = visit();
+              if (r) return r;
+            }
+            return null;
+          };
+          const detail = visit() ?? "script tree contains error nodes";
+          return { ok: false, error: detail };
+        }
+      }
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: `vue SFC validator threw: ${(e as Error).message}` };
+  }
+}
+
+// Given a content range inside a vue file, walk back to the opening
+// <tag...> and forward to the closing </tag>, so the synthetic symbol
+// covers the whole block (tags included). Replacing the symbol then
+// replaces the tags too — matches how agents read it via readSymbol.
+function expandVueBlockRange(source: string, contentStart: number, contentEnd: number, tagName: string): { start: number; end: number; startLine: number; endLine: number } {
+  const openMarker = `<${tagName}`;
+  const closeMarker = `</${tagName}>`;
+  let start = source.lastIndexOf(openMarker, contentStart);
+  if (start < 0) start = contentStart;
+  const closeIdx = source.indexOf(closeMarker, contentEnd);
+  const end = closeIdx < 0 ? contentEnd : closeIdx + closeMarker.length;
+  // Recompute lines from byte positions.
+  const startLine = source.slice(0, start).split("\n").length;
+  const endLine = source.slice(0, end).split("\n").length;
+  return { start, end, startLine, endLine };
+}
+
+function parseVueSfc(filePath: string): AstCacheEntry | null {
+  let source: string;
+  try { source = readFileSync(filePath, "utf-8"); } catch { return null; }
+  let stat;
+  try { stat = statSync(filePath); } catch { return null; }
+  if (stat.size > MAX_FILE_SIZE) return null;
+
+  let descriptor: any;
+  try {
+    const sfcMod = _require("@vue/compiler-sfc");
+    const result = sfcMod.parse(source);
+    descriptor = result.descriptor;
+  } catch {
+    return cacheStore(filePath, stat.mtimeMs, [], source);
+  }
+
+  const symbols: Symbol[] = [];
+
+  if (descriptor.template) {
+    const t = descriptor.template.loc;
+    const r = expandVueBlockRange(source, t.start.offset, t.end.offset, "template");
+    symbols.push({
+      name: "template",
+      kind: "template",
+      startLine: r.startLine,
+      endLine: r.endLine,
+      startIndex: r.start,
+      endIndex: r.end,
+    });
+  }
+
+  const scriptBlock = descriptor.scriptSetup ?? descriptor.script;
+  if (scriptBlock) {
+    const s = scriptBlock.loc;
+    const scriptStart = s.start.offset;
+    const scriptLineBase = s.start.line;
+    const scriptLang = (scriptBlock.lang || "js").toLowerCase();
+    const scriptExt = scriptLang === "ts" ? ".ts" : scriptLang === "tsx" ? ".tsx" : scriptLang === "jsx" ? ".jsx" : ".js";
+
+    const blockRange = expandVueBlockRange(source, s.start.offset, s.end.offset, "script");
+    const scriptSym: Symbol = {
+      name: "script",
+      kind: "script",
+      startLine: blockRange.startLine,
+      endLine: blockRange.endLine,
+      startIndex: blockRange.start,
+      endIndex: blockRange.end,
+      children: [],
+    };
+
+    try {
+      const lang = getLanguage(scriptExt);
+      const query = getQuery(scriptExt);
+      const langEntry = EXT_TO_LANG[scriptExt];
+      if (lang && query && langEntry) {
+        const content = source.slice(s.start.offset, s.end.offset);
+        const P = getParser();
+        const parser = new P();
+        parser.setLanguage(lang);
+        const tree = parser.parse(content, null, { bufferSize: 4 * 1024 * 1024 });
+        const inner = extractSymbolsViaQuery(tree.rootNode, query, langEntry, content);
+        const imp = detectImportsSymbol(tree.rootNode, scriptExt);
+        const shift = (sym: Symbol): Symbol => ({
+          ...sym,
+          startIndex: sym.startIndex + scriptStart,
+          endIndex: sym.endIndex + scriptStart,
+          startLine: sym.startLine + (scriptLineBase - 1),
+          endLine: sym.endLine + (scriptLineBase - 1),
+          children: sym.children ? sym.children.map(shift) : undefined,
+        });
+        scriptSym.children = inner.map(shift);
+        if (imp) scriptSym.children.unshift(shift(imp));
+      }
+    } catch {}
+
+    symbols.push(scriptSym);
+  }
+
+  if (descriptor.styles?.length) {
+    descriptor.styles.forEach((st: any, i: number) => {
+      const stLoc = st.loc;
+      const r = expandVueBlockRange(source, stLoc.start.offset, stLoc.end.offset, "style");
+      symbols.push({
+        name: i === 0 ? "style" : `style#${i + 1}`,
+        kind: "style",
+        startLine: r.startLine,
+        endLine: r.endLine,
+        startIndex: r.start,
+        endIndex: r.end,
+      });
+    });
+  }
+
+  return cacheStore(filePath, stat.mtimeMs, symbols, source);
+}
+
 function cachedParse(filePath: string): AstCacheEntry | null {
   const hit = cacheHit(filePath);
   if (hit) return hit;
 
   const ext = extname(filePath).toLowerCase();
+  if (ext === ".vue") return parseVueSfc(filePath);
   const entry = EXT_TO_LANG[ext];
   if (!entry) return null;
   if (entry.runtime === "wasm") return null; // WASM handled by async path
@@ -990,6 +1165,7 @@ export async function fileSymbolsAsync(filePath: string): Promise<Symbol[] | nul
  */
 export function validateSyntax(filePath: string, source: string): { ok: true } | { ok: false; error: string } {
   const ext = extname(filePath).toLowerCase();
+  if (ext === ".vue") return validateVueSfc(source);
   const lang = getLanguage(ext);
   if (!lang) return { ok: true };
   try {
