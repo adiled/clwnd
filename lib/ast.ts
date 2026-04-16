@@ -494,6 +494,7 @@ let wasmInitialized = false;
 
 async function getWasmParser(): Promise<any> {
   if (!WasmParser) {
+    // @ts-expect-error — web-tree-sitter@0.25 ships types but its package.json exports field hides them from moduleResolution: bundler
     const mod = await import("web-tree-sitter");
     WasmParser = mod.default?.Parser ?? mod.Parser ?? mod.default ?? mod;
   }
@@ -589,6 +590,7 @@ async function getWasmQuery(ext: string): Promise<any | null> {
   try {
     const scm = loadQueryScm(entry);
     // web-tree-sitter@0.25: new Query(language, source)
+    // @ts-expect-error — see getWasmParser: types hidden by package exports field
     const wmod = await import("web-tree-sitter");
     const WQuery = (wmod.default ?? wmod).Query;
     const q = new WQuery(lang, scm);

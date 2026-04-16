@@ -617,12 +617,6 @@ const OC_TO_MCP: Record<string, string> = {
 
 const lastAllowedTools = new Map<string, string>();
 
-// Per-session hash caches for hum payload dedup. On steady-state turns, the
-// systemPrompt and permissions rarely change; re-shipping them every turn is
-// pure IPC waste. Daemon-side falls back to its cached session values when
-// these fields are absent from the hum message (see daemon.ts "prompt" case).
-// Invalidated on compaction / cancel by clearSessionHashes(sid).
-const lastSystemPromptHash = new Map<string, string>();
 const lastPermissionsHash = new Map<string, string>();
 const lastAllowedToolsHash = new Map<string, string>();
 
@@ -652,7 +646,6 @@ function cheapHash(s: string): string {
 }
 
 export function clearSessionHashes(sid: string): void {
-  lastSystemPromptHash.delete(sid);
   lastPermissionsHash.delete(sid);
   lastAllowedToolsHash.delete(sid);
   lastAllowedTools.delete(sid);
@@ -837,20 +830,14 @@ export class ClwndModel implements LanguageModelV3 {
     const skipGraft = sessionJustCompacted.get(sid) === "curated" as any;
     if (skipGraft) trace("graft.skip", { method: "doStream", sid, reason: "post-curate" });
 
-    // Hash-dedup of per-turn hygiene fields. systemPrompt / permissions /
-    // allowedTools rarely change during a session — the daemon falls back to
-    // its cached session values when these fields are omitted, so dedup'd
-    // turns just skip the re-serialization and hum-socket transmission.
-    const systemPromptHash = cheapHash(systemPrompt);
+    const sendSystemPrompt = true;
     const permissionsHash = cheapHash(JSON.stringify(permissions));
     const allowedToolsHash = cheapHash(allowedTools.join(","));
-    const sendSystemPrompt = lastSystemPromptHash.get(sid) !== systemPromptHash;
     const sendPermissions = lastPermissionsHash.get(sid) !== permissionsHash;
     const sendAllowedTools = lastAllowedToolsHash.get(sid) !== allowedToolsHash;
-    if (sendSystemPrompt) lastSystemPromptHash.set(sid, systemPromptHash);
     if (sendPermissions) lastPermissionsHash.set(sid, permissionsHash);
     if (sendAllowedTools) lastAllowedToolsHash.set(sid, allowedToolsHash);
-    if (!sendSystemPrompt || !sendPermissions || !sendAllowedTools) pendingPenny.humDedup++;
+    if (!sendPermissions || !sendAllowedTools) pendingPenny.humDedup++;
     trace("hum.dedup", { sid, sp: sendSystemPrompt, perm: sendPermissions, tools: sendAllowedTools });
 
     // Brokered tool return — permission returns must listen for Claude's remaining output

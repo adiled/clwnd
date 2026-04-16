@@ -302,7 +302,7 @@ export function materializeTools(): typeof TOOLS {
   if (!loadConfig().experimental.subpath) return TOOLS;
   return TOOLS.map(t => {
     if (t.name !== "read" && t.name !== "do_code") return t;
-    const props = (t.inputSchema as { properties: Record<string, { type: string; description: string }> }).properties;
+    const props = (t.inputSchema as unknown as { properties: Record<string, { type: string; description: string }> }).properties;
     const sym = props.symbol;
     if (!sym) return t;
     return {
@@ -315,7 +315,7 @@ export function materializeTools(): typeof TOOLS {
         },
       },
     };
-  });
+  }) as typeof TOOLS;
 }
 
 // ─── Permission Prompt ──────────────────────────────────────────────────────
