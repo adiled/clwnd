@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "clwnd config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "maxProcs": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Maximum concurrent Claude CLI processes in the nest pool."
+    },
+    "idleTimeout": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Milliseconds an idle roost stays alive before eviction."
+    },
+    "smallModel": {
+      "type": "string",
+      "description": "Provider/model id used for small tasks (title generation, etc). Empty = auto-discover a free model at plugin startup."
+    },
+    "permissionDusk": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Milliseconds a pending permission ask waits before auto-denying."
+    },
+    "droned": {
+      "type": "boolean",
+      "description": "Opt-in drone observer. When off, the hum is a raw passthrough."
+    },
+    "droneModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["providerID", "modelID"],
+      "properties": {
+        "providerID": { "type": "string" },
+        "modelID": { "type": "string" }
+      },
+      "description": "Model the drone uses for its sentinel turns."
+    },
+    "experimental": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "subpath": {
+          "type": "boolean",
+          "description": "Linguistic sub-symbol addressing in read / do_code (foo.when.body, foo.try.otherwise, foo.loop.body, foo.return, etc). Off by default."
+        }
+      },
+      "description": "Experimental feature toggles. Off by default."
+    },
+    "ccFlags": {
+      "type": "object",
+      "description": "Claude CLI environment overrides. Each key/value is spread into the nest spawn env AFTER clwnd's defaults, so user entries override clwnd's. Use to re-enable CLAUDE_CODE_DISABLE_* flags clwnd turns off, or set arbitrary CC-facing env vars.",
+      "additionalProperties": {
+        "type": ["string", "number", "boolean"]
+      }
+    }
+  }
+}

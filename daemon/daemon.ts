@@ -308,6 +308,9 @@ class ClaudeNest {
         // deeper reasoning pays off; disabled otherwise to keep
         // token spend predictable on routine build turns.
         ...(planMode ? {} : { CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: "1" }),
+        // User escape hatch: ccFlags from clwnd.json spread last so
+        // they override any of clwnd's defaults above.
+        ...cfg.ccFlags,
       },
       stdio: ["pipe", "pipe", "pipe"],
     });

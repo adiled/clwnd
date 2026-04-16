@@ -21,6 +21,13 @@ export interface ClwndConfig {
      */
     subpath: boolean;
   };
+  /**
+   * Claude CLI environment overrides. Untyped — whatever keys the user
+   * supplies are spread into the nest spawn env AFTER clwnd's defaults,
+   * so user entries override ours (e.g. re-enable CLAUDE_CODE_DISABLE_*
+   * flags clwnd turned off, or set arbitrary CC-facing env).
+   */
+  ccFlags: Record<string, string>;
 }
 
 const DEFAULTS: ClwndConfig = {
@@ -33,6 +40,7 @@ const DEFAULTS: ClwndConfig = {
   experimental: {
     subpath: false,
   },
+  ccFlags: {},
 };
 
 const CONFIG_PATHS = [
@@ -57,6 +65,9 @@ export function loadConfig(): ClwndConfig {
         experimental: {
           subpath: raw.experimental?.subpath ?? DEFAULTS.experimental.subpath,
         },
+        ccFlags: (raw.ccFlags && typeof raw.ccFlags === "object" && !Array.isArray(raw.ccFlags))
+          ? Object.fromEntries(Object.entries(raw.ccFlags).map(([k, v]) => [k, String(v)]))
+          : DEFAULTS.ccFlags,
       };
       return cached;
     } catch {}
