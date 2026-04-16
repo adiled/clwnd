@@ -1,6 +1,6 @@
 {
   "name": "@clwnd/opencode",
-  "version": "0.23.1",
+  "version": "0.23.2",
   "description": "clwnd for opencode",
   "type": "module",
   "main": "dist/index.js",
