@@ -10,6 +10,7 @@ import { resolve, dirname, relative, extname, join as pathJoin } from "path";
 import { trace } from "../log.ts";
 import { penny } from "../lib/penny.ts";
 import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, astGrep, searchSymbols, validateSyntax, symbolByteRange, type Symbol } from "../lib/ast.ts";
+import { loadConfig } from "../lib/config.ts";
 import { resolveWord, resolvePhrase, resolveSentence, resolveParagraph, discoverAnchors, formatAnchors } from "../lib/linguistic.ts";
 import { resolveJsonEntryAst } from "../lib/config-ast.ts";
 
@@ -284,6 +285,38 @@ The subagent starts fresh unless you provide task_id to resume a previous task s
     },
   },
 ];
+
+// ─── Dynamic tool materialization ──────────────────────────────────────────
+//
+// Some tool descriptions extend with optional capabilities depending on
+// runtime config. Re-render TOOLS at every tools/list call so a config
+// change picked up by loadConfig() is reflected in what the next agent
+// sees, without restarting the daemon.
+
+// Sub-symbol vocabulary, advertised on `read.symbol` / `do_code.symbol`
+// only when experimental.subpath is enabled. Phrased as a short menu
+// the agent can scan in one pass.
+const SUBPATH_DESCRIPTION = ` Sub-symbol addressing: after a named symbol, append linguistic aliases that walk into the AST. 7 words: \`body\` (the inside-block of any compound — function body, then-branch, loop body, try block), \`when\` (an if), \`otherwise\` (the alternate branch — else of an if, catch of a try), \`loop\` (any for/while/do), \`try\` (a try construct), \`return\` (a return statement), \`call\` (a function call). Compose with \`.\` and disambiguate with \`#N\` when several match. Examples: 'foo.body' (function body), 'foo.when.body' (then-branch of first if), 'foo.when.otherwise' (else-branch), 'foo.try.otherwise' (catch block), 'foo.loop#2.body' (body of second loop), 'foo.return#2' (second return), 'foo.call' (first call). Walks document order; first-match wins.`;
+
+export function materializeTools(): typeof TOOLS {
+  if (!loadConfig().experimental.subpath) return TOOLS;
+  return TOOLS.map(t => {
+    if (t.name !== "read" && t.name !== "do_code") return t;
+    const props = (t.inputSchema as { properties: Record<string, { type: string; description: string }> }).properties;
+    const sym = props.symbol;
+    if (!sym) return t;
+    return {
+      ...t,
+      inputSchema: {
+        ...t.inputSchema,
+        properties: {
+          ...props,
+          symbol: { ...sym, description: sym.description + SUBPATH_DESCRIPTION },
+        },
+      },
+    };
+  });
+}
 
 // ─── Permission Prompt ──────────────────────────────────────────────────────
 
@@ -2045,9 +2078,10 @@ export async function handleMcpRequest(body: { jsonrpc: string; id?: number | st
       // — Claude CLI is spawned with --permission-prompt-tool pointing at
       // mcp__clwnd__permission_prompt, and the process exits immediately
       // if the tool isn't in the MCP tools/list response.
+      const advertised = materializeTools();
       const nativeAllowed = allowedToolSet
-        ? TOOLS.filter(t => t.name === "permission_prompt" || allowedToolSet!.has(t.name))
-        : TOOLS;
+        ? advertised.filter(t => t.name === "permission_prompt" || allowedToolSet!.has(t.name))
+        : advertised;
       const ext = sessionId ? (externalTools.get(sessionId) ?? []) : [];
       const visibleExt = getVisibleExternalSet(sessionId);
       const externalAllowed = visibleExt ? ext.filter(t => visibleExt.has(t.name)) : ext;
