@@ -302,6 +302,8 @@ class ClaudeNest {
         ENABLE_TOOL_SEARCH: "false",            // prevents cache invalidation from dynamic tool schema injection
         CLAUDE_CODE_DISABLE_FAST_MODE: "1",     // fast mode costs 6x — we control the model
         DISABLE_INTERLEAVED_THINKING: "1",      // reduces context overhead from interleaved thinking blocks
+        CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",    // OC already loads AGENTS.md/CLAUDE.md into --system-prompt; block CLI re-read
+        CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",   // same reason — suppress CLI-side memory injection
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
