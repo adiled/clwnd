@@ -28,6 +28,20 @@ export interface ClwndConfig {
    * flags clwnd turned off, or set arbitrary CC-facing env).
    */
   ccFlags: Record<string, string>;
+  /**
+   * Manual compaction behavior for clwnd-routed sessions. Auto-compaction
+   * is permanently off because clwnd models declare limit.context: 0 in
+   * opencode.json — OC's overflow check (overflow.ts:21) skips, no
+   * 'compacting…' TUI hiccup, Claude CLI's native microcompaction handles
+   * real overflow.
+   *   'off'    — when the user manually fires compaction in TUI, our
+   *              provider stub-returns: no JSONL prune, no model call.
+   *              Default.
+   *   'curate' — manual compaction triggers a surgical JSONL prune
+   *              (strips thinking blocks, trims old tool_result content).
+   * Other providers' compaction is untouched.
+   */
+  compaction: 'off' | 'curate';
 }
 
 const DEFAULTS: ClwndConfig = {
@@ -41,6 +55,7 @@ const DEFAULTS: ClwndConfig = {
     subpath: false,
   },
   ccFlags: {},
+  compaction: 'off',
 };
 
 const CONFIG_PATHS = [
@@ -68,6 +83,7 @@ export function loadConfig(): ClwndConfig {
         ccFlags: (raw.ccFlags && typeof raw.ccFlags === "object" && !Array.isArray(raw.ccFlags))
           ? Object.fromEntries(Object.entries(raw.ccFlags).map(([k, v]) => [k, String(v)]))
           : DEFAULTS.ccFlags,
+        compaction: raw.compaction === 'curate' ? 'curate' : DEFAULTS.compaction,
       };
       return cached;
     } catch {}

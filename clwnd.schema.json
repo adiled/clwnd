@@ -55,6 +55,11 @@
       "additionalProperties": {
         "type": ["string", "number", "boolean"]
       }
+    },
+    "compaction": {
+      "type": "string",
+      "enum": ["off", "curate"],
+      "description": "Compaction behavior for manually-triggered compaction (the 'compact' button in OC TUI). Auto-compaction is permanently off for clwnd models because their limit.context is set to 0 in opencode.json by install — OC's overflow check skips, no 'compacting…' hiccup, Claude CLI's native microcompaction handles overflow. 'off' (default) — manual compact stub-returns, no JSONL prune. 'curate' — manual compact triggers clwnd's surgical JSONL prune (strips thinking blocks, trims old tool_results). Other providers' compaction is untouched."
     }
   }
 }

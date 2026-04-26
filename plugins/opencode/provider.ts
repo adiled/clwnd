@@ -859,13 +859,17 @@ export class ClwndModel implements LanguageModelV3 {
       };
     }
 
-    // Curate: OC wants to compaction-summarize. Instead, we prune the JSONL
-    // (strip thinking, trim old tool_results) and return a minimal response.
-    // No model call, no summary bloat, no compaction contagion.
+    // Compaction intercept. Default ('off'): stub-return with no model
+    // call and no JSONL prune — OC's compaction agent becomes a no-op,
+    // Claude CLI's native microcompaction handles real overflow. Opt-in
+    // ('curate'): hum the daemon to surgically prune the JSONL.
     if (isCompaction) {
-      trace("curate.intercepted", { sid });
-      hum({ chi: "curate", sid, dusk: duskIn(10_000) });
-      sessionJustCompacted.set(sid, "curated" as any);
+      const mode = loadConfig().compaction;
+      trace("compaction.intercepted", { sid, mode });
+      if (mode === "curate") {
+        hum({ chi: "curate", sid, dusk: duskIn(10_000) });
+        sessionJustCompacted.set(sid, "curated" as any);
+      }
       const cId = `curate-${Date.now()}`;
       return {
         stream: new ReadableStream<LanguageModelV3StreamPart>({

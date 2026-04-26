@@ -354,14 +354,20 @@ if (pluginRef === npmRef) {
   console.log('  dev mode: plugin via .opencode/plugins/');
 }
 
-// Provider + models — always sync to match registry
+// Provider + models — always sync to match registry. limit.context is
+// forced to 0 so OC's overflow check (overflow.ts:21) returns false for
+// clwnd models; OC's compaction agent + TUI 'compacting...' indicator
+// stay quiet, Claude CLI's native microcompaction handles real overflow.
+// Other providers are untouched. Manual user-triggered compaction in OC
+// still fires our provider's stub.
 if (!config.provider) config.provider = {};
 const models = {};
 for (const [id, entry] of Object.entries(registry)) {
-  models[id] = { ...entry, provider: { npm: pluginRef } };
+  const limit = entry.limit ? { ...entry.limit, context: 0 } : { context: 0 };
+  models[id] = { ...entry, limit, provider: { npm: pluginRef } };
 }
 config.provider['opencode-clwnd'] = { npm: pluginRef, models };
-console.log('  synced clwnd provider with ' + Object.keys(models).length + ' models');
+console.log('  synced clwnd provider with ' + Object.keys(models).length + ' models (context=0 → OC compaction off for clwnd)');
 
 // Clean legacy small_model — plugin manages at runtime
 if (config.small_model) {
