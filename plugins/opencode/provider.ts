@@ -585,26 +585,56 @@ async function getSessionPermissions(client: unknown, sessionId: string): Promis
   }
 }
 
-// Cache MCP configs — read once per OC lifecycle
-let mcpConfigCache: Array<{ name: string; type: "local"; command: string[]; environment?: Record<string, string> }> | null = null;
+type McpSrvConfig =
+  | { name: string; type: "local"; command: string[]; environment?: Record<string, string> }
+  | { name: string; type: "remote"; url: string; headers?: Record<string, string> };
 
-async function getMcpServerConfigs(client: unknown): Promise<Array<{ name: string; type: "local"; command: string[]; environment?: Record<string, string> }>> {
-  if (mcpConfigCache) return mcpConfigCache;
-  if (!client) return [];
+// Per-call: local stays cached, remote re-reads auth token each turn so
+// refreshed bearers reach the daemon without a plugin restart.
+let mcpLocalCache: McpSrvConfig[] | null = null;
+
+async function resolveRemoteAuth(client: any, name: string, declaredHeaders?: Record<string, string>): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { ...(declaredHeaders ?? {}) };
   try {
-    const resp = await (client as any).config.get();
-    const mcp = resp.data?.mcp as Record<string, { type?: string; command?: string[]; environment?: Record<string, string> }> | undefined;
-    if (!mcp) return [];
-    const configs: Array<{ name: string; type: "local"; command: string[]; environment?: Record<string, string> }> = [];
-    for (const [name, cfg] of Object.entries(mcp)) {
-      if (cfg.type === "local" && Array.isArray(cfg.command)) {
-        configs.push({ name, type: "local", command: cfg.command, environment: cfg.environment });
+    const resp = await client.mcp.auth({ path: { name } }).catch(() => null);
+    const token = (resp as any)?.data?.access ?? (resp as any)?.data?.token;
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+  } catch {}
+  return headers;
+}
+
+async function getMcpServerConfigs(client: unknown): Promise<McpSrvConfig[]> {
+  if (!client) return [];
+  const c = client as any;
+  try {
+    if (!mcpLocalCache) {
+      const resp = await c.config.get();
+      const mcp = resp.data?.mcp as Record<string, any> | undefined;
+      const locals: McpSrvConfig[] = [];
+      if (mcp) {
+        for (const [name, cfg] of Object.entries(mcp)) {
+          if ((cfg as any).type === "local" && Array.isArray((cfg as any).command)) {
+            locals.push({ name, type: "local", command: (cfg as any).command, environment: (cfg as any).environment });
+          }
+        }
+      }
+      mcpLocalCache = locals;
+    }
+    const resp = await c.config.get();
+    const mcp = resp.data?.mcp as Record<string, any> | undefined;
+    const remotes: McpSrvConfig[] = [];
+    if (mcp) {
+      for (const [name, cfg] of Object.entries(mcp)) {
+        if ((cfg as any).type === "remote" && typeof (cfg as any).url === "string") {
+          const headers = await resolveRemoteAuth(c, name, (cfg as any).headers);
+          remotes.push({ name, type: "remote", url: (cfg as any).url, headers });
+        }
       }
     }
-    mcpConfigCache = configs;
-    if (configs.length > 0) trace("mcp.configs.loaded", { servers: configs.map(c => c.name).join(",") });
-    return configs;
-  } catch { return []; }
+    const all = [...mcpLocalCache, ...remotes];
+    if (all.length > 0) trace("mcp.configs.loaded", { servers: all.map(s => `${s.name}(${s.type})`).join(",") });
+    return all;
+  } catch { return mcpLocalCache ?? []; }
 }
 
 const OC_TO_MCP: Record<string, string> = {

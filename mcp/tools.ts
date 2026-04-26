@@ -4,7 +4,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, readdirSync, type Stats } from "fs";
-import { execSync } from "child_process";
+import { execSync, spawn as spawnProc } from "child_process";
 import { resolve, dirname, relative, extname, join as pathJoin } from "path";
 
 import { trace } from "../log.ts";
@@ -1869,91 +1869,66 @@ function getVisibleExternalSet(sessionId: string | undefined): Set<string> | nul
 
 // ─── External MCP client — daemon executes tools directly ──────────────────
 
-import { spawn as spawnProc, type ChildProcess } from "node:child_process";
+import { Client as MCPSDKClient } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 
-interface McpServerConfig {
-  name: string;
-  type: "local";
-  command: string[];
-  environment?: Record<string, string>;
-}
+type McpServerConfig =
+  | { name: string; type: "local"; command: string[]; environment?: Record<string, string> }
+  | { name: string; type: "remote"; url: string; headers?: Record<string, string> };
 
 interface McpClient {
   config: McpServerConfig;
-  proc: ChildProcess;
-  pending: Map<number, { resolve: (v: unknown) => void; timer: ReturnType<typeof setTimeout> }>;
-  nextId: number;
-  buffer: string;
+  sdk: MCPSDKClient;
 }
 
 const mcpClients = new Map<string, McpClient>(); // keyed by server name
 
 async function getMcpClient(config: McpServerConfig): Promise<McpClient> {
   const existing = mcpClients.get(config.name);
-  if (existing && !existing.proc.killed) return existing;
+  if (existing) return existing;
 
-  trace("mcp.client.spawning", { server: config.name, cmd: config.command.join(" ") });
-  const proc = spawnProc(config.command[0], config.command.slice(1), {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, ...config.environment },
-  });
+  trace("mcp.client.connecting", { server: config.name, kind: config.type });
+  const sdk = new MCPSDKClient({ name: "clwnd", version: "0.23.6" }, { capabilities: {} });
 
-  const client: McpClient = { config, proc, pending: new Map(), nextId: 1, buffer: "" };
-  mcpClients.set(config.name, client);
-
-  proc.stdout?.on("data", (chunk: Buffer) => {
-    client.buffer += chunk.toString();
-    let nl: number;
-    while ((nl = client.buffer.indexOf("\n")) !== -1) {
-      const line = client.buffer.slice(0, nl).trim();
-      client.buffer = client.buffer.slice(nl + 1);
-      if (!line) continue;
-      try {
-        const msg = JSON.parse(line);
-        if (msg.id !== undefined) {
-          const p = client.pending.get(msg.id);
-          if (p) {
-            clearTimeout(p.timer);
-            client.pending.delete(msg.id);
-            p.resolve(msg);
-          }
-        }
-      } catch {}
+  if (config.type === "local") {
+    const transport = new StdioClientTransport({
+      command: config.command[0],
+      args: config.command.slice(1),
+      env: { ...process.env, ...config.environment } as Record<string, string>,
+    });
+    await sdk.connect(transport);
+  } else {
+    // Remote: try streamable HTTP first, fall back to SSE.
+    const url = new URL(config.url);
+    const headers = config.headers ?? {};
+    try {
+      const transport = new StreamableHTTPClientTransport(url, {
+        requestInit: { headers },
+      });
+      await sdk.connect(transport);
+    } catch (e) {
+      trace("mcp.client.http.failed", { server: config.name, err: String(e) });
+      const transport = new SSEClientTransport(url, {
+        requestInit: { headers },
+        eventSourceInit: {
+          fetch: (u: any, init: any) => fetch(u, { ...init, headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) } }),
+        } as any,
+      });
+      await sdk.connect(transport);
     }
-  });
+  }
 
-  // Initialize
-  await mcpRpc(client, "initialize", {
-    protocolVersion: "2024-11-05",
-    capabilities: {},
-    clientInfo: { name: "clwnd", version: "0.11.0" },
-  });
-  mcpRpc(client, "notifications/initialized", undefined, true);
+  const client: McpClient = { config, sdk };
+  mcpClients.set(config.name, client);
   trace("mcp.client.ready", { server: config.name });
   return client;
 }
 
-function mcpRpc(client: McpClient, method: string, params?: unknown, notification = false): Promise<unknown> {
-  const id = notification ? undefined : client.nextId++;
-  const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
-  // We always spawn with stdin: "pipe" so stdin is writable. Node's
-  if (!client.proc.stdin) {
-    throw new Error(`mcp client stdin is not available (server=${client.config.name})`);
-  }
-  client.proc.stdin.write(msg);
-  if (notification) return Promise.resolve(null);
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      client.pending.delete(id!);
-      resolve({ error: { message: "MCP call timed out" } });
-    }, 120_000);
-    client.pending.set(id!, { resolve, timer });
-  });
-}
-
 export function shutdownMcpClients(): void {
   for (const [, client] of mcpClients) {
-    try { client.proc.kill(); } catch {}
+    try { client.sdk.close(); } catch {}
   }
   mcpClients.clear();
 }
@@ -1989,15 +1964,18 @@ async function executeExternalTool(sessionId: string, toolName: string, args: Re
   try {
     const client = await getMcpClient(server);
     const rawName = stripServerPrefix(server.name, toolName);
-    const response = await mcpRpc(client, "tools/call", { name: rawName, arguments: args }) as {
-      result?: { content?: Array<{ type: string; text?: string }> };
-      error?: { message: string };
-    };
-    if (response.error) return `Error: ${response.error.message}`;
-    const content = response.result?.content ?? [];
+    const response = await client.sdk.callTool({ name: rawName, arguments: args });
+    const content = (response.content ?? []) as Array<{ type: string; text?: string }>;
     return content.filter(c => c.type === "text").map(c => c.text ?? "").join("\n") || "(empty result)";
   } catch (e) {
-    return `Error: ${e instanceof Error ? e.message : String(e)}`;
+    // Auth expired on remote MCP — drop cached client so next call re-connects
+    // with whatever fresh headers the plugin provides on the next config push.
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/401|403|unauthorized|forbidden/i.test(msg)) {
+      mcpClients.delete(server.name);
+      trace("mcp.client.auth.failed", { server: server.name, err: msg });
+    }
+    return `Error: ${msg}`;
   }
 }
 

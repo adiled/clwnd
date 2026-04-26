@@ -1003,9 +1003,9 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         }
 
         // External MCP server configs — daemon connects directly for tool execution
-        const mcpConfigs = (msg.mcpServerConfigs as Array<{ name: string; type: string; command: string[]; environment?: Record<string, string> }> | undefined) ?? [];
+        const mcpConfigs = (msg.mcpServerConfigs as Array<Record<string, any>> | undefined) ?? [];
         if (mcpConfigs.length > 0) {
-          setMcpServerConfigs(sid, mcpConfigs as Array<{ name: string; type: "local"; command: string[]; environment?: Record<string, string> }>);
+          setMcpServerConfigs(sid, mcpConfigs as any);
           trace("mcp.configs.registered", { sid, servers: mcpConfigs.map(c => c.name).join(",") });
         } else {
           clearMcpServerConfigs(sid);
