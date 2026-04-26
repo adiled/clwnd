@@ -409,6 +409,24 @@ function extractSystemPrompt(prompt: LanguageModelV3Prompt): string {
 // tions as one unit (so stripping leaves no dangling "at"), while still split-
 // ting multi-sentence paragraphs finely enough that one bad sentence doesn't
 // drag the whole paragraph down.
+// Drop any sentence containing the given pattern. Splits on sentence
+// terminators (.!?) followed by whitespace, OR on bare newline, so
+// terminator-less lines (file paths, env entries) are also unit-sized.
+function stripSentencesMatching(text: string, pattern: RegExp): string {
+  if (!text) return text;
+  const sentRe = /[.!?][ \t\n]+|\n/g;
+  const units: string[] = [];
+  let start = 0;
+  let m: RegExpExecArray | null;
+  while ((m = sentRe.exec(text)) !== null) {
+    units.push(text.slice(start, m.index + m[0].length));
+    start = m.index + m[0].length;
+  }
+  if (start < text.length) units.push(text.slice(start));
+  return units.filter(u => !pattern.test(u)).join("");
+}
+
+
 function sanitizePrompt(text: string, word: string): string {
   if (!text) return text;
 
@@ -794,7 +812,10 @@ export class ClwndModel implements LanguageModelV3 {
     trace("doStream.enter", { sid, promptLen: opts.prompt.length, lastRole });
     const content = extractContent(opts.prompt, sid);
     const text = content.filter((p): p is { type: "text"; text: string } => p.type === "text").map(p => p.text).join("\n\n");
-    const systemPrompt = sanitizePrompt(extractSystemPrompt(opts.prompt), "opencode");
+    const systemPrompt = stripSentencesMatching(
+      sanitizePrompt(extractSystemPrompt(opts.prompt), "opencode"),
+      /powered by|here is some useful information about the environment/i,
+    );
     detectAgent(sid, opts.headers);
     const cwd = (this.config.client ? await getSessionDirectory(this.config.client, sid) : null) ?? this.config.cwd ?? process.cwd();
     const self = this;
