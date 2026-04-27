@@ -304,6 +304,7 @@ class ClaudeNest {
         DISABLE_INTERLEAVED_THINKING: "1",      // reduces context overhead from interleaved thinking blocks
         CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",    // OC already loads AGENTS.md/CLAUDE.md into --system-prompt; block CLI re-read
         CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",   // same reason — suppress CLI-side memory injection
+        CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1", // CronCreate/TaskCreate disallowed; also kill the persistence dir (.claude/scheduled_tasks*)
         // Adaptive thinking: on only for OC's plan-mode agent where
         // deeper reasoning pays off; disabled otherwise to keep
         // token spend predictable on routine build turns.
