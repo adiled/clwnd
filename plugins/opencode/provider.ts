@@ -611,11 +611,20 @@ type McpSrvConfig =
 // refreshed bearers reach the daemon without a plugin restart.
 let mcpLocalCache: McpSrvConfig[] | null = null;
 
-async function resolveRemoteAuth(client: any, name: string, declaredHeaders?: Record<string, string>): Promise<Record<string, string>> {
+async function resolveRemoteAuth(_client: any, name: string, declaredHeaders?: Record<string, string>): Promise<Record<string, string>> {
   const headers: Record<string, string> = { ...(declaredHeaders ?? {}) };
+  // OC's /mcp/{name}/auth POST is the OAuth-start endpoint (returns the
+  // authorization URL), NOT a way to fetch the current access token.
+  // Read the live bearer straight from OC's mcp-auth.json store, which
+  // OC rewrites on every refresh — re-reading per turn picks up rotated
+  // tokens automatically with no plugin restart.
   try {
-    const resp = await client.mcp.auth({ path: { name } }).catch(() => null);
-    const token = (resp as any)?.data?.access ?? (resp as any)?.data?.token;
+    const dataHome = process.env.XDG_DATA_HOME ?? `${process.env.HOME ?? ""}/.local/share`;
+    const fp = `${dataHome}/opencode/mcp-auth.json`;
+    const fs = require("fs");
+    const raw = fs.readFileSync(fp, "utf8");
+    const all = JSON.parse(raw) as Record<string, { tokens?: { accessToken?: string } }>;
+    const token = all?.[name]?.tokens?.accessToken;
     if (token) headers["Authorization"] = `Bearer ${token}`;
   } catch {}
   return headers;
