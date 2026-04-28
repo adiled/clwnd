@@ -635,12 +635,21 @@ async function resolveRemoteAuth(_client: any, name: string, declaredHeaders?: R
 }
 
 async function getMcpServerConfigs(client: unknown): Promise<McpSrvConfig[]> {
-  if (!client) return [];
+  if (!client) {
+    trace("mcp.configs.skip", { reason: "no client" });
+    return [];
+  }
   const c = client as any;
   try {
     if (!mcpLocalCache) {
       const resp = await c.config.get();
       const mcp = resp.data?.mcp as Record<string, any> | undefined;
+      trace("mcp.configs.probe", {
+        respShape: typeof resp?.data,
+        hasMcp: !!mcp,
+        mcpKeys: mcp ? Object.keys(mcp).join(",") : "",
+        types: mcp ? Object.entries(mcp).map(([k, v]: any) => `${k}:${v?.type}`).join(",") : "",
+      });
       const locals: McpSrvConfig[] = [];
       if (mcp) {
         for (const [name, cfg] of Object.entries(mcp)) {
@@ -663,9 +672,16 @@ async function getMcpServerConfigs(client: unknown): Promise<McpSrvConfig[]> {
       }
     }
     const all = [...mcpLocalCache, ...remotes];
-    if (all.length > 0) trace("mcp.configs.loaded", { servers: all.map(s => `${s.name}(${s.type})`).join(",") });
+    trace("mcp.configs.loaded", { count: all.length, servers: all.map(s => `${s.name}(${s.type})`).join(",") });
     return all;
-  } catch { return mcpLocalCache ?? []; }
+  } catch (e) {
+    trace("mcp.configs.failed", {
+      err: e instanceof Error ? e.message : String(e),
+      stack: e instanceof Error ? (e.stack ?? "").split("\n").slice(0, 4).join(" | ") : undefined,
+      cacheCount: mcpLocalCache?.length ?? 0,
+    });
+    return mcpLocalCache ?? [];
+  }
 }
 
 const OC_TO_MCP: Record<string, string> = {
