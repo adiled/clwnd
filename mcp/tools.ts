@@ -482,19 +482,24 @@ function isGlobPattern(path: string): boolean {
   return /[*?[\]]/.test(path);
 }
 
-// Expand a glob pattern to a list of absolute file paths. Uses the shell's
-// globstar + nullglob so `**` walks the tree and no-match becomes empty
-// instead of the literal pattern. Sorted newest-first by mtime.
+// Convert a single glob segment to regex. ** is handled at the path level,
+// so segments here only see *, ?, and literals.
+function segToRegex(seg: string): RegExp {
+  const re = seg.replace(/[.+^$()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]");
+  return new RegExp("^" + re + "$");
+}
+
+// Walk baseDir, return absolute file paths matching `pat`. `pat` may
+// contain `**` for any-depth descent. Replaces a previous bash impl
+// that relied on `shopt -s globstar` (bash 4+) — macOS ships bash 3.2
+// where that errors out and the daemon couldn't expand globs at all.
 function expandGlobPattern(pattern: string): string[] {
-  // Decide the base dir: absolute patterns expand from the first component
-  // that has no wildcard; relative patterns expand from CWD.
   let baseDir: string;
   let pat: string;
   if (pattern.startsWith("/")) {
     const parts = pattern.split("/");
     const firstWild = parts.findIndex(seg => isGlobPattern(seg));
     if (firstWild === -1) {
-      // No wildcard despite the classifier — fall through as a literal.
       return existsSync(pattern) ? [pattern] : [];
     }
     baseDir = parts.slice(0, firstWild).join("/") || "/";
@@ -503,13 +508,56 @@ function expandGlobPattern(pattern: string): string[] {
     baseDir = CWD;
     pat = pattern;
   }
+  const segs = pat.split("/").filter(Boolean);
+  const results: Array<{ path: string; mtime: number }> = [];
+
+  // Match a single path's segments against pattern segments, with `**`
+  // matching zero-or-more dirs.
+  function matches(pathSegs: string[]): boolean {
+    function go(i: number, j: number): boolean {
+      if (j === segs.length) return i === pathSegs.length;
+      if (segs[j] === "**") {
+        // try consuming 0..rest
+        for (let k = i; k <= pathSegs.length; k++) {
+          if (go(k, j + 1)) return true;
+        }
+        return false;
+      }
+      if (i === pathSegs.length) return false;
+      if (!segToRegex(segs[j]).test(pathSegs[i])) return false;
+      return go(i + 1, j + 1);
+    }
+    return go(0, 0);
+  }
+
+  function walk(dir: string, depth: number): void {
+    if (results.length >= MAX_RESOLVED_TARGETS) return;
+    if (depth > 30) return;
+    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true, encoding: "utf-8" }) as unknown as Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    } catch { return; }
+    for (const e of entries) {
+      if (results.length >= MAX_RESOLVED_TARGETS) return;
+      const full = pathJoin(dir, e.name);
+      if (e.isDirectory()) {
+        if (SKIP_DIR_NAMES.has(e.name) || e.name.startsWith(".")) continue;
+        walk(full, depth + 1);
+      } else if (e.isFile()) {
+        const rel = full.startsWith(baseDir + "/") ? full.slice(baseDir.length + 1) : full;
+        const relSegs = rel.split("/").filter(Boolean);
+        if (matches(relSegs)) {
+          let mtime = 0;
+          try { mtime = statSync(full).mtimeMs; } catch {}
+          results.push({ path: full, mtime });
+        }
+      }
+    }
+  }
   try {
-    const out = execSync(
-      `shopt -s globstar nullglob; cd "${baseDir}" && printf '%s\\0' ${pat} 2>/dev/null | ` +
-      `xargs -0 -r stat -c '%Y %n' 2>/dev/null | sort -rn | head -${MAX_RESOLVED_TARGETS} | cut -d' ' -f2-`,
-      { encoding: "utf-8", timeout: 10000, shell: "/bin/bash" },
-    );
-    return out.trim().split("\n").filter(Boolean).map(f => resolve(baseDir, f));
+    walk(baseDir, 0);
+    results.sort((a, b) => b.mtime - a.mtime);
+    return results.map(r => r.path);
   } catch {
     return [];
   }

@@ -5,12 +5,18 @@ set -e
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
-XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
-
 CLWND_CONFIG="$XDG_CONFIG_HOME/clwnd"
 CLWND_DATA="$XDG_DATA_HOME/clwnd"
 CLWND_STATE="$XDG_STATE_HOME/clwnd"
-CLWND_RUNTIME="$XDG_RUNTIME_DIR/clwnd"
+# Runtime socket dir. With XDG_RUNTIME_DIR set (linux): standard path.
+# Without it (macOS default): UID-namespaced /tmp dir matching the
+# plugin's and daemon's defaultSocketPath fallback so they agree even
+# when CLWND_SOCKET isn't propagated to OC's shell env.
+if [ -n "$XDG_RUNTIME_DIR" ]; then
+  CLWND_RUNTIME="$XDG_RUNTIME_DIR/clwnd"
+else
+  CLWND_RUNTIME="/tmp/clwnd-$(id -u)"
+fi
 
 OPENCODE_CONFIG="$XDG_CONFIG_HOME/opencode/opencode.json"
 

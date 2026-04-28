@@ -173,7 +173,11 @@ function parseToolResult(resultText: string): { output: string; title: string; m
 function defaultSocketPath(): string {
   const runtime = process.env.XDG_RUNTIME_DIR;
   if (runtime) return `${runtime}/clwnd/clwnd.sock`;
-  return "/tmp/clwnd/clwnd.sock";
+  // macOS / linux without XDG_RUNTIME_DIR — UID-namespaced /tmp dir
+  // matching the daemon's default so plugin and daemon agree without
+  // requiring CLWND_SOCKET to be set in env.
+  const uid = process.getuid?.() ?? 0;
+  return `/tmp/clwnd-${uid}/clwnd.sock`;
 }
 
 const HUM_PATH = (process.env.CLWND_SOCKET ?? defaultSocketPath()) + ".hum";

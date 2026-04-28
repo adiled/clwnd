@@ -673,7 +673,12 @@ function defaultSocketPath(): string {
     mkdirSync(dir, { recursive: true });
     return `${dir}/clwnd.sock`;
   }
-  return "/tmp/clwnd.sock";
+  // macOS / linux without XDG_RUNTIME_DIR — UID-namespaced /tmp dir
+  // (kept in sync with plugin's defaultSocketPath in provider.ts).
+  const uid = process.getuid?.() ?? 0;
+  const dir = `/tmp/clwnd-${uid}`;
+  mkdirSync(dir, { recursive: true });
+  return `${dir}/clwnd.sock`;
 }
 
 
