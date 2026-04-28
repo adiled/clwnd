@@ -1922,20 +1922,27 @@ async function getMcpClient(config: McpServerConfig): Promise<McpClient> {
     // Remote: try streamable HTTP first, fall back to SSE.
     const url = new URL(config.url);
     const headers = config.headers ?? {};
+    const headerKeys = Object.keys(headers);
+    trace("mcp.client.remote.connecting", { server: config.name, url: url.toString(), headerKeys, hasAuth: !!headers["Authorization"] });
     try {
       const transport = new StreamableHTTPClientTransport(url, {
         requestInit: { headers },
       });
       await sdk.connect(transport);
-    } catch (e) {
-      trace("mcp.client.http.failed", { server: config.name, err: String(e) });
-      const transport = new SSEClientTransport(url, {
-        requestInit: { headers },
-        eventSourceInit: {
-          fetch: (u: any, init: any) => fetch(u, { ...init, headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) } }),
-        } as any,
-      });
-      await sdk.connect(transport);
+    } catch (httpErr) {
+      trace("mcp.client.http.failed", { server: config.name, err: String(httpErr) });
+      try {
+        const transport = new SSEClientTransport(url, {
+          requestInit: { headers },
+          eventSourceInit: {
+            fetch: (u: any, init: any) => fetch(u, { ...init, headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) } }),
+          } as any,
+        });
+        await sdk.connect(transport);
+      } catch (sseErr) {
+        trace("mcp.client.sse.failed", { server: config.name, err: String(sseErr) });
+        throw sseErr;
+      }
     }
   }
 

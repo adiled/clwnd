@@ -981,6 +981,29 @@ describe("e2e-serve: brokered tools", () => {
   }, TIMEOUT);
 });
 
+describe("e2e-serve: external MCP", () => {
+  test("agent invokes external MCP tool through Claude CLI dispatch", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    // Force a tool call by name. The model receives tools/list with
+    // every registered external MCP tool prefixed by its server name
+    // (linear_list_teams, context7_resolve-library-id, …). If our
+    // mcpServerConfigs propagation breaks, the daemon's MCP handler
+    // responds 'no MCP server found for tool X' and the agent surfaces
+    // that error. Treating either an MCP-side failure OR missing tool
+    // call as test failure.
+    const resp = await sendMessage(sid, "Call the context7_resolve-library-id tool with query=\"react\". If the call fails or returns an error, quote the EXACT error string verbatim in your response — do not paraphrase, do not retry with a different tool. Otherwise summarise what it returned in one sentence.");
+    const text = extractResponseText(resp);
+    const toolParts = (resp.parts ?? []).filter((p: any) => p.type === "tool" && typeof p.tool === "string");
+    const externalCall = toolParts.find((p: any) => /^[a-zA-Z0-9-]+_/.test(p.tool) && !["read","do_code","do_noncode","bash"].includes(p.tool));
+    expect(externalCall, "agent should have attempted an external MCP tool").toBeDefined();
+    expect(text).not.toMatch(/no MCP server found/i);
+    expect(text).not.toMatch(/Unknown tool/i);
+    expect(text).not.toMatch(/spawn .+ ENOENT/i);
+  }, TIMEOUT);
+});
+
 describe("e2e-serve: task tool", () => {
   test("task spawns subtask and returns result without bloating parent context", async () => {
     skipIfDead();
