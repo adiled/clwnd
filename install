@@ -593,11 +593,23 @@ install_cli() {
 # Blow it away on every update (and install) so OC's next plugin resolve
 # actually hits npm for the latest tag.
 wipe_oc_plugin_cache() {
-  local OC_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/opencode/packages/@clwnd"
-  if [ -d "$OC_CACHE" ]; then
-    rm -rf "$OC_CACHE"
-    echo "  wiped OC plugin cache: $OC_CACHE"
-  fi
+  # OC resolves cache via xdg-basedir which differs by OS:
+  #   linux: $XDG_CACHE_HOME or ~/.cache
+  #   macOS: $XDG_CACHE_HOME or ~/Library/Caches
+  # Hit every plausible location — stale @clwnd pin in any of them
+  # makes OC skip loading the new plugin (manifests as no plugin.loaded
+  # log, externalTools never forwarded, every MCP call returns
+  # 'no MCP server found').
+  local CANDIDATES=()
+  [ -n "$XDG_CACHE_HOME" ] && CANDIDATES+=("$XDG_CACHE_HOME/opencode/packages/@clwnd")
+  CANDIDATES+=("$HOME/.cache/opencode/packages/@clwnd")
+  CANDIDATES+=("$HOME/Library/Caches/opencode/packages/@clwnd")
+  for OC_CACHE in "${CANDIDATES[@]}"; do
+    if [ -d "$OC_CACHE" ]; then
+      rm -rf "$OC_CACHE"
+      echo "  wiped OC plugin cache: $OC_CACHE"
+    fi
+  done
 }
 
 # ─── commands ────────────────────────────────────────────────────────────────
