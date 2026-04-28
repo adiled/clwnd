@@ -1893,10 +1893,29 @@ async function getMcpClient(config: McpServerConfig): Promise<McpClient> {
   const sdk = new MCPSDKClient({ name: "clwnd", version: "0.23.6" }, { capabilities: {} });
 
   if (config.type === "local") {
+    // Daemon's PATH (set by systemd) is minimal — node + system. User's
+    // local MCP commands (bunx, npx, pnpx, brew-installed binaries, etc)
+    // sit in $HOME-scoped bin dirs that aren't there. Augment PATH so
+    // commands like `bunx @upstash/context7-mcp` actually resolve.
+    const home = process.env.HOME ?? "/";
+    const extraPath = [
+      `${home}/.bun/bin`,
+      `${home}/.local/bin`,
+      `${home}/.npm-global/bin`,
+      `${home}/.local/share/clwnd/node/v20.20.2/bin`,
+      `${home}/.local/share/fnm/node-versions/v20.20.2/installation/bin`,
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+    ].join(":");
+    const env = {
+      ...process.env,
+      PATH: `${extraPath}:${process.env.PATH ?? ""}`,
+      ...config.environment,
+    } as Record<string, string>;
     const transport = new StdioClientTransport({
       command: config.command[0],
       args: config.command.slice(1),
-      env: { ...process.env, ...config.environment } as Record<string, string>,
+      env,
     });
     await sdk.connect(transport);
   } else {
