@@ -1439,14 +1439,27 @@ export class ClwndModel implements LanguageModelV3 {
 
 // ─── Factory ─────────────────────────────────────────────────────────────
 
+// Cross-module global. OC imports this package twice — once via the
+// plugin loader (which calls our entry function with PluginInput.client)
+// and again via resolveSDK's `import(installedPath)` to get
+// createClwnd. On macOS the two imports can resolve to different
+// module-record URLs (file:// vs symlinked path), so a module-scoped
+// `let sharedClient` set by the plugin import is invisible to the SDK
+// import. Stashing on globalThis bridges both.
+const G: any = globalThis as any;
+function getSharedClient(): unknown { return G.__clwndSharedClient ?? null; }
+function setSharedClientGlobal(v: unknown): void { G.__clwndSharedClient = v; }
+function getSharedPluginInput(): ClwndConfig["pluginInput"] { return G.__clwndSharedPluginInput; }
+function setSharedPluginInputGlobal(v: ClwndConfig["pluginInput"]): void { G.__clwndSharedPluginInput = v; }
+export function setSharedClient(client: unknown): void { setSharedClientGlobal(client); }
 let sharedClient: unknown = null;
 let sharedPluginInput: ClwndConfig["pluginInput"] = undefined;
-export function setSharedClient(client: unknown): void { sharedClient = client; }
 
 async function handleTendrilReach(msg: Record<string, unknown>): Promise<void> {
   const tool = msg.tool as string;
   const args = msg.args as Record<string, unknown>;
   const callId = msg.callId as string;
+  const sharedClient = getSharedClient();
   trace("tendril.executing", { tool, callId, hasSid: !!msg.sid, hasClient: !!sharedClient, argsKeys: Object.keys(args).join(",") });
 
   try {
@@ -1506,11 +1519,13 @@ async function handleTendrilReach(msg: Record<string, unknown>): Promise<void> {
     hum({ chi: "tendril-result", callId, result: `Error: ${errMsg}` });
   }
 }
-export function setSharedPluginInput(input: ClwndConfig["pluginInput"]): void { sharedPluginInput = input; }
+export function setSharedPluginInput(input: ClwndConfig["pluginInput"]): void { setSharedPluginInputGlobal(input); }
 
 export function createClwnd(config: ClwndConfig = {}) {
-  if (!config.client && sharedClient) config = { ...config, client: sharedClient };
-  if (!config.pluginInput && sharedPluginInput) config = { ...config, pluginInput: sharedPluginInput };
+  const sc = getSharedClient();
+  const spi = getSharedPluginInput();
+  if (!config.client && sc) config = { ...config, client: sc };
+  if (!config.pluginInput && spi) config = { ...config, pluginInput: spi };
   const fn = (modelId: string): LanguageModelV3 => new ClwndModel(modelId, config);
   fn.languageModel = (modelId: string) => new ClwndModel(modelId, config);
   return fn;
