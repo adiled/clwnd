@@ -315,7 +315,19 @@ const configPath = '${TUI_CONFIG}';
 const pluginRef = '${PLUGIN_REF}';
 
 let config = {};
-try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
+let raw = null;
+try { raw = fs.readFileSync(configPath, 'utf8'); } catch (e) {
+  if (e.code !== 'ENOENT') {
+    console.error('  ABORT: cannot read ' + configPath + ': ' + e.message + ' (refusing to overwrite)');
+    process.exit(1);
+  }
+}
+if (raw !== null) {
+  try { config = JSON.parse(raw); } catch (e) {
+    console.error('  ABORT: ' + configPath + ' is not valid JSON: ' + e.message + ' (refusing to overwrite — fix the file or move it aside)');
+    process.exit(1);
+  }
+}
 
 if (!config.plugin) config.plugin = [];
 config.plugin = config.plugin.filter(p => typeof p !== 'string' || (!p.includes('clwnd') && !p.includes('@clwnd')));
@@ -338,9 +350,19 @@ const pluginRef = '${PLUGIN_REF}';
 const registry = JSON.parse(fs.readFileSync('${CLWND_SRC}/models.json', 'utf8'));
 
 let config = {};
-try {
-  config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-} catch {}
+let raw = null;
+try { raw = fs.readFileSync(configPath, 'utf8'); } catch (e) {
+  if (e.code !== 'ENOENT') {
+    console.error('  ABORT: cannot read ' + configPath + ': ' + e.message + ' (refusing to overwrite)');
+    process.exit(1);
+  }
+}
+if (raw !== null) {
+  try { config = JSON.parse(raw); } catch (e) {
+    console.error('  ABORT: ' + configPath + ' is not valid JSON: ' + e.message + ' (refusing to overwrite — fix the file or move it aside)');
+    process.exit(1);
+  }
+}
 
 // Plugin cleanup: remove both known refs, then add the correct one
 if (!config.plugin) config.plugin = [];
