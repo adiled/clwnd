@@ -284,9 +284,9 @@ do_build() {
   echo "[build] compiling..."
   "$CLWND_PNPM_BIN" run build
 
-  # ExecStart uses `node --import tsx`; tsx must be resolvable from $CLWND_SRC.
-  [ -d "$CLWND_SRC/node_modules/tsx" ] || {
-    echo "error: tsx package missing at $CLWND_SRC/node_modules/tsx"
+  # ExecStart uses `--import file://...tsx/dist/loader.mjs`; that file must exist.
+  [ -f "$CLWND_SRC/node_modules/tsx/dist/loader.mjs" ] || {
+    echo "error: tsx loader missing at $CLWND_SRC/node_modules/tsx/dist/loader.mjs"
     exit 1
   }
   [ -f "$CLWND_SRC/plugins/opencode/dist/index.js" ] || {
@@ -430,7 +430,7 @@ register_service() {
   <array>
     <string>${NODE}</string>
     <string>--import</string>
-    <string>tsx</string>
+    <string>file://${CLWND_SRC}/node_modules/tsx/dist/loader.mjs</string>
     <string>${CLWND_SRC}/daemon/daemon.ts</string>
   </array>
   <key>WorkingDirectory</key>
@@ -498,7 +498,7 @@ Environment=XDG_STATE_HOME=$XDG_STATE_HOME
 Environment=XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
 Environment=PATH=$(dirname $CLAUDE):$(dirname $NODE):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 $($IS_ROOT || echo "Environment=CLWND_PERMISSION_MODE=bypassPermissions")
-ExecStart=$NODE --import tsx $CLWND_SRC/daemon/daemon.ts
+ExecStart=$NODE --import file://$CLWND_SRC/node_modules/tsx/dist/loader.mjs $CLWND_SRC/daemon/daemon.ts
 Restart=on-failure
 RestartSec=2s
 StandardOutput=journal
