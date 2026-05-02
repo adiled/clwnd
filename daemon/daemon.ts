@@ -1243,7 +1243,13 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
 
           return (type: string, payload: Record<string, unknown>) => {
             if (!cup || cup.withered) return;
-            drift.mark(sid, "first_petal");
+            // first_petal = first data-bearing petal from Claude CLI's stream.
+            // Skip housekeeping types (stream_start fires at nest spawn,
+            // before any content) so the murmur→first_petal gap reflects
+            // real TTFB to first content, not synthetic bookkeeping.
+            if (type !== "stream_start" && type !== "content_block_stop") {
+              drift.mark(sid, "first_petal");
+            }
 
             // Per-block-type first-time marks + per-call tracking
             if (type === "reasoning_start") {
