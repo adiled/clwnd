@@ -243,13 +243,66 @@ except Exception as e:
 "
     ;;
   drift)
+    SUB="${1:-}"
+    if [ "$SUB" = "help" ] || [ "$SUB" = "--help" ] || [ "$SUB" = "-h" ]; then
+      cat <<'DRIFTHELP'
+clwnd drift — per-turn latency report
+
+Usage:
+  clwnd drift              Recent turns + aggregate p50/p95
+  clwnd drift <sid>        Filter to one session
+  clwnd drift help         This help
+
+Phase order (canonical):
+  plugin_doStream_enter    plugin's doStream begins (Stage 2)
+  plugin_prompt_sent       plugin finished prep, hum'd prompt to daemon
+    span plugin_prep       prep cost (graft prep, perm fetch, MCP cfg)
+    span hum_hop_outbound  socket hop plugin → daemon
+  graft_synced             daemon spliced JSONL from priorPetals
+    span graft             splice ms
+  nest_spawned             daemon cold-spawned Claude CLI
+    span nest_spawn        spawn ms (absent if flag.warm = true)
+  murmur                   daemon wrote prompt to Claude stdin
+  first_petal              first byte from Claude CLI (TTFB)
+  first_reasoning_start    Claude opened a thinking block
+    span reasoning         cumulative thinking time
+  first_text_start         Claude opened a text block
+  first_tool_input_start   Claude picked a tool
+    span tool_args:<tool>  args-stream time per tool
+  first_uncup              cup released (drone cleared the first bytes)
+  first_bloom              first chunk hit the wire
+    span hum_hop_inbound   socket hop daemon → plugin (first chunk)
+  plugin_first_enqueue     plugin enqueued first text-delta on the AI SDK stream
+  plugin_first_visible     == first_enqueue (Stage 3 refinement pending)
+  oc_bus_publish           OC processor published first part-delta on the bus
+  oc_sse_write             SSE writer flushed (≈ bus_publish, sub-ms)
+  turn                     entire turn wall-clock
+
+Spans (cumulative durations, not phase marks):
+  reasoning, graft, nest_spawn, plugin_prep, hum_hop_outbound,
+  hum_hop_inbound, compaction_curate, permission_check, permission_hold,
+  brokered:<tool>, external_mcp_spawn, external_exec:<server>,
+  task_subagent, tendril_exec:<tool>, tool_args:<tool>
+
+Flags:
+  warm                     daemon reused existing Claude CLI process
+  withered                 count of drone-wither retries on this turn
+
+Tendrils: per-MCP tools/call roundtrip (non-permission_prompt only).
+  Decompositions live in spans (brokered:*, external_*, task_subagent).
+
+The TUI render gap (SSE → terminal pixels) is OUT of clwnd's process and
+unmeasurable from here. The chain ends at oc_sse_write.
+DRIFTHELP
+      exit 0
+    fi
     XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
     SOCK="${CLWND_SOCKET:-$XDG_RUNTIME_DIR/clwnd/clwnd.sock}.http"
     if [ ! -S "$SOCK" ]; then
       echo "daemon not running (socket $SOCK not found)"
       exit 1
     fi
-    SID="${1:-}"
+    SID="$SUB"
     QUERY=""
     [ -n "$SID" ] && QUERY="?sid=$SID&limit=20"
     curl -s --unix-socket "$SOCK" "http://localhost/drift$QUERY" | python3 -c "

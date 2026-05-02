@@ -942,7 +942,25 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
     humEcho(clientId, msg);
   }
 
+  // Hum hop timing — plugin stamps `sentAt` on outgoing tones; daemon
+  // records the inbound socket-hop latency on the active turn.
+  if (typeof msg.sentAt === "number" && typeof msg.sid === "string") {
+    drift.span(msg.sid as string, "hum_hop_outbound", Math.max(0, Date.now() - (msg.sentAt as number)));
+  }
+
   switch (chi) {
+    case "perf-mark": {
+      // Plugin-emitted perf marks. Daemon merges into the active turn's
+      // marks (first observation wins) and optionally records a span.
+      const sid = msg.sid as string;
+      const mark = msg.mark as string | undefined;
+      const span = msg.span as { name: string; ms: number } | undefined;
+      const flag = msg.flag as { key: string; value: boolean | number | string } | undefined;
+      if (mark) drift.mark(sid, mark);
+      if (span) drift.span(sid, span.name, span.ms);
+      if (flag) drift.flag(sid, flag.key, flag.value);
+      break;
+    }
     case "prompt": {
       // Plugin piggybacks its counter delta on every prompt — ingest before
       // anything else so counts don't miss on errors/early returns below.
@@ -1138,6 +1156,12 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
 
           function sendChunks(chunks: string[]) {
             drift.mark(sid, "first_bloom");
+            // Stamp sentAt on the first chunk only, at the actual send time
+            // (not at petal creation, which can be cup-delayed by seconds).
+            // Plugin only reads sentAt on first chunk per turn for hop timing.
+            if (chunks.length > 0) {
+              chunks = [chunks[0].replace(/}$/, `,"sentAt":${Date.now()}}`), ...chunks.slice(1)];
+            }
             const line = chunks.join("\n") + "\n";
             const s = sigil(sid);
             let sent = false;

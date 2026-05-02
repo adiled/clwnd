@@ -9,6 +9,7 @@ import { resolve, dirname, relative, extname, join as pathJoin } from "path";
 
 import { trace } from "../log.ts";
 import { penny } from "../lib/penny.ts";
+import * as drift from "../lib/drift.ts";
 import { fileSymbols, formatSymbols, readSymbol, isSupported as astSupported, isWasmLanguage, astGrep, searchSymbols, validateSyntax, symbolByteRange, type Symbol } from "../lib/ast.ts";
 import { loadConfig } from "../lib/config.ts";
 import { resolveWord, resolvePhrase, resolveSentence, resolveParagraph, discoverAnchors, formatAnchors } from "../lib/linguistic.ts";
@@ -1854,10 +1855,13 @@ async function execBash(args: { command: string; description?: string; timeout?:
 
 async function execPermissionPrompt(args: { tool_name: string; input?: Record<string, unknown> }, sessionId?: string): Promise<ToolResult> {
   trace("mcp.permission.prompted", { tool: args.tool_name, sessionId });
+  const checkStart = Date.now();
   if (!permissionCallback) {
+    if (sessionId) drift.span(sessionId, "permission_check", Date.now() - checkStart);
     return { output: JSON.stringify({ behavior: "allow", updatedInput: args.input ?? {} }) };
   }
   const result = await permissionCallback(args.tool_name, args.input ?? {}, sessionId);
+  if (sessionId) drift.span(sessionId, "permission_check", Date.now() - checkStart);
   if (result.decision === "allow") {
     return { output: JSON.stringify({ behavior: "allow", updatedInput: args.input ?? {} }) };
   }
@@ -2036,9 +2040,14 @@ async function executeExternalTool(sessionId: string, toolName: string, args: Re
   const server = findServerForTool(sessionId, toolName);
   if (!server) return `Error: no MCP server found for tool ${toolName}`;
   try {
+    const wasCached = mcpClients.has(server.name);
+    const spawnStart = Date.now();
     const client = await getMcpClient(server);
+    if (!wasCached) drift.span(sessionId, "external_mcp_spawn", Date.now() - spawnStart);
+    const callStart = Date.now();
     const rawName = stripServerPrefix(server.name, toolName);
     const response = await client.sdk.callTool({ name: rawName, arguments: args });
+    drift.span(sessionId, `external_exec:${server.name}`, Date.now() - callStart);
     const content = (response.content ?? []) as Array<{ type: string; text?: string }>;
     return content.filter(c => c.type === "text").map(c => c.text ?? "").join("\n") || "(empty result)";
   } catch (e) {
@@ -2079,6 +2088,7 @@ async function execTendril(name: string, args: Record<string, unknown>, sessionI
 
   if (tendrilCallback) tendrilCallback(name, args, callId, sessionId);
 
+  const tendrilStart = Date.now();
   const result = await new Promise<string>((resolve) => {
     TENDRIL_HOLDS.set(callId, { resolve, tool: name });
     setTimeout(() => {
@@ -2089,18 +2099,28 @@ async function execTendril(name: string, args: Record<string, unknown>, sessionI
       }
     }, 5 * 60_000);
   });
+  if (sessionId) drift.span(sessionId, name === "task" ? "task_subagent" : `tendril_exec:${name}`, Date.now() - tendrilStart);
 
   return { output: result, title: name, metadata: { proxy: true, callId } };
 }
 
+const BROKERED_TOOLS = new Set(["read", "do_code", "do_noncode", "bash"]);
+
 export async function executeTool(name: string, args: Record<string, unknown>, _callId?: string, sessionId?: string): Promise<ToolResult> {
   if (name !== "permission_prompt") trace("mcp.tool.executed", { tool: name });
   penny.toolCalls++;
+  const brokered = BROKERED_TOOLS.has(name);
+  const start = brokered ? Date.now() : 0;
+  const wrap = async (p: Promise<ToolResult>): Promise<ToolResult> => {
+    try { return await p; } finally {
+      if (brokered && sessionId) drift.span(sessionId, `brokered:${name}`, Date.now() - start);
+    }
+  };
   switch (name) {
-    case "read": return execRead(args as any, sessionId);
-    case "do_code": return execDoCode(args as any, sessionId);
-    case "do_noncode": return execDoNoncode(args as any, sessionId);
-    case "bash": return execBash(args as any);
+    case "read": return wrap(Promise.resolve(execRead(args as any, sessionId)));
+    case "do_code": return wrap(Promise.resolve(execDoCode(args as any, sessionId)));
+    case "do_noncode": return wrap(Promise.resolve(execDoNoncode(args as any, sessionId)));
+    case "bash": return wrap(execBash(args as any));
     case "permission_prompt": return execPermissionPrompt(args as any, sessionId);
     case "task": return execTendril("task", args, sessionId);
     // Replaced-and-banned tools. Return a redirect instead of "Unknown tool"

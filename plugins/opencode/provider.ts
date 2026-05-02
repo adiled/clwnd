@@ -304,6 +304,8 @@ export function hum(msg: Record<string, unknown>): void {
   }
   if (msg.chi !== "log" && !msg.rid) msg.rid = makeRid();
   msg.from = "plugin";
+  // Drift: stamp send-time so the daemon can compute hum_hop_outbound.
+  if (typeof msg.sentAt !== "number") msg.sentAt = Date.now();
   try {
     const data = JSON.stringify(msg) + "\n";
     writeLog("trace", "hum.send", { chi: msg.chi as string, rid: msg.rid as string, len: data.length });
@@ -840,6 +842,8 @@ export class ClwndModel implements LanguageModelV3 {
     const sid = opts.headers?.["x-opencode-session"] ?? makeSigil(Date.now().toString());
     const lastRole = opts.prompt.length > 0 ? opts.prompt[opts.prompt.length - 1].role : "none";
     trace("doStream.enter", { sid, promptLen: opts.prompt.length, lastRole });
+    const _doStreamEnteredAt = Date.now();
+    hum({ chi: "perf-mark", sid, mark: "plugin_doStream_enter" });
     const content = extractContent(opts.prompt, sid);
     const text = content.filter((p): p is { type: "text"; text: string } => p.type === "text").map(p => p.text).join("\n\n");
     const systemPrompt = stripSentencesMatching(
@@ -1080,6 +1084,7 @@ export class ClwndModel implements LanguageModelV3 {
         ...(pd ? { pennyDelta: pd } : {}),
         dusk: duskIn(30_000),
       });
+      hum({ chi: "perf-mark", sid, span: { name: "plugin_prep", ms: Date.now() - _doStreamEnteredAt }, mark: "plugin_prompt_sent" });
       promptSent = true;
       if (permAskId) {
         trace("permission.hold.releasing", { sid, askId: permAskId });
@@ -1130,6 +1135,7 @@ export class ClwndModel implements LanguageModelV3 {
         ...(pd ? { pennyDelta: pd } : {}),
         dusk: duskIn(30_000),
       });
+      hum({ chi: "perf-mark", sid, span: { name: "plugin_prep", ms: Date.now() - _doStreamEnteredAt }, mark: "plugin_prompt_sent" });
       promptSent = true;
     }
 
@@ -1208,6 +1214,8 @@ export class ClwndModel implements LanguageModelV3 {
           });
         }
 
+        let _firstChunkSeen = false;
+        let _firstEnqueueDone = false;
         function onHummin(raw: Record<string, unknown>): void {
           if (raw.chi === "tool-meta") {
             metaQueue.push({
@@ -1224,6 +1232,13 @@ export class ClwndModel implements LanguageModelV3 {
           if (chi === "chunk") {
             const ct = raw.chunkType as string;
 
+            // Drift: stamp inbound hop on first chunk seen for this turn.
+            if (!_firstChunkSeen && typeof raw.sentAt === "number") {
+              _firstChunkSeen = true;
+              const hop = Math.max(0, Date.now() - (raw.sentAt as number));
+              hum({ chi: "perf-mark", sid, span: { name: "hum_hop_inbound", ms: hop } });
+            }
+
             // Text
             if (ct === "text_start" || (ct === "text_delta" && !textStarted)) {
               if (!textStarted) {
@@ -1234,6 +1249,13 @@ export class ClwndModel implements LanguageModelV3 {
             }
             if (ct === "text_delta" && raw.delta) {
               petal({ type: "text-delta", id: textId, delta: raw.delta as string });
+              if (!_firstEnqueueDone) {
+                _firstEnqueueDone = true;
+                hum({ chi: "perf-mark", sid, mark: "plugin_first_enqueue" });
+                // first_visible: in absence of an OC-side hook (Stage 3),
+                // use the same instant. Refined later via bus subscription.
+                hum({ chi: "perf-mark", sid, mark: "plugin_first_visible" });
+              }
             }
 
             // Reasoning
