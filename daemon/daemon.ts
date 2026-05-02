@@ -1642,10 +1642,26 @@ const httpServer = createHttpServer(async (req, res) => {
 
   if (req.method === "GET" && url.pathname === "/drift") {
     const sid = url.searchParams.get("sid") ?? undefined;
-    const limit = Math.max(1, Math.min(200, parseInt(url.searchParams.get("limit") ?? "20", 10) || 20));
-    const recent = drift.recent(sid, limit);
+    const limit = Math.max(1, Math.min(2000, parseInt(url.searchParams.get("limit") ?? "20", 10) || 20));
+    const days = parseInt(url.searchParams.get("days") ?? "0", 10);
+    const since = parseInt(url.searchParams.get("since") ?? "0", 10);
+    let recent = drift.recent(sid, limit);
+    if (days > 0 || since > 0) {
+      const fromMs = since > 0 ? since : Date.now() - days * 86_400_000;
+      const fromDisk = drift.readSince(fromMs, sid);
+      // Merge: ring may overlap with disk for the current day. Dedupe by turnId.
+      const seen = new Set<string>();
+      const merged: typeof recent = [];
+      for (const t of [...fromDisk, ...recent]) {
+        if (seen.has(t.turnId)) continue;
+        seen.add(t.turnId);
+        merged.push(t);
+      }
+      recent = merged.slice(-limit).reverse();
+    }
     const aggregate = drift.aggregate(100);
-    return jsonResponse(res, { recent, aggregate });
+    const days_avail = drift.listDays();
+    return jsonResponse(res, { recent, aggregate, days: days_avail });
   }
 
   if (req.method === "GET" && url.pathname === "/sessions") {
@@ -1924,6 +1940,13 @@ process.on("SIGINT",  () => { nest.silence(); process.exit(0); });
 process.on("SIGTERM", () => { nest.silence(); process.exit(0); });
 process.on("uncaughtException",  e => info("process.uncaught", { err: String(e) }));
 process.on("unhandledRejection", e => info("process.unhandled", { err: String(e) }));
+
+drift.configure({
+  storeDir: `${STATE_DIR}/drift`,
+  retentionDays: cfg.driftRetentionDays,
+  version: CURRENT_VERSION,
+});
+setInterval(() => drift.prune(), 86_400_000); // daily prune
 
 info("ready", { http: HTTP, mcp: MCP_URL, pid: process.pid, version: CURRENT_VERSION, maxProcs: MAX_PROCS, idleTimeout: IDLE_TIMEOUT, droned: DRONED });
 

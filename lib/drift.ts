@@ -5,6 +5,14 @@
 // Naming follows the rest of the codebase: a turn drifts through phases,
 // each milestone is a mark, each tool roundtrip is a tendril. Aggregation
 // is purely lazy on read — the hot path only stamps a few timestamps.
+//
+// Persistence: when configured, each turn appends one JSON line to
+//   ${stateDir}/drift/YYYY-MM-DD.ndjson
+// at turn end. The in-memory ring stays primary for "recent N turns";
+// historical reads cross over to disk via readSince().
+
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "fs";
+import { join } from "path";
 
 export interface TendrilDrift {
   name: string;
@@ -16,6 +24,7 @@ export interface TurnDrift {
   sid: string;
   turnId: string;
   modelId?: string;
+  version?: string;                  // clwnd build that recorded this turn
   startedAt: number;
   endedAt?: number;
   marks: Record<string, number>;     // phase name → ms since startedAt (first-only)
@@ -29,12 +38,69 @@ const turns: TurnDrift[] = [];
 const active = new Map<string, TurnDrift>();
 let seq = 0;
 
+// Persistence config — set by daemon at startup via configure().
+let storeDir: string | null = null;
+let retentionDays = 0;
+let buildVersion: string | undefined;
+
+export function configure(opts: { storeDir: string; retentionDays: number; version?: string }): void {
+  storeDir = opts.storeDir;
+  retentionDays = opts.retentionDays;
+  buildVersion = opts.version;
+  if (retentionDays > 0 && storeDir) {
+    try { mkdirSync(storeDir, { recursive: true }); } catch {}
+    pruneOldFiles();
+  }
+}
+
+function dayBucket(t: number): string {
+  const d = new Date(t);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function fileFor(t: number): string | null {
+  if (!storeDir || retentionDays <= 0) return null;
+  return join(storeDir, `${dayBucket(t)}.ndjson`);
+}
+
+function appendTurn(t: TurnDrift): void {
+  const path = fileFor(t.endedAt ?? t.startedAt);
+  if (!path) return;
+  try {
+    appendFileSync(path, JSON.stringify(t) + "\n");
+  } catch {
+    // Disk full / EROFS / permission — drift is not critical, drop silently.
+  }
+}
+
+function pruneOldFiles(): void {
+  if (!storeDir || retentionDays <= 0) return;
+  try {
+    const cutoff = Date.now() - retentionDays * 86_400_000;
+    for (const name of readdirSync(storeDir)) {
+      if (!name.endsWith(".ndjson")) continue;
+      const path = join(storeDir, name);
+      try {
+        const st = statSync(path);
+        if (st.mtimeMs < cutoff) unlinkSync(path);
+      } catch {}
+    }
+  } catch {}
+}
+
+// Periodic prune — daemon invokes once per ~24h.
+export function prune(): void { pruneOldFiles(); }
+
 export function start(sid: string, modelId?: string): void {
   if (active.has(sid)) return; // re-entrant guard — same turn, no reset
   const t: TurnDrift = {
     sid,
     turnId: `t${++seq}`,
     modelId,
+    version: buildVersion,
     startedAt: Date.now(),
     marks: {},
     spans: {},
@@ -91,6 +157,44 @@ export function end(sid: string): void {
   t.endedAt = Date.now();
   t.marks["turn"] = t.endedAt - t.startedAt;
   active.delete(sid);
+  appendTurn(t);
+}
+
+/**
+ * Read turns from disk for the given window. Used when the in-memory ring
+ * is colder than the requested range (typical for `clwnd drift --days N`).
+ * Returns turns sorted oldest → newest. Caller may .reverse() if desired.
+ */
+export function readSince(sinceMs: number, sid?: string): TurnDrift[] {
+  if (!storeDir || retentionDays <= 0) return [];
+  const out: TurnDrift[] = [];
+  let names: string[] = [];
+  try { names = readdirSync(storeDir).filter((n) => n.endsWith(".ndjson")).sort(); } catch { return []; }
+  for (const name of names) {
+    const path = join(storeDir, name);
+    let raw: string;
+    try { raw = readFileSync(path, "utf8"); } catch { continue; }
+    for (const line of raw.split("\n")) {
+      if (!line) continue;
+      let t: TurnDrift;
+      try { t = JSON.parse(line) as TurnDrift; } catch { continue; }
+      if (t.startedAt < sinceMs) continue;
+      if (sid && t.sid !== sid) continue;
+      out.push(t);
+    }
+  }
+  return out;
+}
+
+/** Days for which a drift bucket exists on disk. Useful for UI listing. */
+export function listDays(): string[] {
+  if (!storeDir) return [];
+  try {
+    return readdirSync(storeDir)
+      .filter((n) => n.endsWith(".ndjson"))
+      .map((n) => n.replace(/\.ndjson$/, ""))
+      .sort();
+  } catch { return []; }
 }
 
 export function recent(sid?: string, limit = 20): TurnDrift[] {

@@ -302,9 +302,22 @@ DRIFTHELP
       echo "daemon not running (socket $SOCK not found)"
       exit 1
     fi
-    SID="$SUB"
-    QUERY=""
-    [ -n "$SID" ] && QUERY="?sid=$SID&limit=20"
+    # Parse remaining args: optional sid, --days N, --limit N
+    SID=""
+    DAYS=""
+    LIMIT="20"
+    while [ -n "$SUB" ]; do
+      case "$SUB" in
+        --days) shift; DAYS="$1" ;;
+        --limit) shift; LIMIT="$1" ;;
+        *) [ -z "$SID" ] && SID="$SUB" ;;
+      esac
+      shift
+      SUB="${1:-}"
+    done
+    QUERY="?limit=$LIMIT"
+    [ -n "$SID" ] && QUERY="${QUERY}&sid=$SID"
+    [ -n "$DAYS" ] && QUERY="${QUERY}&days=$DAYS"
     curl -s --unix-socket "$SOCK" "http://localhost/drift$QUERY" | python3 -c "
 import sys, json
 def fmt_ms(v):

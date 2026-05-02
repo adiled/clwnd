@@ -42,6 +42,13 @@ export interface ClwndConfig {
    * Other providers' compaction is untouched.
    */
   compaction: 'off' | 'curate';
+  /**
+   * Drift retention in days. Daemon writes one NDJSON file per day to
+   * ${state}/drift/YYYY-MM-DD.ndjson and prunes files older than this on
+   * startup + once daily. Default 30 days. 0 disables persistence (ring
+   * buffer only).
+   */
+  driftRetentionDays: number;
 }
 
 const DEFAULTS: ClwndConfig = {
@@ -56,6 +63,7 @@ const DEFAULTS: ClwndConfig = {
   },
   ccFlags: {},
   compaction: 'off',
+  driftRetentionDays: 30,
 };
 
 const CONFIG_PATHS = [
@@ -84,6 +92,9 @@ export function loadConfig(): ClwndConfig {
           ? Object.fromEntries(Object.entries(raw.ccFlags).map(([k, v]) => [k, String(v)]))
           : DEFAULTS.ccFlags,
         compaction: raw.compaction === 'curate' ? 'curate' : DEFAULTS.compaction,
+        driftRetentionDays: typeof raw.driftRetentionDays === "number" && raw.driftRetentionDays >= 0
+          ? Math.floor(raw.driftRetentionDays)
+          : DEFAULTS.driftRetentionDays,
       };
       return cached;
     } catch {}
