@@ -1214,7 +1214,6 @@ export class ClwndModel implements LanguageModelV3 {
           });
         }
 
-        let _firstChunkSeen = false;
         let _firstEnqueueDone = false;
         function onHummin(raw: Record<string, unknown>): void {
           if (raw.chi === "tool-meta") {
@@ -1232,11 +1231,12 @@ export class ClwndModel implements LanguageModelV3 {
           if (chi === "chunk") {
             const ct = raw.chunkType as string;
 
-            // Drift: stamp inbound hop on first chunk seen for this turn.
-            if (!_firstChunkSeen && typeof raw.sentAt === "number") {
-              _firstChunkSeen = true;
-              const hop = Math.max(0, Date.now() - (raw.sentAt as number));
-              hum({ chi: "perf-mark", sid, span: { name: "hum_hop_inbound", ms: hop } });
+            // Drift: every chunk carries `sentAt` from the daemon. Sample
+            // each one as one hum (destination = oc) so the daemon can
+            // aggregate true per-hum p50/p95 instead of a cumulative sum.
+            if (typeof raw.sentAt === "number") {
+              const transit = Math.max(0, Date.now() - (raw.sentAt as number));
+              hum({ chi: "perf-mark", sid, hum: { to: "oc", ms: transit } });
             }
 
             // Text

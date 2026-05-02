@@ -269,7 +269,7 @@ Phase order (canonical):
   plugin_doStream_enter    plugin's doStream begins (Stage 2)
   plugin_prompt_sent       plugin finished prep, hum'd prompt to daemon
     span plugin_prep       prep cost (graft prep, perm fetch, MCP cfg)
-    span hum_hop_outbound  socket hop plugin → daemon
+    hum  hum_to_nest       per-hum transit, plugin → daemon (p50/p95)
   graft_synced             daemon spliced JSONL from priorPetals
     span graft             splice ms
   nest_spawned             daemon cold-spawned Claude CLI
@@ -283,7 +283,7 @@ Phase order (canonical):
     span tool_args:<tool>  args-stream time per tool
   first_uncup              cup released (drone cleared the first bytes)
   first_bloom              first chunk hit the wire
-    span hum_hop_inbound   socket hop daemon → plugin (first chunk)
+    hum  hum_to_oc         per-hum transit, daemon → plugin (p50/p95)
   plugin_first_enqueue     plugin enqueued first text-delta on the AI SDK stream
   plugin_first_visible     == first_enqueue (Stage 3 refinement pending)
   oc_bus_publish           OC processor published first part-delta on the bus
@@ -291,10 +291,14 @@ Phase order (canonical):
   wilt                     entire bloom wall-clock (open → wilt)
 
 Spans (cumulative durations, not phase marks):
-  reasoning, graft, nest_spawn, plugin_prep, hum_hop_outbound,
-  hum_hop_inbound, compaction_curate, permission_check, permission_hold,
-  brokered:<tool>, external_mcp_spawn, external_exec:<server>,
-  task_subagent, tendril_exec:<tool>, tool_args:<tool>
+  reasoning, graft, nest_spawn, plugin_prep, compaction_curate,
+  permission_check, permission_hold, brokered:<tool>, external_mcp_spawn,
+  external_exec:<server>, task_subagent, tendril_exec:<tool>,
+  tool_args:<tool>
+
+Hums (per-tone transit samples, aggregated p50/p95):
+  hum_to_nest              every plugin → daemon hum sample
+  hum_to_oc                every daemon → plugin hum sample (one per send batch)
 
 Flags:
   warm                     daemon reused existing Claude CLI process
@@ -360,12 +364,13 @@ DRIFTHELP
 import sys, json
 def fmt_ms(v):
     if v is None: return '-'
+    if v < 0: v = 0
     if v < 1000: return f'{int(v)}ms'
     return f'{v/1000:.2f}s'
 def gap(marks, a, b):
     av, bv = marks.get(a), marks.get(b)
     if av is None or bv is None: return None
-    return bv - av
+    return max(0, bv - av)
 try:
     d = json.load(sys.stdin)
     recent = d.get('recent', [])
@@ -408,6 +413,12 @@ try:
             print()
             print(f'  {\"span\":<24} {\"p50\":>8} {\"p95\":>8} {\"n\":>5}')
             for name, s in sorted(spans_agg.items(), key=lambda kv: -kv[1]['p95']):
+                print(f'  {name:<24} {fmt_ms(s[\"p50\"]):>8} {fmt_ms(s[\"p95\"]):>8} {s[\"n\"]:>5}')
+        hums_agg = agg.get('hums', {})
+        if hums_agg:
+            print()
+            print(f'  {\"hum\":<24} {\"p50\":>8} {\"p95\":>8} {\"n\":>5}')
+            for name, s in sorted(hums_agg.items()):
                 print(f'  {name:<24} {fmt_ms(s[\"p50\"]):>8} {fmt_ms(s[\"p95\"]):>8} {s[\"n\"]:>5}')
         tendrils = agg.get('tendrils', {})
         if tendrils:

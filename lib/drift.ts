@@ -21,6 +21,12 @@ export interface TendrilDrift {
   at: number; // ms since turn start
 }
 
+export interface HumSample {
+  to: "nest" | "oc"; // destination endpoint (anchored on receiver, not perspective)
+  ms: number;
+  at: number;        // ms since bloom start
+}
+
 export interface BloomDrift {
   sid: string;
   bloomId: string;
@@ -32,6 +38,7 @@ export interface BloomDrift {
   spans: Record<string, number>;     // named duration accumulator (cumulative)
   flags: Record<string, boolean | number | string>; // arbitrary tags (warm, withered, …)
   tendrils: TendrilDrift[];
+  hums: HumSample[];                 // per-hum transit samples — aggregated as p50/p95
 }
 
 const RING_SIZE = 200;
@@ -107,6 +114,7 @@ export function open(sid: string, modelId?: string): void {
     spans: {},
     flags: {},
     tendrils: [],
+    hums: [],
   };
   active.set(sid, t);
   blooms.push(t);
@@ -124,6 +132,22 @@ export function tendril(sid: string, name: string, ms: number): void {
   const t = active.get(sid);
   if (!t) return;
   t.tendrils.push({ name, ms, at: Date.now() - t.startedAt });
+}
+
+/**
+ * Record one hum sample — a single tone's transit across the hum socket.
+ * `to` names the destination endpoint (nest = daemon, oc = plugin), so
+ * direction is unambiguous regardless of who's reading. Aggregates as
+ * p50/p95 across all sampled hums per bloom.
+ */
+export function hum(sid: string, to: "nest" | "oc", ms: number): void {
+  const t = active.get(sid);
+  if (!t) return;
+  if (ms < 0) ms = 0; // clock-skew clamp
+  // Cap per-bloom samples to avoid memory blow on chatty turns. p95 stays
+  // representative; tail samples after the cap are dropped.
+  if (t.hums.length >= 200) return;
+  t.hums.push({ to, ms, at: Date.now() - t.startedAt });
 }
 
 /** Cumulative span — call multiple times to add (e.g. multiple reasoning blocks). */
@@ -208,11 +232,13 @@ export function aggregate(limit = 100): {
   marks: Record<string, { p50: number; p95: number; n: number }>;
   spans: Record<string, { p50: number; p95: number; n: number }>;
   tendrils: Record<string, { p50: number; p95: number; n: number }>;
+  hums: Record<string, { p50: number; p95: number; n: number }>;
 } {
   const sample = blooms.slice(-limit);
   const byMark: Record<string, number[]> = {};
   const bySpan: Record<string, number[]> = {};
   const byTendril: Record<string, number[]> = {};
+  const byHum: Record<string, number[]> = {};
   for (const t of sample) {
     for (const [name, ms] of Object.entries(t.marks)) {
       (byMark[name] ??= []).push(ms);
@@ -222,6 +248,9 @@ export function aggregate(limit = 100): {
     }
     for (const td of t.tendrils) {
       (byTendril[td.name] ??= []).push(td.ms);
+    }
+    for (const h of t.hums ?? []) {
+      (byHum[`hum_to_${h.to}`] ??= []).push(h.ms);
     }
   }
   const stats = (vs: Record<string, number[]>) => {
@@ -241,5 +270,6 @@ export function aggregate(limit = 100): {
     marks: stats(byMark),
     spans: stats(bySpan),
     tendrils: stats(byTendril),
+    hums: stats(byHum),
   };
 }

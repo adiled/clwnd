@@ -942,23 +942,30 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
     humEcho(clientId, msg);
   }
 
-  // Hum hop timing — plugin stamps `sentAt` on outgoing tones; daemon
-  // records the inbound socket-hop latency on the active turn.
+  // Per-hum transit timing — plugin stamps `sentAt` on outgoing tones,
+  // daemon records the time-to-receive as one hum sample. Direction is
+  // anchored on the destination endpoint (`to: "nest"` = arriving at the
+  // daemon's nest). Aggregates as p50/p95 across all sampled hums per
+  // bloom; not cumulative.
   if (typeof msg.sentAt === "number" && typeof msg.sid === "string") {
-    drift.span(msg.sid as string, "hum_hop_outbound", Math.max(0, Date.now() - (msg.sentAt as number)));
+    drift.hum(msg.sid as string, "nest", Date.now() - (msg.sentAt as number));
   }
 
   switch (chi) {
     case "perf-mark": {
-      // Plugin-emitted perf marks. Daemon merges into the active turn's
-      // marks (first observation wins) and optionally records a span.
+      // Plugin-emitted perf marks. Daemon merges into the active bloom's
+      // record. Each field is optional; multiple may be set per message.
       const sid = msg.sid as string;
       const mark = msg.mark as string | undefined;
       const span = msg.span as { name: string; ms: number } | undefined;
       const flag = msg.flag as { key: string; value: boolean | number | string } | undefined;
+      const humSample = msg.hum as { to: "nest" | "oc"; ms: number } | undefined;
       if (mark) drift.mark(sid, mark);
       if (span) drift.span(sid, span.name, span.ms);
       if (flag) drift.flag(sid, flag.key, flag.value);
+      if (humSample && (humSample.to === "nest" || humSample.to === "oc")) {
+        drift.hum(sid, humSample.to, humSample.ms);
+      }
       break;
     }
     case "prompt": {
