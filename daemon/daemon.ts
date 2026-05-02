@@ -11,6 +11,7 @@ import { sigil, rid as makeRid, echo, pulse, isDusk, classifySuspicion, WaneTrac
 import { droneThink, setDroneWorkspace, releaseDroneSession } from "../lib/drone-llm.ts";
 import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, lastUuid, sanitizeJsonl, pruneJsonl, type GraftResult } from "../lib/session.ts";
 import { penny, pennyAdd, pennyLoad, pennySave, pennyReset, type PennyDelta } from "../lib/penny.ts";
+import * as drift from "../lib/drift.ts";
 
 
 // ─── Shapes ─────────────────────────────────────────────────────────────────
@@ -930,6 +931,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       if (msg.pennyDelta) pennyAdd(msg.pennyDelta as PennyDelta);
 
       const sid = msg.sid as string;
+      drift.start(sid, msg.modelId as string | undefined);
       const client = humClients.get(clientId);
       (async () => {
       if (client) client.sigils.add(sigil(sid));
@@ -1111,7 +1113,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           let batch: string[] = [];
           let pending = false;
           // Cupped petals: daemon cups early petals to check for context loss before blooming
-          const CUP_THRESHOLD = 200;
+          const CUP_THRESHOLD = 80;
           const MAX_WITHERS = 1;
           let withers = 0;
           let cupped: string[] = [];
@@ -1119,6 +1121,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           let uncupped = !DRONED; // drone off = bloom directly
 
           function sendChunks(chunks: string[]) {
+            drift.mark(sid, "first_bloom");
             const line = chunks.join("\n") + "\n";
             const s = sigil(sid);
             let sent = false;
@@ -1139,6 +1142,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           function doUncup() {
             if (uncupped) return;
             uncupped = true;
+            drift.mark(sid, "first_uncup");
             trace("nest.uncup", { sid, cuppedChunks: cupped.length, cuppedLen: cuppedText.length });
             if (cupped.length > 0) {
               sendChunks(cupped);
@@ -1190,6 +1194,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
 
           return (type: string, payload: Record<string, unknown>) => {
             if (withered) return; // withered — drop remaining chunks from old stream
+            drift.mark(sid, "first_petal");
             const chunk = JSON.stringify({ chi: "chunk", sid, chunkType: type, ...payload });
 
             if (uncupped) {
@@ -1221,13 +1226,15 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
             // Cup phase — buffer and check
             cupped.push(chunk);
 
-            // tool_use in the stream = structurally valid output. Trigger
-            // the suspicion check early so tool calls aren't hidden behind
-            // the text threshold. If text is clean, uncup immediately —
-            // user sees tool feedback. If suspicious, wither as normal.
+            // tool_use or reasoning in the stream = structurally valid output.
+            // Trigger the suspicion check early so tool calls and thinking
+            // aren't hidden behind the text threshold. Reasoning emits zero
+            // text_delta, so without this, extended-thinking turns stay
+            // cupped until onWilt — users see a burst at turn end.
             const isToolStart = type === "tool_input_start";
+            const isReasoningStart = type === "reasoning_start";
 
-            if (cuppedText.length >= CUP_THRESHOLD || isToolStart) {
+            if (cuppedText.length >= CUP_THRESHOLD || isToolStart || isReasoningStart) {
               const level = classifySuspicion(cuppedText);
               if ((level === "critical" || level === "suspicious") && withers < MAX_WITHERS) {
                 withers++;
@@ -1278,6 +1285,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
             usage: harvest.usage,
             providerMetadata: harvest.providerMetadata,
           });
+          drift.end(sid);
           nest.hush(sid, poolKey);
         },
         onThorn(wound) {
@@ -1297,6 +1305,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           ? promptContent.length > 0
           : Array.isArray(promptContent) && promptContent.some((p: Record<string, unknown>) => p.type !== "text" || (p.text as string)?.length > 0);
         if (hasContent) {
+          drift.mark(sid, "murmur");
           nest.murmur(sid, poolKey, promptContent);
         } else {
           trace("nest.murmur.empty", { sid, poolKey });
@@ -1594,6 +1603,14 @@ const httpServer = createHttpServer(async (req, res) => {
     return jsonResponse(res, { ok: true, resetAt: penny.started });
   }
 
+  if (req.method === "GET" && url.pathname === "/drift") {
+    const sid = url.searchParams.get("sid") ?? undefined;
+    const limit = Math.max(1, Math.min(200, parseInt(url.searchParams.get("limit") ?? "20", 10) || 20));
+    const recent = drift.recent(sid, limit);
+    const aggregate = drift.aggregate(100);
+    return jsonResponse(res, { recent, aggregate });
+  }
+
   if (req.method === "GET" && url.pathname === "/sessions") {
     const out: Record<string, unknown> = {};
     for (const [sid, s] of sessions) out[sid] = s;
@@ -1723,7 +1740,14 @@ const mcpServer = createHttpServer(async (req, res) => {
     try {
       const body = JSON.parse(await readBody(req)) as { jsonrpc: string; id?: number | string; method: string; params?: unknown };
       trace("mcp.request.received", { method: body.method, sid: mcpSessionId });
+      const tendrilStart = body.method === "tools/call" ? Date.now() : 0;
+      const tendrilName = body.method === "tools/call"
+        ? ((body.params as { name?: string } | undefined)?.name ?? "unknown")
+        : undefined;
       const result = await handleMcpRequest(body, mcpSessionId);
+      if (tendrilStart && mcpSessionId && tendrilName && tendrilName !== "permission_prompt") {
+        drift.tendril(mcpSessionId, tendrilName, Date.now() - tendrilStart);
+      }
       if (!result) { res.writeHead(204); res.end(); return; }
       return jsonResponse(res, result);
     } catch (e: unknown) {

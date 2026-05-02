@@ -242,6 +242,65 @@ except Exception as e:
     print(f'error: {e}')
 "
     ;;
+  drift)
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+    SOCK="${CLWND_SOCKET:-$XDG_RUNTIME_DIR/clwnd/clwnd.sock}.http"
+    if [ ! -S "$SOCK" ]; then
+      echo "daemon not running (socket $SOCK not found)"
+      exit 1
+    fi
+    SID="${1:-}"
+    QUERY=""
+    [ -n "$SID" ] && QUERY="?sid=$SID&limit=20"
+    curl -s --unix-socket "$SOCK" "http://localhost/drift$QUERY" | python3 -c "
+import sys, json
+def fmt_ms(v):
+    if v is None: return '-'
+    if v < 1000: return f'{int(v)}ms'
+    return f'{v/1000:.2f}s'
+def gap(marks, a, b):
+    av, bv = marks.get(a), marks.get(b)
+    if av is None or bv is None: return None
+    return bv - av
+try:
+    d = json.load(sys.stdin)
+    recent = d.get('recent', [])
+    agg = d.get('aggregate', {})
+    if not recent:
+        print('no turns recorded yet')
+    else:
+        print(f'{\"sid\":<32}  {\"turn\":<6} {\"total\":>8} {\"pre_murmur\":>10} {\"ttfb\":>8} {\"cup\":>8} {\"bloom\":>8}  tendrils')
+        for t in recent[:20]:
+            sid = t.get('sid','?')[:30]
+            tid = t.get('turnId','?')
+            marks = t.get('marks', {})
+            total = marks.get('turn')
+            pre = marks.get('murmur')
+            ttfb = gap(marks, 'murmur', 'first_petal')
+            cup = gap(marks, 'first_petal', 'first_uncup')
+            bloom = gap(marks, 'first_uncup', 'first_bloom')
+            tendrils = t.get('tendrils', [])
+            tend_str = ' '.join(f'{x[\"name\"]}:{fmt_ms(x[\"ms\"])}' for x in tendrils[:5])
+            if len(tendrils) > 5: tend_str += f' (+{len(tendrils)-5})'
+            print(f'{sid:<32}  {tid:<6} {fmt_ms(total):>8} {fmt_ms(pre):>10} {fmt_ms(ttfb):>8} {fmt_ms(cup):>8} {fmt_ms(bloom):>8}  {tend_str}')
+        marks = agg.get('marks', {})
+        print()
+        print(f'aggregate (last {agg.get(\"turns\",0)} turns)')
+        print(f'  {\"phase\":<14} {\"p50\":>8} {\"p95\":>8} {\"n\":>5}')
+        for name in ['murmur','first_petal','first_uncup','first_bloom','turn']:
+            s = marks.get(name)
+            if not s: continue
+            print(f'  {name:<14} {fmt_ms(s[\"p50\"]):>8} {fmt_ms(s[\"p95\"]):>8} {s[\"n\"]:>5}')
+        tendrils = agg.get('tendrils', {})
+        if tendrils:
+            print()
+            print('  tendril latency (p50/p95):')
+            for name, s in sorted(tendrils.items(), key=lambda kv: -kv[1]['p95'])[:10]:
+                print(f'    {name:<32} {fmt_ms(s[\"p50\"]):>8} {fmt_ms(s[\"p95\"]):>8} {s[\"n\"]:>5}')
+except Exception as e:
+    print(f'error: {e}')
+"
+    ;;
   help|--help|-h|"")
     echo "clwnd - take back what is yours"
     echo ""
@@ -256,6 +315,7 @@ except Exception as e:
     echo "  logs       Tail daemon logs"
     echo "  sessions   List tracked sessions"
     echo "  savings    Show penny-pincher counters (read dedup, bash cap, context warning, plugin-side dedup)"
+    echo "  drift      Per-turn latency report — phase breakdowns and tendril roundtrips"
     echo "  version    Show installed version"
     echo "  uninstall  Remove clwnd"
     ;;
