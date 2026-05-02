@@ -1,14 +1,15 @@
-// drift — the felt passing of time. Records each turn's milestones, tools
-// the daemon dispatched, and exposes a ring of recent turns for the
+// drift — the felt passing of time. Records each bloom's milestones, tools
+// the daemon dispatched, and exposes a ring of recent blooms for the
 // `clwnd drift` CLI and HTTP endpoints to query.
 //
-// Naming follows the rest of the codebase: a turn drifts through phases,
-// each milestone is a mark, each tool roundtrip is a tendril. Aggregation
-// is purely lazy on read — the hot path only stamps a few timestamps.
+// Naming follows the rest of the codebase: a bloom is one assistant turn
+// (prompt → wilt). Each milestone within is a mark, each tool roundtrip
+// is a tendril. Aggregation is purely lazy on read — the hot path only
+// stamps a few timestamps.
 //
-// Persistence: when configured, each turn appends one JSON line to
+// Persistence: when configured, each bloom appends one JSON line to
 //   ${stateDir}/drift/YYYY-MM-DD.ndjson
-// at turn end. The in-memory ring stays primary for "recent N turns";
+// at wilt time. The in-memory ring stays primary for "recent N blooms";
 // historical reads cross over to disk via readSince().
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "fs";
@@ -20,9 +21,9 @@ export interface TendrilDrift {
   at: number; // ms since turn start
 }
 
-export interface TurnDrift {
+export interface BloomDrift {
   sid: string;
-  turnId: string;
+  bloomId: string;
   modelId?: string;
   version?: string;                  // clwnd build that recorded this turn
   startedAt: number;
@@ -34,8 +35,8 @@ export interface TurnDrift {
 }
 
 const RING_SIZE = 200;
-const turns: TurnDrift[] = [];
-const active = new Map<string, TurnDrift>();
+const blooms: BloomDrift[] = [];
+const active = new Map<string, BloomDrift>();
 let seq = 0;
 
 // Persistence config — set by daemon at startup via configure().
@@ -66,7 +67,7 @@ function fileFor(t: number): string | null {
   return join(storeDir, `${dayBucket(t)}.ndjson`);
 }
 
-function appendTurn(t: TurnDrift): void {
+function appendBloom(t: BloomDrift): void {
   const path = fileFor(t.endedAt ?? t.startedAt);
   if (!path) return;
   try {
@@ -94,11 +95,11 @@ function pruneOldFiles(): void {
 // Periodic prune — daemon invokes once per ~24h.
 export function prune(): void { pruneOldFiles(); }
 
-export function start(sid: string, modelId?: string): void {
-  if (active.has(sid)) return; // re-entrant guard — same turn, no reset
-  const t: TurnDrift = {
+export function open(sid: string, modelId?: string): void {
+  if (active.has(sid)) return; // re-entrant guard — same bloom, no reset
+  const t: BloomDrift = {
     sid,
-    turnId: `t${++seq}`,
+    bloomId: `b${++seq}`,
     modelId,
     version: buildVersion,
     startedAt: Date.now(),
@@ -108,8 +109,8 @@ export function start(sid: string, modelId?: string): void {
     tendrils: [],
   };
   active.set(sid, t);
-  turns.push(t);
-  if (turns.length > RING_SIZE) turns.shift();
+  blooms.push(t);
+  if (blooms.length > RING_SIZE) blooms.shift();
 }
 
 export function mark(sid: string, phase: string): void {
@@ -151,23 +152,23 @@ export function witherReset(sid: string): void {
   t.flags["withered"] = ((t.flags["withered"] as number) ?? 0) + 1;
 }
 
-export function end(sid: string): void {
+export function wilt(sid: string): void {
   const t = active.get(sid);
   if (!t) return;
   t.endedAt = Date.now();
-  t.marks["turn"] = t.endedAt - t.startedAt;
+  t.marks["wilt"] = t.endedAt - t.startedAt;
   active.delete(sid);
-  appendTurn(t);
+  appendBloom(t);
 }
 
 /**
- * Read turns from disk for the given window. Used when the in-memory ring
+ * Read blooms from disk for the given window. Used when the in-memory ring
  * is colder than the requested range (typical for `clwnd drift --days N`).
- * Returns turns sorted oldest → newest. Caller may .reverse() if desired.
+ * Returns blooms sorted oldest → newest. Caller may .reverse() if desired.
  */
-export function readSince(sinceMs: number, sid?: string): TurnDrift[] {
+export function readSince(sinceMs: number, sid?: string): BloomDrift[] {
   if (!storeDir || retentionDays <= 0) return [];
-  const out: TurnDrift[] = [];
+  const out: BloomDrift[] = [];
   let names: string[] = [];
   try { names = readdirSync(storeDir).filter((n) => n.endsWith(".ndjson")).sort(); } catch { return []; }
   for (const name of names) {
@@ -176,8 +177,8 @@ export function readSince(sinceMs: number, sid?: string): TurnDrift[] {
     try { raw = readFileSync(path, "utf8"); } catch { continue; }
     for (const line of raw.split("\n")) {
       if (!line) continue;
-      let t: TurnDrift;
-      try { t = JSON.parse(line) as TurnDrift; } catch { continue; }
+      let t: BloomDrift;
+      try { t = JSON.parse(line) as BloomDrift; } catch { continue; }
       if (t.startedAt < sinceMs) continue;
       if (sid && t.sid !== sid) continue;
       out.push(t);
@@ -197,18 +198,18 @@ export function listDays(): string[] {
   } catch { return []; }
 }
 
-export function recent(sid?: string, limit = 20): TurnDrift[] {
-  const list = sid ? turns.filter((t) => t.sid === sid) : turns;
+export function recent(sid?: string, limit = 20): BloomDrift[] {
+  const list = sid ? blooms.filter((t) => t.sid === sid) : blooms;
   return list.slice(-limit).reverse();
 }
 
 export function aggregate(limit = 100): {
-  turns: number;
+  blooms: number;
   marks: Record<string, { p50: number; p95: number; n: number }>;
   spans: Record<string, { p50: number; p95: number; n: number }>;
   tendrils: Record<string, { p50: number; p95: number; n: number }>;
 } {
-  const sample = turns.slice(-limit);
+  const sample = blooms.slice(-limit);
   const byMark: Record<string, number[]> = {};
   const bySpan: Record<string, number[]> = {};
   const byTendril: Record<string, number[]> = {};
@@ -236,7 +237,7 @@ export function aggregate(limit = 100): {
     return out;
   };
   return {
-    turns: sample.length,
+    blooms: sample.length,
     marks: stats(byMark),
     spans: stats(bySpan),
     tendrils: stats(byTendril),

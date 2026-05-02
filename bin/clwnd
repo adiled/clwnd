@@ -246,11 +246,13 @@ except Exception as e:
     SUB="${1:-}"
     if [ "$SUB" = "help" ] || [ "$SUB" = "--help" ] || [ "$SUB" = "-h" ]; then
       cat <<'DRIFTHELP'
-clwnd drift — per-turn latency report
+clwnd drift — per-bloom latency report (one bloom = one assistant turn)
 
 Usage:
-  clwnd drift              Recent turns + aggregate p50/p95
+  clwnd drift              Recent blooms + aggregate p50/p95
   clwnd drift <sid>        Filter to one session
+  clwnd drift --days N     Read back N days of persisted blooms
+  clwnd drift --limit N    Cap rows (default 20)
   clwnd drift help         This help
 
 Phase order (canonical):
@@ -276,7 +278,7 @@ Phase order (canonical):
   plugin_first_visible     == first_enqueue (Stage 3 refinement pending)
   oc_bus_publish           OC processor published first part-delta on the bus
   oc_sse_write             SSE writer flushed (≈ bus_publish, sub-ms)
-  turn                     entire turn wall-clock
+  wilt                     entire bloom wall-clock (open → wilt)
 
 Spans (cumulative durations, not phase marks):
   reasoning, graft, nest_spawn, plugin_prep, hum_hop_outbound,
@@ -333,16 +335,16 @@ try:
     recent = d.get('recent', [])
     agg = d.get('aggregate', {})
     if not recent:
-        print('no turns recorded yet')
+        print('no blooms recorded yet')
     else:
-        print(f'{\"sid\":<32}  {\"turn\":<6} {\"total\":>8} {\"graft\":>8} {\"spawn\":>8} {\"ttfb\":>8} {\"cup\":>8} {\"bloom\":>8} flags  tendrils')
+        print(f'{\"sid\":<32}  {\"bloom\":<6} {\"total\":>8} {\"graft\":>8} {\"spawn\":>8} {\"ttfb\":>8} {\"cup\":>8} {\"wire\":>8} flags  tendrils')
         for t in recent[:20]:
             sid = t.get('sid','?')[:30]
-            tid = t.get('turnId','?')
+            tid = t.get('bloomId', t.get('turnId','?'))
             marks = t.get('marks', {})
             spans = t.get('spans', {})
             flags = t.get('flags', {})
-            total = marks.get('turn')
+            total = marks.get('wilt', marks.get('bloom', marks.get('turn')))
             graft = spans.get('graft')
             spawn = spans.get('nest_spawn')
             ttfb = gap(marks, 'murmur', 'first_petal')
@@ -358,9 +360,9 @@ try:
             print(f'{sid:<32}  {tid:<6} {fmt_ms(total):>8} {fmt_ms(graft):>8} {fmt_ms(spawn):>8} {fmt_ms(ttfb):>8} {fmt_ms(cup):>8} {fmt_ms(bloom):>8} {flag_str:<5}  {tend_str}')
         marks = agg.get('marks', {})
         print()
-        print(f'aggregate (last {agg.get(\"turns\",0)} turns)')
+        print(f'aggregate (last {agg.get(\"blooms\",agg.get(\"turns\",0))} blooms)')
         print(f'  {\"mark\":<24} {\"p50\":>8} {\"p95\":>8} {\"n\":>5}')
-        mark_order = ['graft_synced','nest_spawned','murmur','first_petal','first_reasoning_start','first_text_start','first_tool_input_start','first_uncup','first_bloom','turn']
+        mark_order = ['graft_synced','nest_spawned','murmur','first_petal','first_reasoning_start','first_text_start','first_tool_input_start','first_uncup','first_bloom','wilt']
         for name in mark_order:
             s = marks.get(name)
             if not s: continue
@@ -395,7 +397,7 @@ except Exception as e:
     echo "  logs       Tail daemon logs"
     echo "  sessions   List tracked sessions"
     echo "  savings    Show penny-pincher counters (read dedup, bash cap, context warning, plugin-side dedup)"
-    echo "  drift      Per-turn latency report — phase breakdowns and tendril roundtrips"
+    echo "  drift      Per-bloom latency report — phase breakdowns and tendril roundtrips"
     echo "  version    Show installed version"
     echo "  uninstall  Remove clwnd"
     ;;

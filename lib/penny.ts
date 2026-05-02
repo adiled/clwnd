@@ -45,7 +45,7 @@ export interface Penny {
   totalOutputTokens: number;
   totalCacheReadTokens: number;
   totalCacheWriteTokens: number;
-  turns: number;               // total inference turns
+  blooms: number;              // total assistant turns (one prompt → one wilt)
 }
 
 export type PennyDelta = Partial<Omit<Penny, "started">>;
@@ -74,7 +74,7 @@ export const penny: Penny = {
   totalOutputTokens: 0,
   totalCacheReadTokens: 0,
   totalCacheWriteTokens: 0,
-  turns: 0,
+  blooms: 0,
 };
 
 export function pennyReset(): void {
@@ -95,9 +95,11 @@ export function pennyAdd(delta: PennyDelta): void {
 
 export function pennyLoad(path: string): void {
   try {
-    const data = JSON.parse(readFileSync(path, "utf-8")) as Partial<Penny>;
+    const data = JSON.parse(readFileSync(path, "utf-8")) as Partial<Penny> & { turns?: number };
     for (const [k, v] of Object.entries(data)) {
       if (k === "started" || typeof v !== "number") continue;
+      // Migrate legacy field name `turns` → `blooms`. Read once, drop forever.
+      if (k === "turns") { penny.blooms = (penny.blooms ?? 0) + (v as number); continue; }
       (penny as any)[k] = v;
     }
   } catch {}

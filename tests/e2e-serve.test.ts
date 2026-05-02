@@ -484,20 +484,20 @@ describe("e2e-serve: session basics", () => {
     const driftResp = await unixFetch(DAEMON_SOCK, `/drift?sid=${sid}&limit=5`);
     const recent = (driftResp.recent ?? []) as Array<any>;
     expect(recent.length).toBeGreaterThan(0);
-    const turn = recent[0];
+    const bloom = recent[0];
 
-    // Marks every successful turn must record (independent of model + drone).
-    const marks = turn.marks ?? {};
-    for (const required of ["first_petal", "first_bloom", "turn"]) {
-      expect(marks[required], `mark ${required} missing on turn ${turn.turnId}`).toBeDefined();
+    // Marks every successful bloom must record (independent of model + drone).
+    const marks = bloom.marks ?? {};
+    for (const required of ["first_petal", "first_bloom", "wilt"]) {
+      expect(marks[required], `mark ${required} missing on bloom ${bloom.bloomId}`).toBeDefined();
     }
 
     // Spans should include at least one of: graft, nest_spawn (cold), or
     // warm flag should be true. This is the "spawn cost" coverage proof.
-    const spans = turn.spans ?? {};
-    const flags = turn.flags ?? {};
+    const spans = bloom.spans ?? {};
+    const flags = bloom.flags ?? {};
     const spawnAccounted = spans.graft !== undefined || spans.nest_spawn !== undefined || flags.warm === true;
-    expect(spawnAccounted, `turn neither warm nor recorded a spawn/graft span: ${JSON.stringify({spans, flags})}`).toBe(true);
+    expect(spawnAccounted, `bloom neither warm nor recorded a spawn/graft span: ${JSON.stringify({spans, flags})}`).toBe(true);
   }, TIMEOUT);
 
   test("mid-turn user message queues and is processed after current turn", async () => {

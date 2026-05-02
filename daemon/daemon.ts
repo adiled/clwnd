@@ -967,7 +967,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       if (msg.pennyDelta) pennyAdd(msg.pennyDelta as PennyDelta);
 
       const sid = msg.sid as string;
-      drift.start(sid, msg.modelId as string | undefined);
+      drift.open(sid, msg.modelId as string | undefined);
       const client = humClients.get(clientId);
       (async () => {
       if (client) client.sigils.add(sigil(sid));
@@ -1288,7 +1288,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           // Track peak per-turn input context for observability — surfaced
           // by `clwnd savings` and used by the next-prompt warning trace.
           // No destructive action attached: clwnd does not rotate sessions.
-          penny.turns++;
+          penny.blooms++;
           if (harvest.usage) {
             const u = harvest.usage;
             const turnCtx = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
@@ -1312,7 +1312,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
             usage: harvest.usage,
             providerMetadata: harvest.providerMetadata,
           });
-          drift.end(sid);
+          drift.wilt(sid);
           nest.hush(sid, poolKey);
         },
         onThorn(wound) {
@@ -1618,7 +1618,7 @@ const httpServer = createHttpServer(async (req, res) => {
     const avgCtx = sessionCtx.length > 0 ? sessionCtx[0].maxContextTokens : 150_000;
     const compactionSaved = penny.curateEvents * (avgCtx * INPUT_PRICE + COMPACTION_OUTPUT_TOKENS * OUTPUT_PRICE);
     // JSONL bytes pruned → tokens not cache-read on subsequent turns
-    const pruneSaved = (penny.curateBytesSaved / 4) * 0.3 / 1_000_000 * penny.turns; // cache-read price × turns after prune
+    const pruneSaved = (penny.curateBytesSaved / 4) * 0.3 / 1_000_000 * penny.blooms; // cache-read price × turns after prune
     const estimatedSaved = compactionSaved + pruneSaved;
     return jsonResponse(res, {
       uptimeMs: Date.now() - penny.started,
