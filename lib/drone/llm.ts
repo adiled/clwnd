@@ -2,9 +2,9 @@
 // The drone's brain. Uses the OC SDK to create throwaway sessions for triage.
 // Workspace-isolated: drone sessions don't pollute the user's session list.
 
-import { TRIAGE_PROMPT, buildTriagePrompt, buildTreatPrompt, type DroneContext, type TriageCategory } from "./drone-prompts.ts";
-import type { Assessment } from "./hum.ts";
-import { loadConfig } from "./config.ts";
+import { TRIAGE_PROMPT, buildTriagePrompt, buildTreatPrompt, type DroneContext, type TriageCategory } from "./prompts.ts";
+import type { Assessment } from "../hum.ts";
+import { loadConfig } from "../config.ts";
 
 export interface DroneJudgment {
   assessment: Assessment;

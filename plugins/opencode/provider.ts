@@ -9,7 +9,8 @@
 import { appendFileSync, mkdirSync } from "fs";
 import { connect as netConnect, type Socket as NetSocket } from "net";
 import { loadConfig, type ClwndConfig as CfgShape } from "../../lib/config.ts";
-import { sigil as makeSigil, Drone, duskIn, type DroneAction } from "../../lib/hum.ts";
+import { sigil as makeSigil, duskIn } from "../../lib/hum.ts";
+import { Drone, stubDrone, type DroneAction } from "../../lib/drone/index.ts";
 
 import type {
   LanguageModelV3,
@@ -223,7 +224,7 @@ const pluginDrone = DRONED ? new Drone("plugin", (action: DroneAction) => {
     case "dead": trace("drone.dead", { missedBeats: action.missedBeats }); break;
     case "swallow": trace("drone.swallow", { reason: action.reason }); break;
   }
-}) : { sent() {}, heard() {}, observed() {}, setWane() {}, inspect() { return new Map(); }, stop() {} } as unknown as Drone;
+}) : stubDrone();
 
 async function awakenHum(): Promise<void> {
   try {

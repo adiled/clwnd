@@ -7,8 +7,8 @@ import { fileURLToPath } from "url";
 
 import { trace, info } from "../log.ts";
 import { loadConfig } from "../lib/config.ts";
-import { sigil, rid as makeRid, echo, pulse, isDusk, classifySuspicion, WaneTracker, Drone, type Tone, type DroneBeat, type DroneState, type Breath, type BreathSession, type Reach, type DroneAction, type PulseKind, type Pulse } from "../lib/hum.ts";
-import { droneThink, setDroneWorkspace, releaseDroneSession } from "../lib/drone-llm.ts";
+import { sigil, rid as makeRid, echo, pulse, isDusk, WaneTracker, type Tone, type Breath, type BreathSession, type Reach, type PulseKind, type Pulse } from "../lib/hum.ts";
+import { Drone, classifySuspicion, droneThink, setDroneWorkspace, releaseDroneSession, stubDrone, Cup, type DroneBeat, type DroneState, type DroneAction } from "../lib/drone/index.ts";
 import { graft, createSession as createClaudeSession, sessionDir as getSessionDir, sessionPath as getSessionPath, lastUuid, sanitizeJsonl, pruneJsonl, type GraftResult } from "../lib/session.ts";
 import { penny, pennyAdd, pennyLoad, pennySave, pennyReset, type PennyDelta } from "../lib/penny.ts";
 import * as drift from "../lib/drift.ts";
@@ -795,7 +795,7 @@ const drone = DRONED ? new Drone("daemon", (action: DroneAction) => {
       trace("drone.wither.noop", { sigil: action.sigil, reason: action.reason });
       break;
   }
-}, droneEvaluator, 0.7, (s, state) => {
+}, droneEvaluator, 0.7, (s: string, state: DroneState) => {
   // LLM assessment on silence — full state evaluation
   droneThink(droneCtx(state.responseText, state), ocUrlForSigil(s), s).then(judgment => {
     trace("drone.llm.assess", { sigil: s, assessment: judgment.assessment, action: judgment.action, reason: judgment.reason });
@@ -820,7 +820,7 @@ const drone = DRONED ? new Drone("daemon", (action: DroneAction) => {
       }
     }
   }).catch(e => trace("drone.llm.assess.failed", { sigil: s, err: String(e) }));
-}) : { sent() {}, heard() {}, observed() {}, setWane() {}, inspect() { return new Map(); }, stop() {} } as unknown as Drone;
+}) : stubDrone();
 
 const HUM = SOCK + ".hum";
 
@@ -1090,8 +1090,8 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       const promptContent: Array<Record<string, unknown>> | string | null =
         !msg.listenOnly ? (msg.content as Array<Record<string, unknown>> | undefined) ?? (msg.text as string ?? "") : null;
       const isResume = !!(session.claudeSessionId && session.needsRespawn);
-      let withered = false; // shared between onPetal and onWilt — true when bad petals were discarded
-      let uncup: (() => void) | null = null; // set by onPetal closure — flushes cupped petals to plugin
+      let cup: Cup | null = null; // owns the drone's cup buffer; assigned in onPetal closure
+      let uncup: (() => void) | null = null; // closure-shim onto cup.forceFlush — called from onWilt
 
       const listener: BloomListener = {
         sessionId: sid,
@@ -1110,15 +1110,10 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           humPulse("roost-ready", sid, { pid: nest.roost(poolKey)?.proc.pid });
         },
         onPetal: (() => {
+          // Outbound socket batching: independent of the drone's cup. The cup
+          // decides WHEN to release; this microtask coalesces socket writes.
           let batch: string[] = [];
           let pending = false;
-          // Cupped petals: daemon cups early petals to check for context loss before blooming
-          const CUP_THRESHOLD = 80;
-          const MAX_WITHERS = 1;
-          let withers = 0;
-          let cupped: string[] = [];
-          let cuppedText = "";
-          let uncupped = !DRONED; // drone off = bloom directly
 
           function sendChunks(chunks: string[]) {
             drift.mark(sid, "first_bloom");
@@ -1139,119 +1134,74 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
             }
           }
 
-          function doUncup() {
-            if (uncupped) return;
-            uncupped = true;
-            drift.mark(sid, "first_uncup");
-            trace("nest.uncup", { sid, cuppedChunks: cupped.length, cuppedLen: cuppedText.length });
-            if (cupped.length > 0) {
-              sendChunks(cupped);
-              cupped = [];
-            }
-          }
-          uncup = doUncup;
-          if (session) session.forceUncup = doUncup;
-
-          function wither() {
-            if (!session) return;
-            withered = true;
-            cupped = [];
-            cuppedText = "";
-            trace("drone.wither", { sid });
-            penny.droneWithers++;
-            // Kill process, graft, respawn, re-murmur — all internal
-            nest.fell(sid, poolKey);
-            session.needsRespawn = true;
-            session.lastSyncedPetal = null;
-            saveSessions(sid);
-            // Re-send the prompt after a tick (let fell complete)
-            queueMicrotask(() => {
-              // Graft runs inside the prompt handler on the re-sent prompt
-              const effectiveCwd = cwd ?? session.cwd;
-              const ocUrl = session.ocServerUrl ?? DEFAULT_OC_URL;
-              // Re-create listener state for the retry
-              uncupped = !DRONED;
-              withered = false;
-              cuppedText = "";
-              cupped = [];
-              batch = [];
-              pending = false;
-              // Respawn with existing JSONL — history is already grafted from prior prompt
-              if (promptContent) {
-                (async () => {
-                  try {
-                    session.needsRespawn = true;
-                    nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd, session.planMode);
-                    nest.murmur(sid, poolKey, promptContent);
-                  } catch (e) {
-                    trace("drone.swallow.retry.failed", { sid, err: String(e) });
-                    hum(sid, { chi: "error", sid, message: `swallow retry failed: ${e}` });
+          cup = new Cup(
+            { enabled: DRONED },
+            {
+              onBloom: (chunks) => {
+                drift.mark(sid, "first_uncup");
+                sendChunks(chunks);
+              },
+              onApiError: (text) => {
+                trace("nest.api.error", { sid, text: text.slice(0, 120) });
+                hum(sid, { chi: "error", sid, message: text });
+                nest.interrupt(poolKey);
+              },
+              onWither: () => {
+                if (!session) return;
+                trace("drone.wither", { sid });
+                penny.droneWithers++;
+                nest.fell(sid, poolKey);
+                session.needsRespawn = true;
+                session.lastSyncedPetal = null;
+                saveSessions(sid);
+                // Re-send the prompt after a tick (let fell complete)
+                queueMicrotask(() => {
+                  cup?.reset();
+                  batch = [];
+                  pending = false;
+                  if (promptContent) {
+                    (async () => {
+                      try {
+                        session.needsRespawn = true;
+                        nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd, session.planMode);
+                        nest.murmur(sid, poolKey, promptContent);
+                      } catch (e) {
+                        trace("drone.swallow.retry.failed", { sid, err: String(e) });
+                        hum(sid, { chi: "error", sid, message: `swallow retry failed: ${e}` });
+                      }
+                    })();
                   }
-                })();
-              }
-            });
-          }
+                });
+              },
+              onTrace: (ev, data) => trace(ev, { sid, ...data }),
+            },
+          );
+
+          uncup = () => cup?.forceFlush();
+          if (session) session.forceUncup = uncup;
 
           return (type: string, payload: Record<string, unknown>) => {
-            if (withered) return; // withered — drop remaining chunks from old stream
+            if (!cup || cup.withered) return;
             drift.mark(sid, "first_petal");
             const chunk = JSON.stringify({ chi: "chunk", sid, chunkType: type, ...payload });
 
-            if (uncupped) {
-              // Already uncupped — bloom directly via microtask batching
-              batch.push(chunk);
-              if (!pending) {
-                pending = true;
-                queueMicrotask(() => {
-                  sendChunks(batch);
-                  batch = [];
-                  pending = false;
-                });
-              }
-              return;
-            }
+            const verdict = cup.feed(type, payload, chunk);
+            if (verdict === "withered" || verdict === "buffered") return;
 
-            // Detect API errors in Claude CLI's stream — interrupt before retry loop
-            if (type === "text_delta" && payload.delta) {
-              cuppedText += payload.delta as string;
-              if (cuppedText.startsWith("API Error:")) {
-                trace("nest.api.error", { sid, text: cuppedText.slice(0, 120) });
-                hum(sid, { chi: "error", sid, message: cuppedText.slice(0, 200) });
-                nest.interrupt(poolKey);
-                withered = true;
-                return;
-              }
-            }
-
-            // Cup phase — buffer and check
-            cupped.push(chunk);
-
-            // tool_use or reasoning in the stream = structurally valid output.
-            // Trigger the suspicion check early so tool calls and thinking
-            // aren't hidden behind the text threshold. Reasoning emits zero
-            // text_delta, so without this, extended-thinking turns stay
-            // cupped until onWilt — users see a burst at turn end.
-            const isToolStart = type === "tool_input_start";
-            const isReasoningStart = type === "reasoning_start";
-
-            if (cuppedText.length >= CUP_THRESHOLD || isToolStart || isReasoningStart) {
-              const level = classifySuspicion(cuppedText);
-              if ((level === "critical" || level === "suspicious") && withers < MAX_WITHERS) {
-                withers++;
-                trace(`drone.cup.${level}`, { sid, len: cuppedText.length, wither: withers });
-                wither();
-              } else {
-                // Clean, or exhausted withers — uncup and bloom directly
-                if (level !== "none" && withers >= MAX_WITHERS) {
-                  trace("drone.cup.exhausted", { sid, level, withers });
-                }
-                doUncup();
-              }
+            // passthrough (uncupped) — microtask-batch + send
+            batch.push(chunk);
+            if (!pending) {
+              pending = true;
+              queueMicrotask(() => {
+                sendChunks(batch);
+                batch = [];
+                pending = false;
+              });
             }
           };
         })(),
         onWilt(harvest) {
-          if (withered) return; // withered petal — don't send finish for bad petals
+          if (cup?.withered) return; // withered petal — don't send finish for bad petals
           session.thorns = 0; // reset circuit breaker on success
           // Advance anchor to last JSONL entry — Claude finished writing
           if (session.claudeSessionPath) {
