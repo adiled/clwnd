@@ -50,7 +50,6 @@ case "$CMD" in
   doctor)
     OS="$(uname -s)"
     XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
-    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
     echo "clwnd doctor"
     echo "  os:         $OS"
     echo "  version:    $(cat "$CLWND_SRC/package.json" | grep '"version"' | head -1 | sed 's/.*"\([0-9.]*\)".*/\1/')"
@@ -116,7 +115,13 @@ case "$CMD" in
     fi
     echo
     echo "── socket ──"
-    SOCK="$XDG_RUNTIME_DIR/clwnd/clwnd.sock"
+    if [ -n "$CLWND_SOCKET" ]; then
+      SOCK="$CLWND_SOCKET"
+    elif [ -n "$XDG_RUNTIME_DIR" ]; then
+      SOCK="$XDG_RUNTIME_DIR/clwnd/clwnd.sock"
+    else
+      SOCK="/tmp/clwnd-$(id -u)/clwnd.sock"
+    fi
     for ext in "" ".hum" ".http"; do
       if [ -S "${SOCK}${ext}" ]; then
         echo "  ${SOCK}${ext}: ok"
@@ -195,8 +200,13 @@ except: print('error reading sessions')
 " 2>/dev/null || cat "$FILE"
     ;;
   savings)
-    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
-    SOCK="${CLWND_SOCKET:-$XDG_RUNTIME_DIR/clwnd/clwnd.sock}.http"
+    if [ -n "$CLWND_SOCKET" ]; then
+      SOCK="$CLWND_SOCKET.http"
+    elif [ -n "$XDG_RUNTIME_DIR" ]; then
+      SOCK="$XDG_RUNTIME_DIR/clwnd/clwnd.sock.http"
+    else
+      SOCK="/tmp/clwnd-$(id -u)/clwnd.sock.http"
+    fi
     if [ ! -S "$SOCK" ]; then
       echo "daemon not running (socket $SOCK not found)"
       exit 1
@@ -298,8 +308,13 @@ unmeasurable from here. The chain ends at oc_sse_write.
 DRIFTHELP
       exit 0
     fi
-    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
-    SOCK="${CLWND_SOCKET:-$XDG_RUNTIME_DIR/clwnd/clwnd.sock}.http"
+    if [ -n "$CLWND_SOCKET" ]; then
+      SOCK="$CLWND_SOCKET.http"
+    elif [ -n "$XDG_RUNTIME_DIR" ]; then
+      SOCK="$XDG_RUNTIME_DIR/clwnd/clwnd.sock.http"
+    else
+      SOCK="/tmp/clwnd-$(id -u)/clwnd.sock.http"
+    fi
     if [ ! -S "$SOCK" ]; then
       echo "daemon not running (socket $SOCK not found)"
       exit 1
@@ -320,9 +335,19 @@ DRIFTHELP
     QUERY="?limit=$LIMIT"
     [ -n "$SID" ] && QUERY="${QUERY}&sid=$SID"
     [ -n "$DAYS" ] && QUERY="${QUERY}&days=$DAYS"
-    RESP="$(curl -s -w $'\n__STATUS__%{http_code}' --unix-socket "$SOCK" "http://localhost/drift$QUERY")"
+    RESP="$(curl -s -w $'\n__STATUS__%{http_code}' --unix-socket "$SOCK" "http://localhost/drift$QUERY" 2>&1)" || CURL_FAIL=$?
+    if [ -n "${CURL_FAIL:-}" ]; then
+      echo "curl failed (exit $CURL_FAIL) on $SOCK"
+      echo "  hint: socket may be stale. Try: clwnd restart"
+      exit 1
+    fi
     STATUS="$(printf '%s' "$RESP" | tail -n1 | sed 's/^__STATUS__//')"
     BODY="$(printf '%s' "$RESP" | sed '$d')"
+    if [ -z "$STATUS" ] || [ "$STATUS" = "000" ]; then
+      echo "no response from daemon at $SOCK"
+      echo "  hint: daemon may not be running. Try: clwnd restart"
+      exit 1
+    fi
     if [ "$STATUS" != "200" ]; then
       echo "daemon returned HTTP $STATUS for /drift"
       if [ "$STATUS" = "404" ]; then
