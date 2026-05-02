@@ -320,7 +320,18 @@ DRIFTHELP
     QUERY="?limit=$LIMIT"
     [ -n "$SID" ] && QUERY="${QUERY}&sid=$SID"
     [ -n "$DAYS" ] && QUERY="${QUERY}&days=$DAYS"
-    curl -s --unix-socket "$SOCK" "http://localhost/drift$QUERY" | python3 -c "
+    RESP="$(curl -s -w $'\n__STATUS__%{http_code}' --unix-socket "$SOCK" "http://localhost/drift$QUERY")"
+    STATUS="$(printf '%s' "$RESP" | tail -n1 | sed 's/^__STATUS__//')"
+    BODY="$(printf '%s' "$RESP" | sed '$d')"
+    if [ "$STATUS" != "200" ]; then
+      echo "daemon returned HTTP $STATUS for /drift"
+      if [ "$STATUS" = "404" ]; then
+        echo "this build of the daemon does not expose /drift. Try: clwnd restart"
+      fi
+      [ -n "$BODY" ] && [ ${#BODY} -lt 400 ] && echo "$BODY"
+      exit 1
+    fi
+    printf '%s' "$BODY" | python3 -c "
 import sys, json
 def fmt_ms(v):
     if v is None: return '-'

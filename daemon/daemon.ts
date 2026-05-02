@@ -1688,7 +1688,15 @@ const httpServer = createHttpServer(async (req, res) => {
     return;
   }
 
-  res.writeHead(200); res.end("clwnd");
+  // Default fallback. Root path returns identity; everything else is 404
+  // so callers (e.g. `clwnd drift`) can detect a missing route instead of
+  // silently parsing the identity response as JSON.
+  if (url.pathname === "/" || url.pathname === "") {
+    res.writeHead(200); res.end("clwnd");
+  } else {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: `unknown route: ${url.pathname}`, hint: "daemon may be outdated; try `clwnd restart`" }));
+  }
 });
 httpServer.listen(HTTP, () => { info("http.listening", { path: HTTP }); });
 
