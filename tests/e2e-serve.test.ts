@@ -466,6 +466,57 @@ describe("e2e-serve: session basics", () => {
     expect(text).toContain("73");
     expect(text).toContain("tokyo");
   }, TIMEOUT);
+
+  // REPL parity: when the user sends a second message while the assistant is
+  // mid-turn, OC's runLoop re-iterates after the current turn's `finish`
+  // because lastUser.id > lastAssistant.id. clwnd does not need to inject
+  // mid-stream; the queued user message is delivered to a fresh assistant
+  // turn at the boundary, exactly like Claude REPL's <queued_commands>.
+  test("mid-turn user message queues and is processed after current turn", async () => {
+    skipIfDead();
+    const sid = await createSession();
+
+    const p1 = sendMessage(
+      sid,
+      "Recite the first eight prime numbers, one per line, with a one-sentence note about each. Number them.",
+    );
+    // Let OC start the first turn before sending the second.
+    await new Promise(r => setTimeout(r, 1500));
+    const p2 = sendMessage(sid, "What is the capital of France? Just the city name in one word.");
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1).toBeTruthy();
+    expect(r2).toBeTruthy();
+
+    const msgs = await getMessages(sid);
+    const userMsgs = msgs.filter((m: any) => (m.info?.role ?? m.role) === "user");
+    const asstMsgs = msgs.filter((m: any) => (m.info?.role ?? m.role) === "assistant");
+
+    // Both user msgs persisted in order
+    expect(userMsgs.length).toBe(2);
+    // Two assistant turns — one per user message
+    expect(asstMsgs.length).toBeGreaterThanOrEqual(2);
+
+    // Last assistant turn must reflect the second user msg's question
+    const lastAsst = asstMsgs[asstMsgs.length - 1];
+    const lastText = (lastAsst.parts ?? [])
+      .filter((p: any) => p.type === "text")
+      .map((p: any) => p.text ?? "")
+      .join("")
+      .toLowerCase();
+    expect(lastText).toContain("paris");
+
+    // First turn's response must be present too — text mentioning at least
+    // one of the early primes (2, 3, 5, or 7) somewhere across all assistant
+    // text excluding the last turn.
+    const earlierText = asstMsgs
+      .slice(0, -1)
+      .flatMap((m: any) => m.parts ?? [])
+      .filter((p: any) => p.type === "text")
+      .map((p: any) => p.text ?? "")
+      .join(" ");
+    expect(earlierText).toMatch(/\b(2|3|5|7)\b/);
+  }, TIMEOUT);
 });
 
 describe("e2e-serve: agent switching", () => {
