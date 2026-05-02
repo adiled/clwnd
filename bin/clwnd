@@ -269,28 +269,42 @@ try:
     if not recent:
         print('no turns recorded yet')
     else:
-        print(f'{\"sid\":<32}  {\"turn\":<6} {\"total\":>8} {\"pre_murmur\":>10} {\"ttfb\":>8} {\"cup\":>8} {\"bloom\":>8}  tendrils')
+        print(f'{\"sid\":<32}  {\"turn\":<6} {\"total\":>8} {\"graft\":>8} {\"spawn\":>8} {\"ttfb\":>8} {\"cup\":>8} {\"bloom\":>8} flags  tendrils')
         for t in recent[:20]:
             sid = t.get('sid','?')[:30]
             tid = t.get('turnId','?')
             marks = t.get('marks', {})
+            spans = t.get('spans', {})
+            flags = t.get('flags', {})
             total = marks.get('turn')
-            pre = marks.get('murmur')
+            graft = spans.get('graft')
+            spawn = spans.get('nest_spawn')
             ttfb = gap(marks, 'murmur', 'first_petal')
             cup = gap(marks, 'first_petal', 'first_uncup')
             bloom = gap(marks, 'first_uncup', 'first_bloom')
+            flag_str = ''
+            if flags.get('warm'): flag_str += 'W'
+            wc = flags.get('withered', 0)
+            if wc: flag_str += f'×{wc}'
             tendrils = t.get('tendrils', [])
             tend_str = ' '.join(f'{x[\"name\"]}:{fmt_ms(x[\"ms\"])}' for x in tendrils[:5])
             if len(tendrils) > 5: tend_str += f' (+{len(tendrils)-5})'
-            print(f'{sid:<32}  {tid:<6} {fmt_ms(total):>8} {fmt_ms(pre):>10} {fmt_ms(ttfb):>8} {fmt_ms(cup):>8} {fmt_ms(bloom):>8}  {tend_str}')
+            print(f'{sid:<32}  {tid:<6} {fmt_ms(total):>8} {fmt_ms(graft):>8} {fmt_ms(spawn):>8} {fmt_ms(ttfb):>8} {fmt_ms(cup):>8} {fmt_ms(bloom):>8} {flag_str:<5}  {tend_str}')
         marks = agg.get('marks', {})
         print()
         print(f'aggregate (last {agg.get(\"turns\",0)} turns)')
-        print(f'  {\"phase\":<14} {\"p50\":>8} {\"p95\":>8} {\"n\":>5}')
-        for name in ['murmur','first_petal','first_uncup','first_bloom','turn']:
+        print(f'  {\"mark\":<24} {\"p50\":>8} {\"p95\":>8} {\"n\":>5}')
+        mark_order = ['graft_synced','nest_spawned','murmur','first_petal','first_reasoning_start','first_text_start','first_tool_input_start','first_uncup','first_bloom','turn']
+        for name in mark_order:
             s = marks.get(name)
             if not s: continue
-            print(f'  {name:<14} {fmt_ms(s[\"p50\"]):>8} {fmt_ms(s[\"p95\"]):>8} {s[\"n\"]:>5}')
+            print(f'  {name:<24} {fmt_ms(s[\"p50\"]):>8} {fmt_ms(s[\"p95\"]):>8} {s[\"n\"]:>5}')
+        spans_agg = agg.get('spans', {})
+        if spans_agg:
+            print()
+            print(f'  {\"span\":<24} {\"p50\":>8} {\"p95\":>8} {\"n\":>5}')
+            for name, s in sorted(spans_agg.items(), key=lambda kv: -kv[1]['p95']):
+                print(f'  {name:<24} {fmt_ms(s[\"p50\"]):>8} {fmt_ms(s[\"p95\"]):>8} {s[\"n\"]:>5}')
         tendrils = agg.get('tendrils', {})
         if tendrils:
             print()

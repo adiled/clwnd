@@ -18,7 +18,9 @@ export interface TurnDrift {
   modelId?: string;
   startedAt: number;
   endedAt?: number;
-  marks: Record<string, number>; // phase name → ms since startedAt
+  marks: Record<string, number>;     // phase name → ms since startedAt (first-only)
+  spans: Record<string, number>;     // named duration accumulator (cumulative)
+  flags: Record<string, boolean | number | string>; // arbitrary tags (warm, withered, …)
   tendrils: TendrilDrift[];
 }
 
@@ -35,6 +37,8 @@ export function start(sid: string, modelId?: string): void {
     modelId,
     startedAt: Date.now(),
     marks: {},
+    spans: {},
+    flags: {},
     tendrils: [],
   };
   active.set(sid, t);
@@ -55,6 +59,32 @@ export function tendril(sid: string, name: string, ms: number): void {
   t.tendrils.push({ name, ms, at: Date.now() - t.startedAt });
 }
 
+/** Cumulative span — call multiple times to add (e.g. multiple reasoning blocks). */
+export function span(sid: string, name: string, ms: number): void {
+  const t = active.get(sid);
+  if (!t) return;
+  t.spans[name] = (t.spans[name] ?? 0) + ms;
+}
+
+/** Set an arbitrary tag on the turn (warm flag, witherCount, etc.). */
+export function flag(sid: string, key: string, value: boolean | number | string): void {
+  const t = active.get(sid);
+  if (!t) return;
+  t.flags[key] = value;
+}
+
+/**
+ * Reset turn marks but keep startedAt. Used when the drone withers and
+ * the turn restarts; the original marks (first_petal at the bad output)
+ * would otherwise lock in misleading numbers. Sets `withered: <count>` flag.
+ */
+export function witherReset(sid: string): void {
+  const t = active.get(sid);
+  if (!t) return;
+  t.marks = {};
+  t.flags["withered"] = ((t.flags["withered"] as number) ?? 0) + 1;
+}
+
 export function end(sid: string): void {
   const t = active.get(sid);
   if (!t) return;
@@ -71,14 +101,19 @@ export function recent(sid?: string, limit = 20): TurnDrift[] {
 export function aggregate(limit = 100): {
   turns: number;
   marks: Record<string, { p50: number; p95: number; n: number }>;
+  spans: Record<string, { p50: number; p95: number; n: number }>;
   tendrils: Record<string, { p50: number; p95: number; n: number }>;
 } {
   const sample = turns.slice(-limit);
   const byMark: Record<string, number[]> = {};
+  const bySpan: Record<string, number[]> = {};
   const byTendril: Record<string, number[]> = {};
   for (const t of sample) {
     for (const [name, ms] of Object.entries(t.marks)) {
       (byMark[name] ??= []).push(ms);
+    }
+    for (const [name, ms] of Object.entries(t.spans)) {
+      (bySpan[name] ??= []).push(ms);
     }
     for (const td of t.tendrils) {
       (byTendril[td.name] ??= []).push(td.ms);
@@ -99,6 +134,7 @@ export function aggregate(limit = 100): {
   return {
     turns: sample.length,
     marks: stats(byMark),
+    spans: stats(bySpan),
     tendrils: stats(byTendril),
   };
 }

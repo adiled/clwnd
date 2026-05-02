@@ -382,6 +382,7 @@ class ClaudeNest {
   // Track whether we've seen streaming content blocks for this turn
   // to avoid duplicating text from the final assistant message
   private streamedTurn = false;
+  private reasoningBlockIdx: number | null = null;
 
   private dispatchLine(poolKey: string, roost: Roost, raw: unknown): void {
     if (!raw || typeof raw !== "object") return;
@@ -457,10 +458,12 @@ class ClaudeNest {
           tool: toolName,
           path,
           sessionId: roost.activeSid ?? "",
+          createdAt: Date.now(),
         });
 
         setTimeout(() => {
           if (CLWND_PERMIT_HOLD.has(askId)) {
+            recordPermitHoldSpan(askId);
             const hold = CLWND_PERMIT_HOLD.get(askId)!;
             CLWND_PERMIT_HOLD.delete(askId);
             hold.resolve("deny");
@@ -481,7 +484,10 @@ class ClaudeNest {
 
     if (msg.type === "content_block_start") {
       const block = (msg.content_block ?? {}) as Record<string, unknown>;
-      if (block.type === "thinking") petal("reasoning_start", { id: msg.index });
+      if (block.type === "thinking") {
+        this.reasoningBlockIdx = msg.index as number;
+        petal("reasoning_start", { id: msg.index });
+      }
       if (block.type === "text") petal("text_start", { id: msg.index });
       if (block.type === "tool_use") {
         petal("tool_input_start", { toolCallId: block.id as string, toolName: block.name as string });
@@ -503,6 +509,10 @@ class ClaudeNest {
     }
 
     if (msg.type === "content_block_stop") {
+      if (this.reasoningBlockIdx === msg.index) {
+        petal("reasoning_end", { id: msg.index });
+        this.reasoningBlockIdx = null;
+      }
       petal("content_block_stop", { blockIdx: msg.index });
       return;
     }
@@ -559,7 +569,15 @@ const CLWND_PERMIT_HOLD = new Map<string, {
   tool: string;
   path?: string;
   sessionId: string;
+  createdAt: number;
 }>();
+
+function recordPermitHoldSpan(askId: string): void {
+  const hold = CLWND_PERMIT_HOLD.get(askId);
+  if (hold && hold.sessionId) {
+    drift.span(hold.sessionId, "permission_hold", Date.now() - hold.createdAt);
+  }
+}
 
 // Permission rules stored per-session, forwarded from OC via the provider
 const sessionPermissions = new Map<string, Array<{ permission: string; pattern: string; action: string }>>();
@@ -1051,6 +1069,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       const priorPetals = msg.priorPetals as Array<{ role: string; content: unknown }> | undefined;
       if (!msg.listenOnly && !msg.skipGraft && priorPetals && priorPetals.length > 0) {
         trace("graft.enter", { sid, petals: priorPetals.length });
+        const graftStart = Date.now();
         try {
           const effectiveCwd = cwd ?? session.cwd;
           if (session.claudeSessionId && session.claudeSessionPath) {
@@ -1084,6 +1103,8 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
         } catch (e) {
           trace("graft.failed", { sid, err: String(e) });
         }
+        drift.span(sid, "graft", Date.now() - graftStart);
+        drift.mark(sid, "graft_synced");
       }
 
       // Capture prompt content for deferred murmur
@@ -1154,6 +1175,9 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
                 session.needsRespawn = true;
                 session.lastSyncedPetal = null;
                 saveSessions(sid);
+                // Drift: keep startedAt, clear marks so the retry's first_petal etc.
+                // record fresh values; flags.withered increments to track retries.
+                drift.witherReset(sid);
                 // Re-send the prompt after a tick (let fell complete)
                 queueMicrotask(() => {
                   cup?.reset();
@@ -1180,9 +1204,38 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
           uncup = () => cup?.forceFlush();
           if (session) session.forceUncup = uncup;
 
+          // Per-tool-call arg-stream timer + reasoning duration tracker.
+          // Drift accounts for "input thinking" (tool_input_start → tool_call)
+          // and reasoning span (reasoning_start → reasoning_end). Closure-local.
+          const toolArgStarts = new Map<string, number>();
+          let reasoningStartedAt = 0;
+
           return (type: string, payload: Record<string, unknown>) => {
             if (!cup || cup.withered) return;
             drift.mark(sid, "first_petal");
+
+            // Per-block-type first-time marks + per-call tracking
+            if (type === "reasoning_start") {
+              drift.mark(sid, "first_reasoning_start");
+              reasoningStartedAt = Date.now();
+            } else if (type === "reasoning_end" && reasoningStartedAt) {
+              drift.span(sid, "reasoning", Date.now() - reasoningStartedAt);
+              reasoningStartedAt = 0;
+            } else if (type === "text_start") {
+              drift.mark(sid, "first_text_start");
+            } else if (type === "tool_input_start" && payload.toolCallId) {
+              drift.mark(sid, "first_tool_input_start");
+              toolArgStarts.set(payload.toolCallId as string, Date.now());
+            } else if (type === "tool_call" && payload.toolCallId) {
+              const callId = payload.toolCallId as string;
+              const startedAt = toolArgStarts.get(callId);
+              if (startedAt) {
+                const toolName = (payload.toolName as string) ?? "unknown";
+                drift.span(sid, `tool_args:${toolName}`, Date.now() - startedAt);
+                toolArgStarts.delete(callId);
+              }
+            }
+
             const chunk = JSON.stringify({ chi: "chunk", sid, chunkType: type, ...payload });
 
             const verdict = cup.feed(type, payload, chunk);
@@ -1247,7 +1300,14 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       };
 
       const hadRoost = !!nest.roost(poolKey);
+      const awakenStart = Date.now();
       nest.awaken(poolKey, session.modelId, listener, session.claudeSessionId ?? undefined, permissions, systemPrompt, allowedTools, cwd, session.planMode);
+      if (hadRoost) {
+        drift.flag(sid, "warm", true);
+      } else {
+        drift.span(sid, "nest_spawn", Date.now() - awakenStart);
+        drift.mark(sid, "nest_spawned");
+      }
 
       if (promptContent) {
         // Guard against empty murmurs — empty text blocks cause API 400 (cache_control on empty text)
@@ -1324,8 +1384,10 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       if (session) {
         nest.fell(sid, sid);
         if (session.claudeSessionPath) {
+          const pruneStart = Date.now();
           try {
             const result = pruneJsonl(session.claudeSessionPath);
+            drift.span(sid, "compaction_curate", Date.now() - pruneStart);
             penny.curateEvents++;
             penny.curateBytesSaved += result.bytes.before - result.bytes.after;
             penny.curateThinkingStripped += result.stripped;
@@ -1362,6 +1424,7 @@ function humHear(clientId: string, msg: Record<string, unknown>): void {
       const hold = CLWND_PERMIT_HOLD.get(askId);
       trace("hum.permit.releasing", { askId, decision, holdExists: !!hold, pendingHolds: CLWND_PERMIT_HOLD.size });
       if (hold) {
+        recordPermitHoldSpan(askId);
         CLWND_PERMIT_HOLD.delete(askId);
         hold.resolve(decision);
         trace("hum.permit.released", { askId, decision });
@@ -1641,9 +1704,10 @@ const mcpServer = createHttpServer(async (req, res) => {
         hum(ocSessionId ?? sessionId, { chi: "permission-ask", askId, tool: toolName, path, input: body.tool_input ?? {}, dusk: Date.now() + cfg.permissionDusk });
 
         const decision = await new Promise<"allow" | "deny">((resolve) => {
-          CLWND_PERMIT_HOLD.set(askId, { resolve, tool: toolName, path, sessionId: ocSessionId ?? sessionId });
+          CLWND_PERMIT_HOLD.set(askId, { resolve, tool: toolName, path, sessionId: ocSessionId ?? sessionId, createdAt: Date.now() });
           setTimeout(() => {
             if (CLWND_PERMIT_HOLD.has(askId)) {
+              recordPermitHoldSpan(askId);
               CLWND_PERMIT_HOLD.delete(askId);
               trace("permission.hold.timeout", { id: askId });
               resolve("deny");
@@ -1651,6 +1715,15 @@ const mcpServer = createHttpServer(async (req, res) => {
           }, cfg.permissionDusk);
         });
 
+        // Caller is in `await` over resolve() — the resolve path runs from
+        // /permission-respond which uses the release-permit hum case above
+        // and records the span there. For the timeout path we recorded
+        // above; for the success path we record now since this lambda owns
+        // the wait.
+        if (CLWND_PERMIT_HOLD.has(askId)) {
+          recordPermitHoldSpan(askId);
+          CLWND_PERMIT_HOLD.delete(askId);
+        }
         trace("permission.hold.resolved", { id: askId, decision });
         return decision === "allow" ? hookAllow() : hookDeny("Denied by user");
       } catch (e) {
@@ -1733,6 +1806,7 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>, s
     CLWND_PERMIT_HOLD.set(askId, {
       resolve: (decision) => resolve({ decision }),
       tool, path, sessionId: sessionId ?? "",
+      createdAt: Date.now(),
     });
 
     // Auto-allow after 5s. The MCP permission_prompt blocks Claude CLI's stream,
@@ -1742,6 +1816,7 @@ setPermissionCallback(async (toolName: string, input: Record<string, unknown>, s
     // if OC's ctx.ask() resolves quickly (which it does when agent auto-allows).
     setTimeout(() => {
       if (CLWND_PERMIT_HOLD.has(askId)) {
+        recordPermitHoldSpan(askId);
         CLWND_PERMIT_HOLD.delete(askId);
         trace("permission.hold.timeout.allow", { id: askId });
         resolve({ decision: "allow" });
