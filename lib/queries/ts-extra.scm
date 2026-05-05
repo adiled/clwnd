@@ -1,25 +1,15 @@
-; clwnd extras (TS-only) — type aliases, enums. Layered on top of
-; js-ts-extra.scm for .ts/.tsx. Kept separate because tree-sitter-javascript
-; can't parse type_alias_declaration / enum_declaration node types.
+; clwnd extras (TS-only) — type aliases, enums, class fields. Layered on
+; top of js-ts-extra.scm for .ts/.tsx. Kept separate because tree-sitter-
+; javascript can't parse TS-only node types.
 
 ; type X = <...>
-(program
-  (type_alias_declaration
-    name: (type_identifier) @name) @definition.type)
-
-; export type X = <...>
-(program
-  (export_statement
-    (type_alias_declaration
-      name: (type_identifier) @name) @definition.type))
+(type_alias_declaration
+  name: (type_identifier) @name) @definition.type
 
 ; enum X { ... }
-(program
-  (enum_declaration
-    name: (identifier) @name) @definition.enum)
+(enum_declaration
+  name: (identifier) @name) @definition.enum
 
-; export enum X { ... }
-(program
-  (export_statement
-    (enum_declaration
-      name: (identifier) @name) @definition.enum))
+; class field — TS uses public_field_definition for `foo = 1` / `foo: string`
+(public_field_definition
+  name: (property_identifier) @name) @definition.property

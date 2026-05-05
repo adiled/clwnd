@@ -909,9 +909,21 @@ function readBySymbol(targets: string[], symbol: string, sessionId?: string): To
             cur = parent.children ?? [];
           }
           if (!parent || !parent.children || parent.children.length === 0) return "";
-          const outline = parent.children
-            .map(c => `  ${c.kind} ${c.name} L${c.startLine}-${c.endLine}`)
-            .join("\n");
+          // Render the full nested outline (class fields + methods +
+          // method-internal locals), not just direct children, so opening
+          // an oversized class shows everything addressable underneath.
+          const renderTree = (syms: Symbol[], depth = 1): string => {
+            return syms.map(c => {
+              const pad = "  ".repeat(depth);
+              const range = c.startLine === c.endLine ? `L${c.startLine}` : `L${c.startLine}-${c.endLine}`;
+              const head = `${pad}${c.kind} ${c.name} ${range}`;
+              if (c.children && c.children.length > 0) {
+                return `${head}\n${renderTree(c.children, depth + 1)}`;
+              }
+              return head;
+            }).join("\n");
+          };
+          const outline = renderTree(parent.children);
           return `\n\nChildren of '${symbol}':\n${outline}\n\nDrill in with: read('${relPath}', symbol: '${symbol}.CHILD_NAME')`;
         } catch { return ""; }
       })();
