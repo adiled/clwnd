@@ -72,8 +72,8 @@ interface LanguageEntry {
    * inherits from JS, and we extend a few with vendored extras.
    */
   queryPaths: string[];
-  /** Optional vendored extra .scm in lib/queries/ that we add to the query. */
-  vendoredExtra?: string;
+  /** Optional vendored extra .scm in lib/queries/ that we add to the query. Single name or array (concatenated in order). */
+  vendoredExtra?: string | string[];
   /**
    * Parent node types whose presence around a captured definition node
    * should EXPAND the symbol's byte range to cover them. Examples: a
@@ -86,12 +86,12 @@ interface LanguageEntry {
 }
 
 const EXT_TO_LANG: Record<string, LanguageEntry> = {
-  ".ts":   { language: TSTypescript, queryPaths: ["tree-sitter-javascript/queries/tags.scm", "tree-sitter-typescript/queries/tags.scm"], expandWrappers: ["export_statement"] },
-  ".tsx":  { language: TSTsx,        queryPaths: ["tree-sitter-javascript/queries/tags.scm", "tree-sitter-typescript/queries/tags.scm"], expandWrappers: ["export_statement"] },
-  ".js":   { language: TSJavaScript, queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
-  ".jsx":  { language: TSJavaScript, queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
-  ".mjs":  { language: TSJavaScript, queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
-  ".cjs":  { language: TSJavaScript, queryPaths: ["tree-sitter-javascript/queries/tags.scm"], expandWrappers: ["export_statement"] },
+  ".ts":   { language: TSTypescript, queryPaths: ["tree-sitter-javascript/queries/tags.scm", "tree-sitter-typescript/queries/tags.scm"], vendoredExtra: ["js-ts-extra.scm", "ts-extra.scm"], expandWrappers: ["export_statement", "lexical_declaration", "variable_declaration"] },
+  ".tsx":  { language: TSTsx,        queryPaths: ["tree-sitter-javascript/queries/tags.scm", "tree-sitter-typescript/queries/tags.scm"], vendoredExtra: ["js-ts-extra.scm", "ts-extra.scm"], expandWrappers: ["export_statement", "lexical_declaration", "variable_declaration"] },
+  ".js":   { language: TSJavaScript, queryPaths: ["tree-sitter-javascript/queries/tags.scm"], vendoredExtra: "js-ts-extra.scm", expandWrappers: ["export_statement", "lexical_declaration", "variable_declaration"] },
+  ".jsx":  { language: TSJavaScript, queryPaths: ["tree-sitter-javascript/queries/tags.scm"], vendoredExtra: "js-ts-extra.scm", expandWrappers: ["export_statement", "lexical_declaration", "variable_declaration"] },
+  ".mjs":  { language: TSJavaScript, queryPaths: ["tree-sitter-javascript/queries/tags.scm"], vendoredExtra: "js-ts-extra.scm", expandWrappers: ["export_statement", "lexical_declaration", "variable_declaration"] },
+  ".cjs":  { language: TSJavaScript, queryPaths: ["tree-sitter-javascript/queries/tags.scm"], vendoredExtra: "js-ts-extra.scm", expandWrappers: ["export_statement", "lexical_declaration", "variable_declaration"] },
   ".py":   { language: TSPython,     queryPaths: ["tree-sitter-python/queries/tags.scm"],     expandWrappers: ["decorated_definition"] },
   ".pyi":  { language: TSPython,     queryPaths: ["tree-sitter-python/queries/tags.scm"],     expandWrappers: ["decorated_definition"] },
   ".go":   { language: TSGo,         queryPaths: ["tree-sitter-go/queries/tags.scm"] },
@@ -558,8 +558,11 @@ function loadQueryScm(entry: LanguageEntry): string {
     parts.push(stripDirectives(readFileSync(p, "utf-8")));
   }
   if (entry.vendoredExtra) {
-    const p = join(VENDORED_QUERY_DIR, entry.vendoredExtra);
-    parts.push(stripDirectives(readFileSync(p, "utf-8")));
+    const files = Array.isArray(entry.vendoredExtra) ? entry.vendoredExtra : [entry.vendoredExtra];
+    for (const f of files) {
+      const p = join(VENDORED_QUERY_DIR, f);
+      parts.push(stripDirectives(readFileSync(p, "utf-8")));
+    }
   }
   return parts.join("\n");
 }
@@ -1235,7 +1238,12 @@ function extractSymbolsViaQuery(rootNode: any, query: any, langEntry: LanguageEn
     const endIndex = expandedRoot.endIndex as number;
     const endLine = (expandedRoot.endPosition.row as number) + 1;
     const name = nameCapture.node.text as string;
-    const dedupKey = `${startIndex}:${endIndex}:${name}:${kind}`;
+    // Dedup by byte range + name only (no kind). When upstream tags.scm
+    // captures an arrow-function const as @definition.function and our
+    // vendored extras also capture it as @definition.constant, the first
+    // hit wins — query order has upstream first, so the more specific
+    // function kind beats the generic constant.
+    const dedupKey = `${startIndex}:${endIndex}:${name}`;
     if (seen.has(dedupKey)) continue;
     seen.add(dedupKey);
     hits.push({ node: expandedRoot, defNode: defCapture.node, kind, name, startIndex, endIndex, startLine, endLine });

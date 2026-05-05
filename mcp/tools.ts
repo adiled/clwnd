@@ -174,8 +174,10 @@ OPERATIONS:
 
 IMPORTS: the top-of-file import block is addressable as symbol: 'imports' — a synthetic symbol that spans the first contiguous run of import/use/#include/using directives. Prefer 'replace' with the full new block for add/remove/reorder (clean output, no stray blank lines). insert_after/before also work but leave a blank-line separator. delete nukes the whole block. Covered: TS/JS, Python, Go, Rust, Java, C/C++, C#, PHP. Not covered: Ruby, shell, Vue — on those, symbol 'imports' is not found and you should whole-file replace.
 
-VUE SFCs: address sub-blocks too, not just the three top-level synths.
-  - script.<name>          — JS/TS symbol inside <script> (function, class, const, …).
+ADDRESSABLE in JS/TS (and Vue <script>): functions, classes, methods, top-level const/let/var, type aliases, enums, the synthetic 'imports' block. Yes — top-level "const foo = ref(...)", "const URL = '…'", "let counter", "type Foo", "enum Status" are all addressable by name. Don't fall back to whole-file rewrite for "I have nothing to anchor on" — read the outline first; the const/type/enum is in there.
+
+VUE SFCs: don't treat the <script> block as a monolith. Read it once to see its child outline, then address by symbol like a normal .ts file. Sub-block syntax:
+  - script.<name>          — JS/TS symbol inside <script> (function, class, const, type, enum, …).
   - template.<tag>         — first <tag> in template (use #N if multiple).
   - template.<tag>#<id>    — element with that static id attr (e.g. template.div#banner).
   - style.<class>          — CSS class rule. Single class .foo => style.foo. Compound .foo.bar => style.foo.bar.
