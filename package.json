@@ -46,6 +46,8 @@
     "@vue/compiler-sfc": "^3.5.32",
     "better-sqlite3": "^12.9.0",
     "diff": "^8.0.3",
+    "postcss": "^8.5.14",
+    "postcss-scss": "^4.0.9",
     "tree-sitter": "0.21.1",
     "tree-sitter-bash": "0.23.3",
     "tree-sitter-c": "0.23.6",

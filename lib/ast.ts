@@ -687,6 +687,125 @@ function cacheHit(filePath: string): AstCacheEntry | null {
 // symbols: `template`, `script`, `style` (or `style#2` etc). Children
 // of `script` are real function/class symbols from the script content
 // with offsets shifted to the enclosing vue file's coordinates.
+// `template` children are HTML elements (via @vue/compiler-sfc's bundled
+// compiler-dom AST). `style` children are CSS rules (via postcss/postcss-scss).
+// Both carry absolute byte offsets in the SFC file so do_code can splice
+// by symbol like `template.div#banner` or `style.linkIcon`.
+
+// Walk a compiler-dom template AST and collect every ELEMENT node as a
+// Symbol. Naming: `tag#id` if the element has a static id attr, else
+// just `tag` (de-duped via #N at format time). Range = element.loc with
+// absolute SFC offsets — compiler-sfc returns offsets in SFC coordinates.
+function vueTemplateChildren(ast: any, source: string): Symbol[] {
+  const NODE_TYPE_ELEMENT = 1;
+  const PROP_TYPE_ATTR = 6;
+  const out: Symbol[] = [];
+  const visit = (node: any): Symbol | null => {
+    if (!node || node.type !== NODE_TYPE_ELEMENT) return null;
+    const start = node.loc?.start?.offset ?? -1;
+    const end = node.loc?.end?.offset ?? -1;
+    if (start < 0 || end < 0) return null;
+    let id: string | null = null;
+    for (const p of node.props ?? []) {
+      if (p.type === PROP_TYPE_ATTR && p.name === "id" && p.value?.content) {
+        id = p.value.content;
+        break;
+      }
+    }
+    const tag = node.tag ?? "elem";
+    const name = id ? `${tag}#${id}` : tag;
+    const startLine = source.slice(0, start).split("\n").length;
+    const endLine = source.slice(0, end).split("\n").length;
+    const children: Symbol[] = [];
+    for (const c of node.children ?? []) {
+      const s = visit(c);
+      if (s) children.push(s);
+    }
+    return {
+      name,
+      kind: "element",
+      startLine,
+      endLine,
+      startIndex: start,
+      endIndex: end,
+      children: children.length ? children : undefined,
+    };
+  };
+  for (const c of ast?.children ?? []) {
+    const s = visit(c);
+    if (s) out.push(s);
+  }
+  return out;
+}
+
+// Parse a <style> block's content with postcss (or postcss-scss for
+// lang="scss"/"sass"). Walks the tree hierarchically — nested SCSS rules
+// become children, at-rules (@media, @supports, @keyframes) become parent
+// scopes whose nested rules nest under them. Selector heuristic for Rule:
+// `.foo` → name `foo` (kind `class`), `#foo` → name `#foo` (kind `id`),
+// otherwise selector verbatim (kind `rule`). At-rules: name `@media (...)`,
+// kind `atrule`. Offsets shifted by `baseOffset` for absolute SFC coords.
+function vueStyleChildren(content: string, baseOffset: number, lang: string, sfcSource: string): Symbol[] {
+  let postcss: any, postcssScss: any;
+  try {
+    postcss = _require("postcss");
+    if (lang === "scss" || lang === "sass") postcssScss = _require("postcss-scss");
+  } catch {
+    return [];
+  }
+  let root: any;
+  try {
+    root = postcssScss ? postcssScss.parse(content) : postcss.parse(content);
+  } catch {
+    return [];
+  }
+  const lineOf = (off: number) => sfcSource.slice(0, off).split("\n").length;
+  const buildRule = (node: any): Symbol | null => {
+    const localStart = node.source?.start?.offset;
+    const localEnd = node.source?.end?.offset;
+    if (typeof localStart !== "number" || typeof localEnd !== "number") return null;
+    const start = baseOffset + localStart;
+    const end = baseOffset + localEnd;
+    let name: string;
+    let kind: string;
+    if (node.type === "rule") {
+      const sel = String(node.selector ?? "").trim();
+      // Compound classes (.foo.bar) and chained ids count as class/id —
+      // strip the leading sigil and keep internal dots in the name. The
+      // path resolver greedy-joins segments to handle internal dots.
+      if (/^\.[A-Za-z_][\w.-]*$/.test(sel)) { name = sel.slice(1); kind = "class"; }
+      else if (/^#[A-Za-z_][\w-]*$/.test(sel)) { name = sel; kind = "id"; }
+      else { name = sel; kind = "rule"; }
+    } else if (node.type === "atrule") {
+      const params = String(node.params ?? "").trim();
+      name = params ? `@${node.name} ${params}` : `@${node.name}`;
+      kind = "atrule";
+    } else {
+      return null;
+    }
+    const children: Symbol[] = [];
+    for (const child of node.nodes ?? []) {
+      const s = buildRule(child);
+      if (s) children.push(s);
+    }
+    return {
+      name,
+      kind,
+      startLine: lineOf(start),
+      endLine: lineOf(end),
+      startIndex: start,
+      endIndex: end,
+      children: children.length ? children : undefined,
+    };
+  };
+  const out: Symbol[] = [];
+  for (const child of root.nodes ?? []) {
+    const s = buildRule(child);
+    if (s) out.push(s);
+  }
+  return out;
+}
+
 function validateVueSfc(source: string): { ok: true } | { ok: false; error: string } {
   try {
     const sfcMod = _require("@vue/compiler-sfc");
@@ -778,6 +897,14 @@ function parseVueSfc(filePath: string): AstCacheEntry | null {
   if (descriptor.template) {
     const t = descriptor.template.loc;
     const r = expandVueBlockRange(source, t.start.offset, t.end.offset, "template");
+    let children: Symbol[] | undefined;
+    try {
+      const ast = descriptor.template.ast;
+      if (ast) {
+        const c = vueTemplateChildren(ast, source);
+        if (c.length) children = c;
+      }
+    } catch {}
     symbols.push({
       name: "template",
       kind: "template",
@@ -785,6 +912,7 @@ function parseVueSfc(filePath: string): AstCacheEntry | null {
       endLine: r.endLine,
       startIndex: r.start,
       endIndex: r.end,
+      children,
     });
   }
 
@@ -839,6 +967,12 @@ function parseVueSfc(filePath: string): AstCacheEntry | null {
     descriptor.styles.forEach((st: any, i: number) => {
       const stLoc = st.loc;
       const r = expandVueBlockRange(source, stLoc.start.offset, stLoc.end.offset, "style");
+      const lang = String(st.lang || "css").toLowerCase();
+      let children: Symbol[] | undefined;
+      try {
+        const c = vueStyleChildren(st.content ?? "", stLoc.start.offset, lang, source);
+        if (c.length) children = c;
+      } catch {}
       symbols.push({
         name: i === 0 ? "style" : `style#${i + 1}`,
         kind: "style",
@@ -846,6 +980,7 @@ function parseVueSfc(filePath: string): AstCacheEntry | null {
         endLine: r.endLine,
         startIndex: r.start,
         endIndex: r.end,
+        children,
       });
     });
   }
@@ -1250,21 +1385,42 @@ function findSymbol(filePath: string, symbolPath: string): Symbol | null {
   let current: Symbol[] = entry.symbols;
   let found: Symbol | null = null;
   let aliasStart = -1;
-  for (let i = 0; i < parts.length; i++) {
-    const rawPart = parts[i];
-    const { name, occurrence } = parseSegment(rawPart);
-    // Find the Nth symbol with this name at the current scope level.
-    let count = 0;
-    let match: Symbol | null = null;
-    for (const s of current) {
-      if (s.name === name) {
-        count++;
-        if (count === occurrence) { match = s; break; }
+  let i = 0;
+  while (i < parts.length) {
+    // Try matching the longest contiguous join first, falling back to
+    // shorter joins, and finally to the bare segment. This handles
+    // selectors with internal dots like `.foo.bar` (stored as `foo.bar`)
+    // or `@media (min-width: 1.5em)` — `style.foo.bar` becomes
+    // ["style","foo","bar"], greedy-join finds `foo.bar`. Single-segment
+    // matches still win first, so nested `style.foo.bar` (parent .foo →
+    // child .bar) resolves the nested form before the compound form.
+    const tryMatch = (span: number): Symbol | null => {
+      const joined = parts.slice(i, i + span).join(".");
+      const { name, occurrence } = parseSegment(joined);
+      let count = 0;
+      for (const s of current) {
+        if (s.name === name) {
+          count++;
+          if (count === occurrence) return s;
+        }
+      }
+      return null;
+    };
+    let match: Symbol | null = tryMatch(1);
+    let consumed = 1;
+    if (!match) {
+      // Single-segment miss — try longest join down to span 2. Lets
+      // compound selectors (`.foo.bar` stored as `foo.bar`) and at-rule
+      // params with internal dots (`@media (min-width: 1.5em)`) resolve.
+      for (let span = parts.length - i; span >= 2; span--) {
+        const cand = tryMatch(span);
+        if (cand) { match = cand; consumed = span; break; }
       }
     }
     if (match) {
       found = match;
       current = found.children ?? [];
+      i += consumed;
       continue;
     }
     // Named miss. If the experimental sub-path flag is on and we have
